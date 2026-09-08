@@ -12,7 +12,7 @@ export default async function Home(){
       </div>
       <div className="quote">
         <span className="quote-label">ORO / DOLLARO</span>
-        <div className="price">{stopped?"STOP":s?.quote?.mid?.toFixed?.(2)??"—"}{!stopped&&<small>USD</small>}</div>
+        <div className="price">{stopped?"FERMO":s?.quote?.mid?.toFixed?.(2)??"—"}{!stopped&&<small>USD</small>}</div>
       </div>
     </header>
 
@@ -24,7 +24,7 @@ export default async function Home(){
         <h1 id="dashboard-title">Scalper <span>streaming</span></h1>
         <p>Quote continue via WebSocket. La strategia conferma il setup sulla chiusura M1 e usa M5 solo come contesto immediato.</p>
       </div>
-      <div className={stopped?"off":streamOnline?"on":"off"}>{stopped?"STOP TUTTO":streamOnline?"STREAM ONLINE":"STREAM OFFLINE"}</div>
+      <div className={stopped?"off":streamOnline?"on":"off"}>{stopped?"SISTEMA FERMO":streamOnline?"SISTEMA ATTIVO":"STREAM OFFLINE"}</div>
     </section>
 
     <section className="grid" aria-label="Stato operativo">
