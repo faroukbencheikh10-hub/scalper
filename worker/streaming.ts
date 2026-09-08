@@ -1,4 +1,4 @@
-import MetaApi from "metaapi.cloud-sdk";
+import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, setSetting, systemStopActive } from "../src/lib/server/db";
 import { autoExecEnabled } from "../src/lib/server/executor";
 import { fetchCandles, symbol } from "../src/lib/server/metaApi";
@@ -18,10 +18,6 @@ function envInt(name: string, fallback: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.floor(value)));
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function bucketStart(timeMs: number, minutes: number) {
   const size = minutes * 60_000;
   return Math.floor(timeMs / size) * size;
@@ -35,7 +31,7 @@ function upsertTick(buffer: Candle[], minutes: number, mid: number, timeMs: numb
   if (!last || Date.parse(last.datetime) < bucket) {
     buffer.push({ datetime, open: mid, high: mid, low: mid, close: mid });
     while (buffer.length > max) buffer.shift();
-    return true;
+    return;
   }
 
   if (Date.parse(last.datetime) === bucket) {
@@ -43,7 +39,6 @@ function upsertTick(buffer: Candle[], minutes: number, mid: number, timeMs: numb
     last.low = Math.min(last.low, mid);
     last.close = mid;
   }
-  return false;
 }
 
 function priceTimeMs(price: Record<string, unknown>) {
@@ -85,56 +80,13 @@ async function markWorker(status: string, extra?: Record<string, unknown>) {
   ]);
 }
 
-async function processClosedMinute(
-  quote: Quote,
-  m1: Candle[],
-  m5: Candle[],
-  connection: StreamingConnectionLike,
-) {
-  if (await systemStopActive()) return;
-
-  await syncStreamingExecutor(connection);
-  const active = await dbQuery(
-    `SELECT id FROM scalper_signals
-      WHERE outcome IS NULL AND direction IN ('BUY','SELL')
-      ORDER BY created_at DESC LIMIT 1`,
-  );
-  if (active.rows[0]) return;
-
-  const closedM1 = m1.slice(0, -1);
-  const currentM5Bucket = bucketStart(quote.quotedAt ?? Date.now(), 5);
-  const closedM5 = m5.filter((c) => Date.parse(c.datetime) < currentM5Bucket);
-  const signal = evaluateScalper({ quote, m1: closedM1, m5: closedM5 });
-
-  await setSetting("stream_last_decision", JSON.stringify({
-    at: new Date().toISOString(),
-    direction: signal.direction,
-    setup: signal.setup,
-    reasoning: signal.reasoning,
-    quote,
-  }));
-
-  if (signal.direction === "NO_TRADE") return;
-
-  if (!autoExecEnabled()) {
-    await setSetting("stream_last_preview", JSON.stringify({ at: new Date().toISOString(), ...signal }));
-    return;
+class QuoteListener extends SynchronizationListener {
+  constructor(private readonly handler: (price: Record<string, unknown>) => Promise<void>) {
+    super();
   }
 
-  const saved = await dbQuery(
-    `INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
-     VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-    [signal.direction, signal.setup, signal.entry, signal.stopLoss, signal.takeProfit, signal.riskReward, signal.reasoning],
-  );
-  const signalId = String(saved.rows[0].id);
-  const execution = await executeStreaming(signalId, signal.direction, signal.stopLoss!, signal.takeProfit!, connection);
-
-  if (["blocked", "blocked_existing_position", "system_stopped"].includes(execution.status)) {
-    const reason = "reason" in execution ? String(execution.reason ?? "") : "";
-    await dbQuery(
-      `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
-      [signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`],
-    );
+  async onSymbolPriceUpdated(_instanceIndex: string, price: any) {
+    await this.handler(price as Record<string, unknown>);
   }
 }
 
@@ -144,118 +96,249 @@ async function main() {
   const accountId = required("METAAPI_ACCOUNT_ID");
   const m1Max = envInt("SCALPER_M1_CANDLES", 500, 50, 1000);
   const m5Max = envInt("SCALPER_M5_CANDLES", 300, 50, 1000);
-  const pollMs = envInt("SCALPER_STREAM_POLL_MS", 250, 100, 5000);
-  const controlPollMs = envInt("SCALPER_CONTROL_POLL_MS", 1000, 250, 10_000);
-  const heartbeatMs = envInt("SCALPER_STREAM_HEARTBEAT_MS", 5000, 1000, 60_000);
-  const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 1000, 500, 30_000);
-  const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 1000, 250, 10_000);
+  const controlPollMs = envInt("SCALPER_CONTROL_POLL_MS", 250, 100, 10_000);
+  const heartbeatMs = envInt("SCALPER_STREAM_HEARTBEAT_MS", 3000, 1000, 60_000);
+  const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 250, 100, 30_000);
+  const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
+  const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
 
   const api = new MetaApi(token);
   const account = await api.metatraderAccountApi.getAccount(accountId);
   const connection = account.getStreamingConnection();
-  await connection.connect();
-  await connection.waitSynchronized();
-
   const tradingConnection = connection as unknown as StreamingConnectionLike;
+
   let subscribed = false;
+  let ready = false;
+  let stopped = await systemStopActive();
   let m1: Candle[] = [];
   let m5: Candle[] = [];
-  let lastSignature = "";
-  let lastControlCheck = 0;
-  let lastHeartbeat = 0;
-  let lastSync = 0;
-  let lastQuotePersist = 0;
-  let stopped = true;
-
-  await markWorker("connected", { symbol: symbol(), mode: "MetaApi Streaming/WebSocket" });
+  let latestQuote: Quote | null = null;
+  let latestDecision: Record<string, unknown> | null = null;
+  let latestPreview: Record<string, unknown> | null = null;
+  let decisionBusy = false;
+  let controlBusy = false;
+  let syncBusy = false;
+  let heartbeatBusy = false;
+  let quotePersistBusy = false;
+  let decisionPersistBusy = false;
+  let signalLockUntil = 0;
 
   const marketDataSubscriptions = [{ type: "quotes" as const }];
   const marketDataUnsubscriptions = [{ type: "quotes" as const }];
 
-  const shutdown = async (reason: string) => {
+  const onPrice = async (price: Record<string, unknown>) => {
+    if (!ready || stopped || !subscribed) return;
+    const priceSymbol = typeof price.symbol === "string" ? price.symbol : symbol();
+    if (priceSymbol !== symbol()) return;
+
+    const quote = quoteFromPrice(price);
+    if (!quote) return;
+    latestQuote = quote;
+
+    upsertTick(m1, 1, quote.mid, quote.quotedAt ?? Date.now(), m1Max);
+    upsertTick(m5, 5, quote.mid, quote.quotedAt ?? Date.now(), m5Max);
+    if (m1.length < 35 || m5.length < 30) return;
+    if (decisionBusy || Date.now() < signalLockUntil) return;
+
+    const existing = (tradingConnection.terminalState.positions ?? []).find((p) => p.symbol === symbol());
+    if (existing) return;
+
+    const signal = evaluateScalper({ quote, m1, m5 });
+    latestDecision = {
+      at: new Date().toISOString(),
+      mode: "event_driven_intrabar",
+      direction: signal.direction,
+      setup: signal.setup,
+      reasoning: signal.reasoning,
+      quote,
+    };
+
+    if (signal.direction === "NO_TRADE") return;
+
+    if (!autoExecEnabled()) {
+      latestPreview = { at: new Date().toISOString(), ...signal };
+      return;
+    }
+
+    decisionBusy = true;
     try {
+      const saved = await dbQuery(
+        `INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
+         VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+        [signal.direction, signal.setup, signal.entry, signal.stopLoss, signal.takeProfit, signal.riskReward, signal.reasoning],
+      );
+      const signalId = String(saved.rows[0].id);
+      const execution = await executeStreaming(
+        signalId,
+        signal.direction,
+        signal.stopLoss!,
+        signal.takeProfit!,
+        tradingConnection,
+        { schemaReady: true, skipSync: true, systemStopped: stopped },
+      );
+
+      if (["blocked", "blocked_existing_position", "blocked_existing_signal", "system_stopped"].includes(execution.status)) {
+        const reason = "reason" in execution ? String(execution.reason ?? "") : "";
+        await dbQuery(
+          `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
+          [signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`],
+        );
+      } else if (execution.status === "opened" || execution.status === "pending_position_link") {
+        signalLockUntil = Date.now() + 5000;
+      }
+
+      latestDecision = {
+        at: new Date().toISOString(),
+        mode: "event_driven_intrabar",
+        signalId,
+        direction: signal.direction,
+        setup: signal.setup,
+        reasoning: signal.reasoning,
+        quote,
+        execution,
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
+    } finally {
+      decisionBusy = false;
+    }
+  };
+
+  const listener = new QuoteListener(onPrice);
+  connection.addSynchronizationListener(listener);
+  await connection.connect();
+  await connection.waitSynchronized();
+
+  const subscribe = async () => {
+    ready = false;
+    const seeded = await seedCandles(m1Max, m5Max);
+    m1 = seeded.m1;
+    m5 = seeded.m5;
+    await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);
+    subscribed = true;
+    ready = true;
+    await markWorker("streaming", {
+      symbol: symbol(),
+      mode: "MetaApi WebSocket event-driven intrabar",
+      m1: m1.length,
+      m5: m5.length,
+    });
+  };
+
+  if (!stopped) {
+    await subscribe();
+  } else {
+    await markWorker("paused", { reason: "STOP TUTTO" });
+  }
+
+  const controlTimer = setInterval(() => {
+    if (controlBusy) return;
+    controlBusy = true;
+    void (async () => {
+      try {
+        const nextStopped = await systemStopActive();
+        if (nextStopped && !stopped) {
+          stopped = true;
+          ready = false;
+          if (subscribed) {
+            await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
+            subscribed = false;
+          }
+          m1 = [];
+          m5 = [];
+          latestQuote = null;
+          await setSetting("stream_last_quote", "");
+          await markWorker("paused", { reason: "STOP TUTTO" });
+        } else if (!nextStopped && stopped) {
+          stopped = false;
+          await subscribe();
+        } else {
+          stopped = nextStopped;
+        }
+      } catch (error) {
+        console.error(error);
+      } finally {
+        controlBusy = false;
+      }
+    })();
+  }, controlPollMs);
+
+  const syncTimer = setInterval(() => {
+    if (syncBusy || stopped || !subscribed) return;
+    syncBusy = true;
+    void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
+      .then((result) => {
+        if (result.closed > 0 || result.timedOut > 0) signalLockUntil = 0;
+      })
+      .catch((error) => setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => {
+        syncBusy = false;
+      });
+  }, syncMs);
+
+  const quotePersistTimer = setInterval(() => {
+    if (quotePersistBusy || !latestQuote) return;
+    quotePersistBusy = true;
+    const snapshot = latestQuote;
+    void setSetting("stream_last_quote", JSON.stringify({ ...snapshot, receivedAt: new Date().toISOString() }))
+      .catch((error) => console.error(error))
+      .finally(() => {
+        quotePersistBusy = false;
+      });
+  }, quotePersistMs);
+
+  const decisionPersistTimer = setInterval(() => {
+    if (decisionPersistBusy || (!latestDecision && !latestPreview)) return;
+    decisionPersistBusy = true;
+    const decision = latestDecision;
+    const preview = latestPreview;
+    void Promise.all([
+      decision ? setSetting("stream_last_decision", JSON.stringify(decision)) : Promise.resolve(),
+      preview ? setSetting("stream_last_preview", JSON.stringify(preview)) : Promise.resolve(),
+    ])
+      .catch((error) => console.error(error))
+      .finally(() => {
+        decisionPersistBusy = false;
+      });
+  }, decisionPersistMs);
+
+  const heartbeatTimer = setInterval(() => {
+    if (heartbeatBusy) return;
+    heartbeatBusy = true;
+    void markWorker(stopped ? "paused" : subscribed ? "streaming" : "connected", {
+      symbol: symbol(),
+      mode: "MetaApi WebSocket event-driven intrabar",
+      autoExec: autoExecEnabled(),
+      m1: m1.length,
+      m5: m5.length,
+    })
+      .catch((error) => console.error(error))
+      .finally(() => {
+        heartbeatBusy = false;
+      });
+  }, heartbeatMs);
+
+  const shutdown = async (reason: string) => {
+    clearInterval(controlTimer);
+    clearInterval(syncTimer);
+    clearInterval(quotePersistTimer);
+    clearInterval(decisionPersistTimer);
+    clearInterval(heartbeatTimer);
+    try {
+      ready = false;
       await markWorker("stopping", { reason });
       if (subscribed) await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
+      connection.removeSynchronizationListener(listener);
       await connection.close();
       await markWorker("stopped", { reason });
     } finally {
       process.exit(0);
     }
   };
+
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
   process.on("SIGINT", () => void shutdown("SIGINT"));
-
-  while (true) {
-    const now = Date.now();
-
-    if (now - lastControlCheck >= controlPollMs) {
-      lastControlCheck = now;
-      stopped = await systemStopActive();
-      if (stopped && subscribed) {
-        await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
-        subscribed = false;
-        await setSetting("stream_last_quote", "");
-        await markWorker("paused", { reason: "STOP TUTTO" });
-      } else if (!stopped && !subscribed) {
-        if (!m1.length || !m5.length) {
-          const seeded = await seedCandles(m1Max, m5Max);
-          m1 = seeded.m1;
-          m5 = seeded.m5;
-        }
-        await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);
-        subscribed = true;
-        await markWorker("streaming", { symbol: symbol(), m1: m1.length, m5: m5.length });
-      }
-    }
-
-    if (!stopped && subscribed) {
-      const rawPrice = connection.terminalState.price(symbol()) as unknown as Record<string, unknown> | undefined;
-      if (rawPrice) {
-        const quote = quoteFromPrice(rawPrice);
-        if (quote) {
-          const signature = `${quote.quotedAt}:${quote.bid}:${quote.ask}`;
-          if (signature !== lastSignature) {
-            lastSignature = signature;
-            const newM1 = upsertTick(m1, 1, quote.mid, quote.quotedAt ?? now, m1Max);
-            upsertTick(m5, 5, quote.mid, quote.quotedAt ?? now, m5Max);
-            if (newM1 && m1.length > 36 && m5.length > 31) {
-              try {
-                await processClosedMinute(quote, m1, m5, tradingConnection);
-              } catch (error) {
-                await setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`);
-              }
-            }
-          }
-
-          if (now - lastQuotePersist >= quotePersistMs) {
-            lastQuotePersist = now;
-            await setSetting("stream_last_quote", JSON.stringify({ ...quote, receivedAt: new Date().toISOString() }));
-          }
-        }
-      }
-
-      if (now - lastSync >= syncMs) {
-        lastSync = now;
-        try {
-          await syncStreamingExecutor(tradingConnection);
-        } catch (error) {
-          await setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-    }
-
-    if (now - lastHeartbeat >= heartbeatMs) {
-      lastHeartbeat = now;
-      await markWorker(stopped ? "paused" : subscribed ? "streaming" : "connected", {
-        symbol: symbol(),
-        autoExec: autoExecEnabled(),
-        m1: m1.length,
-        m5: m5.length,
-      });
-    }
-
-    await sleep(pollMs);
-  }
 }
 
 main().catch(async (error) => {

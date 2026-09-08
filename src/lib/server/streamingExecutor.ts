@@ -21,6 +21,17 @@ export type StreamingConnectionLike = {
   closePosition: (positionId: string) => Promise<Record<string, unknown>>;
 };
 
+type SyncOptions = {
+  schemaReady?: boolean;
+  systemStopped?: boolean;
+};
+
+type ExecuteOptions = {
+  schemaReady?: boolean;
+  skipSync?: boolean;
+  systemStopped?: boolean;
+};
+
 const timeStopRequested = new Set<string>();
 
 function envN(name: string, fallback: number, min = 0) {
@@ -35,19 +46,22 @@ function clientId(signalId: string) {
 async function limits() {
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
-  const daily = await dbQuery(
-    `SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL) trades,
-            COALESCE(SUM(mt5_profit),0) profit
-       FROM scalper_signals
-      WHERE created_at >= $1`,
-    [start.toISOString()],
-  );
+  const [daily, last] = await Promise.all([
+    dbQuery(
+      `SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL) trades,
+              COALESCE(SUM(mt5_profit),0) profit
+         FROM scalper_signals
+        WHERE created_at >= $1`,
+      [start.toISOString()],
+    ),
+    dbQuery(`SELECT outcome,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
+  ]);
+
   const trades = Number(daily.rows[0]?.trades ?? 0);
   const profit = Number(daily.rows[0]?.profit ?? 0);
   if (trades >= envN("MAX_TRADES_PER_DAY", 12, 1)) return { ok: false, reason: "max_trades_per_day" };
   if (profit <= -envN("MAX_DAILY_LOSS", 150, 0)) return { ok: false, reason: "max_daily_loss" };
 
-  const last = await dbQuery(`SELECT outcome,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`);
   const losses = last.rows.filter((row: { outcome?: string }) => row.outcome === "LOSS");
   if (losses.length >= 3 && last.rows[0]?.closed_at) {
     const t = Date.parse(last.rows[0].closed_at);
@@ -63,9 +77,10 @@ async function limits() {
   return { ok: true, reason: null };
 }
 
-export async function syncStreamingExecutor(connection: StreamingConnectionLike) {
-  await ensureSchema();
-  if (await systemStopActive()) return { checked: 0, closed: 0, timedOut: 0, stopped: true };
+export async function syncStreamingExecutor(connection: StreamingConnectionLike, options: SyncOptions = {}) {
+  if (!options.schemaReady) await ensureSchema();
+  const stopped = options.systemStopped ?? await systemStopActive();
+  if (stopped) return { checked: 0, closed: 0, timedOut: 0, stopped: true };
 
   const rows = await dbQuery(
     `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
@@ -74,15 +89,16 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike)
       ORDER BY created_at ASC`,
   );
   const positions = connection.terminalState.positions ?? [];
-  const timeoutMin = envN("SCALPER_TIME_STOP_MIN", 12, 1);
+  const legacyTimeoutSec = envN("SCALPER_TIME_STOP_MIN", 12, 0.25) * 60;
+  const timeoutSec = envN("SCALPER_TIME_STOP_SEC", legacyTimeoutSec, 15);
   let closed = 0;
   let timedOut = 0;
 
   for (const signal of rows.rows) {
     const position = positions.find((p) => p.id === signal.mt5_position_id);
     if (position) {
-      const ageMin = (Date.now() - new Date(signal.created_at).getTime()) / 60_000;
-      if (ageMin >= timeoutMin && !timeStopRequested.has(position.id)) {
+      const ageSec = (Date.now() - new Date(signal.created_at).getTime()) / 1000;
+      if (ageSec >= timeoutSec && !timeStopRequested.has(position.id)) {
         timeStopRequested.add(position.id);
         try {
           await connection.closePosition(position.id);
@@ -131,19 +147,40 @@ export async function executeStreaming(
   stopLoss: number,
   takeProfit: number,
   connection: StreamingConnectionLike,
+  options: ExecuteOptions = {},
 ) {
-  await ensureSchema();
-  if (await systemStopActive()) return { status: "system_stopped" as const };
+  if (!options.schemaReady) await ensureSchema();
+  if (options.systemStopped === true) return { status: "system_stopped" as const };
   if (!autoExecEnabled()) return { status: "disabled" as const };
 
-  await syncStreamingExecutor(connection);
-  const lim = await limits();
-  if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
+  if (!options.skipSync) {
+    const sync = await syncStreamingExecutor(connection, {
+      schemaReady: true,
+      systemStopped: options.systemStopped,
+    });
+    if (sync.stopped) return { status: "system_stopped" as const };
+  }
 
   const existing = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol());
   if (existing) return { status: "blocked_existing_position" as const, positionId: existing.id };
 
-  if (await systemStopActive()) return { status: "system_stopped" as const };
+  const [lim, control] = await Promise.all([
+    limits(),
+    dbQuery(
+      `SELECT
+         COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
+         (SELECT id FROM scalper_signals
+            WHERE outcome IS NULL AND direction IN ('BUY','SELL') AND id<>$1
+            ORDER BY created_at DESC LIMIT 1) AS active_signal_id`,
+      [signalId],
+    ),
+  ]);
+
+  if (control.rows[0]?.stopped === true) return { status: "system_stopped" as const };
+  if (control.rows[0]?.active_signal_id) {
+    return { status: "blocked_existing_signal" as const, signalId: String(control.rows[0].active_signal_id) };
+  }
+  if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
 
   try {
     const options = { comment: "scalper streaming", clientId: clientId(signalId) };
@@ -173,10 +210,10 @@ export async function executeStreaming(
         );
         return { status: "opened" as const, orderId, positionId: position.id, openPrice: position.openPrice };
       }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
 
-    await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, "Ordine accettato ma posizione streaming non collegata entro 5s"]);
+    await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, "Ordine accettato ma posizione streaming non collegata entro 2s"]);
     return { status: "pending_position_link" as const, orderId };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

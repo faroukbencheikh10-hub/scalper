@@ -18,6 +18,11 @@ function hoursAllowed(now = new Date()) {
 }
 function bullish(c: Candle) { return c.close > c.open; }
 function bearish(c: Candle) { return c.close < c.open; }
+function timeStopLabel() {
+  const seconds = envN("SCALPER_TIME_STOP_SEC", 0);
+  if (seconds > 0) return seconds % 60 === 0 ? `${seconds / 60} min` : `${seconds} sec`;
+  return `${envN("SCALPER_TIME_STOP_MIN", 12)} min`;
+}
 
 export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[] }): ScalperSignal {
   const { quote } = input;
@@ -73,6 +78,6 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   return {
     direction, setup,
     entry:Number(entry.toFixed(2)), stopLoss:Number(stopLoss.toFixed(2)), takeProfit:Number(takeProfit.toFixed(2)), riskReward:Number(rr.toFixed(2)),
-    reasoning:`${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp?"rialzista":trendDown?"ribassista":"neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Time-stop ${process.env.SCALPER_TIME_STOP_MIN || 12} min.`
+    reasoning:`${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp?"rialzista":trendDown?"ribassista":"neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Time-stop ${timeStopLabel()}.`
   };
 }
