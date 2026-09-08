@@ -1,0 +1,8 @@
+{
+  "name": "Scalper — XAUUSD",
+  "short_name": "Scalper",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#080b10",
+  "theme_color": "#080b10"
+}
