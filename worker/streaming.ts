@@ -132,9 +132,10 @@ async function processClosedMinute(
   const execution = await executeStreaming(signalId, signal.direction, signal.stopLoss!, signal.takeProfit!, connection);
 
   if (["blocked", "blocked_existing_position", "system_stopped"].includes(execution.status)) {
+    const reason = "reason" in execution ? String(execution.reason ?? "") : "";
     await dbQuery(
       `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
-      [signalId, `Streaming execution: ${execution.status}${"reason" in execution && execution.reason ? ` (${execution.reason})` : ""}`],
+      [signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`],
     );
   }
 }
@@ -149,6 +150,7 @@ async function main() {
   const controlPollMs = envInt("SCALPER_CONTROL_POLL_MS", 1000, 250, 10_000);
   const heartbeatMs = envInt("SCALPER_STREAM_HEARTBEAT_MS", 5000, 1000, 60_000);
   const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 1000, 500, 30_000);
+  const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 1000, 250, 10_000);
 
   const api = new MetaApi(token);
   const account = await api.metatraderAccountApi.getAccount(accountId);
@@ -164,6 +166,7 @@ async function main() {
   let lastControlCheck = 0;
   let lastHeartbeat = 0;
   let lastSync = 0;
+  let lastQuotePersist = 0;
   let stopped = true;
 
   await markWorker("connected", { symbol: symbol(), mode: "MetaApi Streaming/WebSocket" });
@@ -190,6 +193,7 @@ async function main() {
       if (stopped && subscribed) {
         await connection.unsubscribeFromMarketData(symbol()).catch(() => undefined);
         subscribed = false;
+        await setSetting("stream_last_quote", "");
         await markWorker("paused", { reason: "STOP TUTTO" });
       } else if (!stopped && !subscribed) {
         if (!m1.length || !m5.length) {
@@ -220,6 +224,11 @@ async function main() {
                 await setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`);
               }
             }
+          }
+
+          if (now - lastQuotePersist >= quotePersistMs) {
+            lastQuotePersist = now;
+            await setSetting("stream_last_quote", JSON.stringify({ ...quote, receivedAt: new Date().toISOString() }));
           }
         }
       }
