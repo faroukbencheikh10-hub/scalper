@@ -30,6 +30,17 @@ type ExecuteOptions = {
   schemaReady?: boolean;
   skipSync?: boolean;
   systemStopped?: boolean;
+  preflightDone?: boolean;
+};
+
+type ReserveSignalInput = {
+  direction: "BUY" | "SELL";
+  setup: string | null;
+  entry: number;
+  stopLoss: number;
+  takeProfit: number;
+  riskReward: number;
+  reasoning: string;
 };
 
 const timeStopRequested = new Set<string>();
@@ -75,6 +86,101 @@ async function limits() {
     }
   }
   return { ok: true, reason: null };
+}
+
+export async function reserveStreamingSignal(input: ReserveSignalInput) {
+  const start = new Date();
+  start.setUTCHours(0, 0, 0, 0);
+  const maxTrades = envN("MAX_TRADES_PER_DAY", 12, 1);
+  const maxDailyLoss = envN("MAX_DAILY_LOSS", 150, 0);
+  const threeLossCooldown = envN("SCALPER_THREE_LOSS_COOLDOWN_MIN", 30, 1);
+  const lossCooldown = envN("SCALPER_LOSS_COOLDOWN_MIN", 5, 1);
+
+  const result = await dbQuery(
+    `WITH lock AS MATERIALIZED (
+       SELECT pg_advisory_xact_lock(209260908)
+     ),
+     daily AS (
+       SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL)::int AS trades,
+              COALESCE(SUM(mt5_profit),0)::float8 AS profit
+         FROM scalper_signals, lock
+        WHERE created_at >= $12::timestamptz
+     ),
+     recent AS MATERIALIZED (
+       SELECT outcome,closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
+         FROM scalper_signals
+        WHERE outcome IS NOT NULL
+        ORDER BY closed_at DESC
+        LIMIT 3
+     ),
+     recent_summary AS (
+       SELECT COUNT(*) FILTER (WHERE outcome='LOSS')::int AS recent_losses,
+              MAX(outcome) FILTER (WHERE rn=1) AS latest_outcome,
+              MAX(closed_at) FILTER (WHERE rn=1) AS latest_closed_at
+         FROM recent
+     ),
+     control AS (
+       SELECT COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
+              (SELECT id::text FROM scalper_signals
+                WHERE outcome IS NULL AND direction IN ('BUY','SELL')
+                ORDER BY created_at DESC LIMIT 1) AS active_signal_id
+         FROM lock
+     ),
+     decision AS (
+       SELECT CASE
+         WHEN control.stopped THEN 'system_stopped'
+         WHEN control.active_signal_id IS NOT NULL THEN 'blocked_existing_signal'
+         WHEN daily.trades >= $8::int THEN 'max_trades_per_day'
+         WHEN daily.profit <= -$9::float8 THEN 'max_daily_loss'
+         WHEN recent_summary.recent_losses >= 3
+              AND recent_summary.latest_closed_at IS NOT NULL
+              AND EXTRACT(EPOCH FROM (now() - recent_summary.latest_closed_at)) < $10::float8 * 60
+           THEN 'three_loss_cooldown'
+         WHEN recent_summary.latest_outcome='LOSS'
+              AND recent_summary.latest_closed_at IS NOT NULL
+              AND EXTRACT(EPOCH FROM (now() - recent_summary.latest_closed_at)) < $11::float8 * 60
+           THEN 'loss_cooldown'
+         ELSE NULL
+       END AS reason
+       FROM daily,recent_summary,control
+     ),
+     inserted AS (
+       INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
+       SELECT $1,$2,$3,$4,$5,$6,$7 FROM decision WHERE reason IS NULL
+       RETURNING id::text AS id
+     )
+     SELECT decision.reason, inserted.id, control.active_signal_id
+       FROM decision CROSS JOIN control
+       LEFT JOIN inserted ON true`,
+    [
+      input.direction,
+      input.setup,
+      input.entry,
+      input.stopLoss,
+      input.takeProfit,
+      input.riskReward,
+      input.reasoning,
+      maxTrades,
+      maxDailyLoss,
+      threeLossCooldown,
+      lossCooldown,
+      start.toISOString(),
+    ],
+  );
+
+  const row = result.rows[0];
+  const reason = row?.reason ? String(row.reason) : null;
+  if (reason === "system_stopped") return { ok: false as const, status: "system_stopped" as const };
+  if (reason === "blocked_existing_signal") {
+    return {
+      ok: false as const,
+      status: "blocked_existing_signal" as const,
+      signalId: row?.active_signal_id ? String(row.active_signal_id) : null,
+    };
+  }
+  if (reason) return { ok: false as const, status: "blocked" as const, reason };
+  if (!row?.id) return { ok: false as const, status: "blocked" as const, reason: "reservation_failed" };
+  return { ok: true as const, signalId: String(row.id) };
 }
 
 export async function syncStreamingExecutor(connection: StreamingConnectionLike, options: SyncOptions = {}) {
@@ -164,29 +270,31 @@ export async function executeStreaming(
   const existing = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol());
   if (existing) return { status: "blocked_existing_position" as const, positionId: existing.id };
 
-  const [lim, control] = await Promise.all([
-    limits(),
-    dbQuery(
-      `SELECT
-         COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
-         (SELECT id FROM scalper_signals
-            WHERE outcome IS NULL AND direction IN ('BUY','SELL') AND id<>$1
-            ORDER BY created_at DESC LIMIT 1) AS active_signal_id`,
-      [signalId],
-    ),
-  ]);
+  if (!options.preflightDone) {
+    const [lim, control] = await Promise.all([
+      limits(),
+      dbQuery(
+        `SELECT
+           COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
+           (SELECT id FROM scalper_signals
+              WHERE outcome IS NULL AND direction IN ('BUY','SELL') AND id<>$1
+              ORDER BY created_at DESC LIMIT 1) AS active_signal_id`,
+        [signalId],
+      ),
+    ]);
 
-  if (control.rows[0]?.stopped === true) return { status: "system_stopped" as const };
-  if (control.rows[0]?.active_signal_id) {
-    return { status: "blocked_existing_signal" as const, signalId: String(control.rows[0].active_signal_id) };
+    if (control.rows[0]?.stopped === true) return { status: "system_stopped" as const };
+    if (control.rows[0]?.active_signal_id) {
+      return { status: "blocked_existing_signal" as const, signalId: String(control.rows[0].active_signal_id) };
+    }
+    if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
   }
-  if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
 
   try {
-    const options = { comment: "scalper streaming", clientId: clientId(signalId) };
+    const orderOptions = { comment: "scalper streaming", clientId: clientId(signalId) };
     const result = direction === "BUY"
-      ? await connection.createMarketBuyOrder(symbol(), lots(), stopLoss, takeProfit, options)
-      : await connection.createMarketSellOrder(symbol(), lots(), stopLoss, takeProfit, options);
+      ? await connection.createMarketBuyOrder(symbol(), lots(), stopLoss, takeProfit, orderOptions)
+      : await connection.createMarketSellOrder(symbol(), lots(), stopLoss, takeProfit, orderOptions);
 
     const orderId = typeof result.orderId === "string" ? result.orderId : null;
     const responsePositionId = typeof result.positionId === "string" ? result.positionId : null;

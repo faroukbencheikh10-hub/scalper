@@ -3,7 +3,7 @@ import { dbQuery, ensureSchema, setSetting, systemStopActive } from "../src/lib/
 import { autoExecEnabled } from "../src/lib/server/executor";
 import { fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
-import { executeStreaming, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
+import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
 import type { Candle, Quote } from "../src/lib/types";
 
 function required(name: string) {
@@ -146,7 +146,7 @@ async function main() {
     const signal = evaluateScalper({ quote, m1, m5 });
     latestDecision = {
       at: new Date().toISOString(),
-      mode: "event_driven_intrabar",
+      mode: "event_driven_intrabar_fast_preflight",
       direction: signal.direction,
       setup: signal.setup,
       reasoning: signal.reasoning,
@@ -162,19 +162,37 @@ async function main() {
 
     decisionBusy = true;
     try {
-      const saved = await dbQuery(
-        `INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
-         VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-        [signal.direction, signal.setup, signal.entry, signal.stopLoss, signal.takeProfit, signal.riskReward, signal.reasoning],
-      );
-      const signalId = String(saved.rows[0].id);
+      const reservation = await reserveStreamingSignal({
+        direction: signal.direction,
+        setup: signal.setup,
+        entry: signal.entry!,
+        stopLoss: signal.stopLoss!,
+        takeProfit: signal.takeProfit!,
+        riskReward: signal.riskReward!,
+        reasoning: signal.reasoning,
+      });
+
+      if (!reservation.ok) {
+        latestDecision = {
+          at: new Date().toISOString(),
+          mode: "event_driven_intrabar_fast_preflight",
+          direction: signal.direction,
+          setup: signal.setup,
+          reasoning: signal.reasoning,
+          quote,
+          execution: reservation,
+        };
+        return;
+      }
+
+      const signalId = reservation.signalId;
       const execution = await executeStreaming(
         signalId,
         signal.direction,
         signal.stopLoss!,
         signal.takeProfit!,
         tradingConnection,
-        { schemaReady: true, skipSync: true, systemStopped: stopped },
+        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true },
       );
 
       if (["blocked", "blocked_existing_position", "blocked_existing_signal", "system_stopped"].includes(execution.status)) {
@@ -189,7 +207,7 @@ async function main() {
 
       latestDecision = {
         at: new Date().toISOString(),
-        mode: "event_driven_intrabar",
+        mode: "event_driven_intrabar_fast_preflight",
         signalId,
         direction: signal.direction,
         setup: signal.setup,
@@ -220,7 +238,7 @@ async function main() {
     ready = true;
     await markWorker("streaming", {
       symbol: symbol(),
-      mode: "MetaApi WebSocket event-driven intrabar",
+      mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
       m1: m1.length,
       m5: m5.length,
     });
@@ -308,7 +326,7 @@ async function main() {
     heartbeatBusy = true;
     void markWorker(stopped ? "paused" : subscribed ? "streaming" : "connected", {
       symbol: symbol(),
-      mode: "MetaApi WebSocket event-driven intrabar",
+      mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
       autoExec: autoExecEnabled(),
       m1: m1.length,
       m5: m5.length,
