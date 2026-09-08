@@ -101,8 +101,6 @@ async function processClosedMinute(
   );
   if (active.rows[0]) return;
 
-  // La candela appena aperta è in fondo ai buffer: la escludiamo.
-  // La strategia lavora quindi solo su candele M1/M5 realmente chiuse.
   const closedM1 = m1.slice(0, -1);
   const currentM5Bucket = bucketStart(quote.quotedAt ?? Date.now(), 5);
   const closedM5 = m5.filter((c) => Date.parse(c.datetime) < currentM5Bucket);
@@ -171,10 +169,13 @@ async function main() {
 
   await markWorker("connected", { symbol: symbol(), mode: "MetaApi Streaming/WebSocket" });
 
+  const marketDataSubscriptions = [{ type: "quotes" as const }];
+  const marketDataUnsubscriptions = [{ type: "quotes" as const }];
+
   const shutdown = async (reason: string) => {
     try {
       await markWorker("stopping", { reason });
-      if (subscribed) await connection.unsubscribeFromMarketData(symbol()).catch(() => undefined);
+      if (subscribed) await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
       await connection.close();
       await markWorker("stopped", { reason });
     } finally {
@@ -191,7 +192,7 @@ async function main() {
       lastControlCheck = now;
       stopped = await systemStopActive();
       if (stopped && subscribed) {
-        await connection.unsubscribeFromMarketData(symbol()).catch(() => undefined);
+        await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
         subscribed = false;
         await setSetting("stream_last_quote", "");
         await markWorker("paused", { reason: "STOP TUTTO" });
@@ -201,7 +202,7 @@ async function main() {
           m1 = seeded.m1;
           m5 = seeded.m5;
         }
-        await connection.subscribeToMarketData(symbol());
+        await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);
         subscribed = true;
         await markWorker("streaming", { symbol: symbol(), m1: m1.length, m5: m5.length });
       }
@@ -265,7 +266,6 @@ main().catch(async (error) => {
     await setSetting("stream_worker_status", "error");
     await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
   } catch {
-    // Nessun'altra azione possibile se anche il DB non è raggiungibile.
   }
   process.exit(1);
 });
