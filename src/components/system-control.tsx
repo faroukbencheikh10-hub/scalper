@@ -14,7 +14,7 @@ export function SystemControl({stopped}:{stopped:boolean}){
     const next=!isStopped;
     const ok=window.confirm(next
       ? "STOP TUTTO? Blocca dati, analisi e nuove esecuzioni MT5. Le posizioni gia aperte NON vengono chiuse e restano protette da SL/TP sul broker."
-      : "AVVIARE TUTTO? Riprenderanno dati, analisi e possibili nuove esecuzioni MT5.");
+      : "RIATTIVARE TUTTO? Riprenderanno dati, analisi e possibili nuove esecuzioni MT5.");
     if(!ok)return;
     setBusy(true);setMsg(null);
     try{
@@ -35,7 +35,7 @@ export function SystemControl({stopped}:{stopped:boolean}){
       <span>{isStopped?"Dati · analisi · esecuzioni bloccati":"Dati e automazioni abilitate secondo configurazione"}</span>
     </div>
     <button type="button" className={isStopped?"resume-button":"stop-button"} onClick={toggle} disabled={busy}>
-      {busy?"Attendi…":isStopped?"AVVIA TUTTO":"STOP TUTTO"}
+      {busy?"Attendi…":isStopped?"RIATTIVA TUTTO":"STOP TUTTO"}
     </button>
     {msg?<p>{msg}</p>:null}
   </div>;
