@@ -37,6 +37,12 @@ export async function ensureSchema() {
       closed_at timestamptz
     );
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
+    CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)
+      WHERE outcome IS NULL AND direction IN ('BUY','SELL');
+    CREATE INDEX IF NOT EXISTS scalper_signals_closed_idx ON scalper_signals(closed_at DESC)
+      WHERE outcome IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS scalper_signals_executed_today_idx ON scalper_signals(created_at DESC)
+      WHERE mt5_order_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS scalper_settings (
       key text PRIMARY KEY,
       value text NOT NULL DEFAULT ''
