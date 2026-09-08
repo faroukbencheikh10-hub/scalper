@@ -18,7 +18,8 @@ export default async function Home() {
   const stopped = Boolean(s?.systemStopped);
   const streamOnline = Boolean(s?.stream?.online) && s?.stream?.status === "streaming";
   const direction = last?.direction ?? s?.stream?.lastDecision?.direction ?? "NO_TRADE";
-  const price = stopped ? "FERMO" : s?.quote?.mid?.toFixed?.(2) ?? "—";
+  const livePrice = s?.quote?.mid?.toFixed?.(2) ?? "—";
+  const price = stopped ? "FERMO" : livePrice;
   const results = s?.results;
   const lastResult = results?.last;
   const totalProfit = Number(results?.profit ?? 0);
@@ -41,7 +42,7 @@ export default async function Home() {
         </div>
 
         <div className="quote-panel">
-          <span className="quote-label">XAUUSD / LIVE</span>
+          <span className="quote-label">{stopped ? "XAUUSD / FERMO" : streamOnline ? "● XAUUSD / LIVE" : "XAUUSD / OFFLINE"}</span>
           <div className="price">{price}{!stopped && <small>USD</small>}</div>
         </div>
       </header>
@@ -50,19 +51,19 @@ export default async function Home() {
         <div className="status-copy">
           <div className="status-kicker">
             <span className="status-dot" aria-hidden="true" />
-            {stopped ? "TRADING ENGINE PAUSED" : streamOnline ? "TRADING ENGINE LIVE" : "CONNESSIONE IN VERIFICA"}
+            {stopped ? "TRADING ENGINE PAUSED" : streamOnline ? `LIVE XAUUSD · ${livePrice} USD` : "CONNESSIONE IN VERIFICA"}
           </div>
-          <h1>{stopped ? "Sistema fermo" : "Scalper operativo"}</h1>
+          <h1>{stopped ? "Sistema fermo" : streamOnline ? `LIVE · ${livePrice} USD` : "Scalper operativo"}</h1>
           <p>
             {stopped
               ? "Dati, analisi e nuove esecuzioni sono bloccati."
               : streamOnline
-                ? "MetaApi WebSocket attivo · analisi intrabar tick per tick · esecuzione automatica pronta."
+                ? `Prezzo XAUUSD ${livePrice} USD · MetaApi WebSocket attivo · analisi intrabar tick per tick · esecuzione automatica pronta.`
                 : "Il sistema è abilitato, ma il worker streaming non risulta online in questo momento."}
           </p>
         </div>
         <div className={`state-badge ${stopped ? "off" : streamOnline ? "on" : "off"}`}>
-          {stopped ? "FERMO" : streamOnline ? "ATTIVO" : "OFFLINE"}
+          {stopped ? "FERMO" : streamOnline ? `● LIVE · ${livePrice} USD` : "OFFLINE"}
         </div>
       </section>
 
@@ -82,10 +83,10 @@ export default async function Home() {
         <article className="stream-card">
           <div className="card-heading">
             <div><span className="card-index">01</span><h3>Streaming</h3></div>
-            <span className={`mini-light ${streamOnline && !stopped ? "live" : ""}`} aria-hidden="true" />
+            <span className="rainbow-label">{stopped ? "PAUSED" : streamOnline ? `LIVE ${livePrice}` : "OFFLINE"}</span>
           </div>
-          <div className="dir">{stopped ? "PAUSED" : s?.stream?.status ?? "not_started"}</div>
-          <p>{stopped ? "Worker in pausa tramite STOP TUTTO." : s?.stream?.online ? "Worker collegato a MetaApi in tempo reale." : "Worker non rilevato: esecuzione streaming non disponibile."}</p>
+          <div className="dir">{stopped ? "PAUSED" : streamOnline ? `LIVE · ${livePrice} USD` : s?.stream?.status ?? "not_started"}</div>
+          <p>{stopped ? "Worker in pausa tramite STOP TUTTO." : s?.stream?.online ? `XAUUSD live a ${livePrice} USD · worker collegato a MetaApi in tempo reale.` : "Worker non rilevato: esecuzione streaming non disponibile."}</p>
           <p className="heartbeat">Heartbeat <span>{s?.stream?.heartbeat ?? "—"}</span></p>
         </article>
 
