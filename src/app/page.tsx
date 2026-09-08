@@ -19,6 +19,12 @@ export default async function Home() {
   const streamOnline = Boolean(s?.stream?.online) && s?.stream?.status === "streaming";
   const direction = last?.direction ?? s?.stream?.lastDecision?.direction ?? "NO_TRADE";
   const price = stopped ? "FERMO" : s?.quote?.mid?.toFixed?.(2) ?? "—";
+  const results = s?.results;
+  const lastResult = results?.last;
+  const totalProfit = Number(results?.profit ?? 0);
+  const totalR = Number(results?.resultR ?? 0);
+  const lastProfit = Number(lastResult?.mt5_profit ?? 0);
+  const lastR = Number(lastResult?.result_r ?? 0);
 
   return (
     <main>
@@ -107,7 +113,24 @@ export default async function Home() {
 
         <article className="rules-card">
           <div className="card-heading rules-heading">
-            <div><span className="card-index">04</span><h3>Parametri operativi</h3></div>
+            <div><span className="card-index">04</span><h3>Risultati</h3></div>
+            <span className="rainbow-label">PERFORMANCE</span>
+          </div>
+          <dl className="rules">
+            <div><dt>Trade chiusi</dt><dd>{results?.total ?? 0}</dd></div>
+            <div><dt>WIN</dt><dd className="positive">{results?.wins ?? 0}</dd></div>
+            <div><dt>LOSS</dt><dd className="negative">{results?.losses ?? 0}</dd></div>
+            <div><dt>Win rate</dt><dd>{Number(results?.winRate ?? 0).toFixed(1)}%</dd></div>
+            <div><dt>Profitto totale</dt><dd className={totalProfit > 0 ? "positive" : totalProfit < 0 ? "negative" : ""}>{totalProfit >= 0 ? "+" : ""}{totalProfit.toFixed(2)}</dd></div>
+          </dl>
+          <p className="heartbeat">
+            Breakeven <span>{results?.breakeven ?? 0}</span> · R totale <span>{totalR >= 0 ? "+" : ""}{totalR.toFixed(2)}R</span> · Ultimo risultato <span className={lastResult?.outcome === "WIN" ? "positive" : lastResult?.outcome === "LOSS" ? "negative" : ""}>{lastResult ? `${lastResult.outcome} · ${lastProfit >= 0 ? "+" : ""}${lastProfit.toFixed(2)} · ${lastR >= 0 ? "+" : ""}${lastR.toFixed(2)}R` : "—"}</span>
+          </p>
+        </article>
+
+        <article className="rules-card">
+          <div className="card-heading rules-heading">
+            <div><span className="card-index">05</span><h3>Parametri operativi</h3></div>
             <span className="rainbow-label">SCALPER MODE</span>
           </div>
           <dl className="rules">
