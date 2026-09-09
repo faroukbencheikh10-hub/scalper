@@ -12,7 +12,6 @@ type StreamPosition = {
   volume?: number;
   clientId?: string;
   type?: string;
-  profit?: number;
 };
 
 export type StreamAccountInformation = {
@@ -77,7 +76,6 @@ export type StreamClosure = {
 };
 
 const historyAttemptAt = new Map<string, number>();
-const profitCloseAttemptAt = new Map<string, number>();
 let historyBackoffUntil = 0;
 let historyBackoffLoaded = false;
 let historyErrorActive = false;
@@ -93,10 +91,6 @@ function maxOpenPositions() {
 
 function minReentrySec() {
   return envN("SCALPER_MIN_REENTRY_SEC", 120, 0);
-}
-
-function profitTarget() {
-  return envN("SCALPER_PROFIT_TARGET", 3, 0);
 }
 
 /**
@@ -362,39 +356,12 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       ORDER BY created_at ASC`,
   );
   const positions = connection.terminalState.positions ?? [];
-  const positionIds = new Set(positions.map((position) => position.id));
-  for (const id of [...profitCloseAttemptAt.keys()]) {
-    if (!positionIds.has(id)) profitCloseAttemptAt.delete(id);
-  }
-
   const closures: StreamClosure[] = [];
   let closed = 0;
 
   for (const signal of rows.rows) {
     const position = positions.find((p) => p.id === signal.mt5_position_id);
-    if (position) {
-      const target = profitTarget();
-      const currentProfit = Number(position.profit);
-      const lastAttempt = profitCloseAttemptAt.get(position.id) ?? 0;
-      if (target > 0 && Number.isFinite(currentProfit) && currentProfit >= target && Date.now() - lastAttempt >= 5000) {
-        profitCloseAttemptAt.set(position.id, Date.now());
-        try {
-          console.log("[scalper-worker] profit_target_close", {
-            signalId: String(signal.id),
-            positionId: position.id,
-            profit: Number(currentProfit.toFixed(2)),
-            target,
-          });
-          await connection.closePosition(position.id);
-        } catch (error) {
-          profitCloseAttemptAt.delete(position.id);
-          const message = `Chiusura profit target fallita posizione ${position.id}: ${errorText(error)}`;
-          console.error("[scalper-worker] profit_target_close_error", { positionId: position.id, error: errorText(error) });
-          await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
-        }
-      }
-      continue;
-    }
+    if (position) continue;
 
     const positionId = String(signal.mt5_position_id);
     const lookup = await fetchHistoryThrottled(positionId);
@@ -433,7 +400,6 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       ],
     );
     historyAttemptAt.delete(positionId);
-    profitCloseAttemptAt.delete(positionId);
     closures.push({
       signalId: String(signal.id),
       positionId,
