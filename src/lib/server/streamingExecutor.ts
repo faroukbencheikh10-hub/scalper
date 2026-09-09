@@ -8,7 +8,6 @@ type StreamPosition = {
   symbol: string;
   openPrice: number;
   volume?: number;
-  profit?: number;
   clientId?: string;
   type?: string;
 };
@@ -50,8 +49,6 @@ type ReserveSignalInput = {
 type DealHistory = Awaited<ReturnType<typeof deals>>;
 
 const timeStopRequested = new Set<string>();
-const quickProfitRequested = new Set<string>();
-const quickProfitRetryAt = new Map<string, number>();
 const historyAttemptAt = new Map<string, number>();
 let historyBackoffUntil = 0;
 let historyBackoffLoaded = false;
@@ -64,10 +61,6 @@ function envN(name: string, fallback: number, min = 0) {
 
 function maxOpenPositions() {
   return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 3, 1))));
-}
-
-function quickProfitTarget() {
-  return envN("SCALPER_QUICK_PROFIT", 2.5, 0.1);
 }
 
 function historyRetryMs() {
@@ -292,7 +285,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
 export async function syncStreamingExecutor(connection: StreamingConnectionLike, options: SyncOptions = {}) {
   if (!options.schemaReady) await ensureSchema();
   const stopped = options.systemStopped ?? await systemStopActive();
-  if (stopped) return { checked: 0, closed: 0, timedOut: 0, quickProfits: 0, stopped: true };
+  if (stopped) return { checked: 0, closed: 0, timedOut: 0, stopped: true };
 
   const rows = await dbQuery(
     `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
@@ -303,42 +296,14 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
   const positions = connection.terminalState.positions ?? [];
   const legacyTimeoutSec = envN("SCALPER_TIME_STOP_MIN", 12, 0.25) * 60;
   const timeoutSec = envN("SCALPER_TIME_STOP_SEC", legacyTimeoutSec, 15);
-  const profitTarget = quickProfitTarget();
   let closed = 0;
   let timedOut = 0;
-  let quickProfits = 0;
 
   for (const signal of rows.rows) {
     const position = positions.find((p) => p.id === signal.mt5_position_id);
     if (position) {
-      const liveProfit = Number(position.profit);
-      const retryAt = quickProfitRetryAt.get(position.id) ?? 0;
-      if (Number.isFinite(liveProfit) && liveProfit >= profitTarget && Date.now() >= retryAt && !quickProfitRequested.has(position.id)) {
-        quickProfitRequested.add(position.id);
-        try {
-          await connection.closePosition(position.id);
-          quickProfitRetryAt.delete(position.id);
-          quickProfits++;
-          console.log("[scalper-worker] quick_profit_close", {
-            positionId: position.id,
-            profit: Number(liveProfit.toFixed(2)),
-            target: profitTarget,
-          });
-        } catch (error) {
-          quickProfitRequested.delete(position.id);
-          quickProfitRetryAt.set(position.id, Date.now() + 2000);
-          console.warn("[scalper-worker] quick_profit_close_error", {
-            positionId: position.id,
-            profit: Number(liveProfit.toFixed(2)),
-            target: profitTarget,
-            error: errorText(error),
-          });
-        }
-        continue;
-      }
-
       const ageSec = (Date.now() - new Date(signal.created_at).getTime()) / 1000;
-      if (ageSec >= timeoutSec && !timeStopRequested.has(position.id) && !quickProfitRequested.has(position.id)) {
+      if (ageSec >= timeoutSec && !timeStopRequested.has(position.id)) {
         timeStopRequested.add(position.id);
         try {
           await connection.closePosition(position.id);
@@ -353,8 +318,6 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
 
     const positionId = String(signal.mt5_position_id);
     timeStopRequested.delete(positionId);
-    quickProfitRequested.delete(positionId);
-    quickProfitRetryAt.delete(positionId);
     const lookup = await fetchHistoryThrottled(positionId);
     if (lookup.status !== "ok") continue;
     const history = lookup.history;
@@ -384,7 +347,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
     closed++;
   }
 
-  return { checked: rows.rows.length, closed, timedOut, quickProfits, stopped: false };
+  return { checked: rows.rows.length, closed, timedOut, stopped: false };
 }
 
 export async function executeStreaming(
