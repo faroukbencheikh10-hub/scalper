@@ -200,6 +200,9 @@ async function main() {
   // lascia sempre i lotti scelti in dashboard, il rischio resta solo informativo su log e Telegram.
   const riskMaxPct = envNum("RISK_MAX_PCT", 0);
   const riskFallbackLots = envNum("RISK_FALLBACK_LOTS", 0.01);
+  // Solo per l'heartbeat: i limiti veri vivono in reserveStreamingSignal, qui servono a mostrarli.
+  const maxTradesPerDay = envInt("MAX_TRADES_PER_DAY", 12, 1, 1000);
+  const tradeDedupSeconds = envNum("TRADE_DEDUP_SECONDS", 30);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -347,6 +350,10 @@ async function main() {
     account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
+    maxTradesPerDay,
+    tradeDedupSeconds,
+    riskMaxPct,
+    riskCapActive: riskMaxPct > 0,
     ...lossGuards(),
     m1: m1.length,
     m5: m5.length,
