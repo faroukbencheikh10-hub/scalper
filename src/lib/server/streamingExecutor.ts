@@ -52,7 +52,7 @@ function envN(name: string, fallback: number, min = 0) {
 }
 
 function shortClientId() {
-  return `SC_${randomBytes(4).toString("hex")}`;
+  return `SC_XAU_${randomBytes(4).toString("hex")}`;
 }
 
 async function limits() {
