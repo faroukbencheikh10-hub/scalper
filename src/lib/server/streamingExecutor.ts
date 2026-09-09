@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { dbQuery, ensureSchema, getSetting, setSetting, systemStopActive } from "./db";
-import { autoExecEnabled, lots } from "./executor";
+import { autoExecEnabled, lots } from "./tradingConfig";
 import { deals, symbol } from "./metaApi";
 
 type StreamPosition = {
@@ -48,7 +48,6 @@ type ReserveSignalInput = {
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
 
-const timeStopRequested = new Set<string>();
 const historyAttemptAt = new Map<string, number>();
 let historyBackoffUntil = 0;
 let historyBackoffLoaded = false;
@@ -285,7 +284,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
 export async function syncStreamingExecutor(connection: StreamingConnectionLike, options: SyncOptions = {}) {
   if (!options.schemaReady) await ensureSchema();
   const stopped = options.systemStopped ?? await systemStopActive();
-  if (stopped) return { checked: 0, closed: 0, timedOut: 0, stopped: true };
+  if (stopped) return { checked: 0, closed: 0, stopped: true };
 
   const rows = await dbQuery(
     `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
@@ -294,30 +293,13 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       ORDER BY created_at ASC`,
   );
   const positions = connection.terminalState.positions ?? [];
-  const legacyTimeoutSec = envN("SCALPER_TIME_STOP_MIN", 12, 0.25) * 60;
-  const timeoutSec = envN("SCALPER_TIME_STOP_SEC", legacyTimeoutSec, 15);
   let closed = 0;
-  let timedOut = 0;
 
   for (const signal of rows.rows) {
     const position = positions.find((p) => p.id === signal.mt5_position_id);
-    if (position) {
-      const ageSec = (Date.now() - new Date(signal.created_at).getTime()) / 1000;
-      if (ageSec >= timeoutSec && !timeStopRequested.has(position.id)) {
-        timeStopRequested.add(position.id);
-        try {
-          await connection.closePosition(position.id);
-          timedOut++;
-        } catch (error) {
-          timeStopRequested.delete(position.id);
-          throw error;
-        }
-      }
-      continue;
-    }
+    if (position) continue;
 
     const positionId = String(signal.mt5_position_id);
-    timeStopRequested.delete(positionId);
     const lookup = await fetchHistoryThrottled(positionId);
     if (lookup.status !== "ok") continue;
     const history = lookup.history;
@@ -339,15 +321,25 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
 
     await dbQuery(
       `UPDATE scalper_signals
-          SET mt5_close_price=$2,mt5_profit=$3,outcome=$4,result_r=$5,closed_at=COALESCE($6::timestamptz,now())
+          SET mt5_close_price=$2,mt5_profit=$3,outcome=$4,result_r=$5,closed_at=COALESCE($6::timestamptz,now()),
+              mt5_open_price=COALESCE(mt5_open_price,$7),mt5_volume=COALESCE(mt5_volume,$8)
         WHERE id=$1`,
-      [signal.id, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null],
+      [
+        signal.id,
+        close,
+        profit,
+        profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN",
+        resultR,
+        out.time ?? null,
+        open,
+        Number(inn?.volume ?? out.volume ?? lots()),
+      ],
     );
     historyAttemptAt.delete(positionId);
     closed++;
   }
 
-  return { checked: rows.rows.length, closed, timedOut, stopped: false };
+  return { checked: rows.rows.length, closed, stopped: false };
 }
 
 export async function executeStreaming(
@@ -439,8 +431,8 @@ export async function executeStreaming(
   if (responsePositionId) {
     const position = (connection.terminalState.positions ?? []).find((p) => p.id === responsePositionId);
     await dbQuery(
-      `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
-      [signalId, responsePositionId, position?.openPrice ?? null],
+      `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3,mt5_volume=$4 WHERE id=$1`,
+      [signalId, responsePositionId, position?.openPrice ?? null, position?.volume ?? orderLots],
     );
     return { status: "opened" as const, orderId, positionId: responsePositionId, openPrice: position?.openPrice ?? null, clientId: orderClientId };
   }
@@ -453,8 +445,8 @@ export async function executeStreaming(
     );
     if (position) {
       await dbQuery(
-        `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
-        [signalId, position.id, position.openPrice],
+        `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3,mt5_volume=$4 WHERE id=$1`,
+        [signalId, position.id, position.openPrice, position.volume ?? orderLots],
       );
       return { status: "opened" as const, orderId, positionId: position.id, openPrice: position.openPrice, clientId: orderClientId };
     }

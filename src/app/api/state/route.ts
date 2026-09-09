@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { dbQuery, ensureSchema } from "@/lib/server/db";
-import { lots } from "@/lib/server/executor";
+import { lots } from "@/lib/server/tradingConfig";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
 
 export const dynamic = "force-dynamic";

@@ -1,6 +1,6 @@
 import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, setSetting, systemStopActive } from "../src/lib/server/db";
-import { autoExecEnabled } from "../src/lib/server/executor";
+import { autoExecEnabled, lots } from "../src/lib/server/tradingConfig";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
@@ -275,9 +275,20 @@ async function main() {
       await dbQuery(
         `UPDATE scalper_signals
             SET mt5_position_id=COALESCE(mt5_position_id,$2),mt5_open_price=COALESCE(mt5_open_price,$3),
-                mt5_close_price=$4,mt5_profit=$5,outcome=$6,result_r=$7,closed_at=COALESCE($8::timestamptz,now())
+                mt5_close_price=$4,mt5_profit=$5,outcome=$6,result_r=$7,closed_at=COALESCE($8::timestamptz,now()),
+                mt5_volume=COALESCE(mt5_volume,$9)
           WHERE id=$1`,
-        [signal.id, position.id, open, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null],
+        [
+          signal.id,
+          position.id,
+          open,
+          close,
+          profit,
+          profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN",
+          resultR,
+          out.time ?? null,
+          Number(position.volume ?? inn?.volume ?? lots()),
+        ],
       );
       await dbQuery(
         `UPDATE trades SET reason=$2,payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason',$2)
@@ -289,17 +300,18 @@ async function main() {
 
     const direction = String(position.type ?? "").includes("SELL") ? "SELL" : String(position.type ?? "").includes("BUY") ? "BUY" : null;
     const openedAt = position.time instanceof Date ? position.time.toISOString() : typeof position.time === "string" ? position.time : null;
-    const externalParams = [symbol(), position.id, direction, position.openPrice ?? inn?.price ?? null, close, profit, reason, openedAt, out.time ?? null, JSON.stringify({ volume: position.volume ?? null })];
+    const lot = Number(position.volume ?? inn?.volume ?? lots());
+    const externalParams = [symbol(), position.id, direction, position.openPrice ?? inn?.price ?? null, close, profit, reason, openedAt, out.time ?? null, JSON.stringify({ volume: position.volume ?? null }), lot];
     const updated = await dbQuery(
       `UPDATE trades SET direction=$3,open_price=$4,close_price=$5,profit=$6,reason=$7,opened_at=$8,
-              closed_at=COALESCE($9::timestamptz,now()),payload=$10::jsonb
+              closed_at=COALESCE($9::timestamptz,now()),payload=$10::jsonb,lot=$11
         WHERE source='flatten_external' AND symbol=$1 AND mt5_position_id=$2`,
       externalParams,
     );
     if (updated.rowCount === 0) {
       await dbQuery(
-        `INSERT INTO trades(source,signal_id,symbol,mt5_position_id,direction,open_price,close_price,profit,result_r,reason,opened_at,closed_at,payload)
-         VALUES('flatten_external',NULL,$1,$2,$3,$4,$5,$6,NULL,$7,$8,COALESCE($9::timestamptz,now()),$10::jsonb)`,
+        `INSERT INTO trades(source,scalper_signal_id,symbol,mt5_position_id,direction,open_price,close_price,profit,result_r,reason,opened_at,closed_at,payload,lot)
+         VALUES('flatten_external',NULL,$1,$2,$3,$4,$5,$6,NULL,$7,$8,COALESCE($9::timestamptz,now()),$10::jsonb,$11)`,
         externalParams,
       );
     }
@@ -616,7 +628,7 @@ async function main() {
     syncBusy = true;
     void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
       .then((result) => {
-        if (result.closed > 0 || result.timedOut > 0) signalLockUntil = 0;
+        if (result.closed > 0) signalLockUntil = 0;
       })
       .catch((error) => setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`))
       .finally(() => {

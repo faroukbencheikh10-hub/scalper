@@ -19,7 +19,6 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 - Storico iniziale: 500 M1 e 300 M5, configurabile fino a 1000.
 - Stop dinamico 2–5 USD.
 - TP predefinito 1.45R.
-- Time-stop 12 minuti.
 - Una sola posizione XAUUSD alla volta.
 - Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive.
 - Filtro spread, ATR M1 e filtro shock.
@@ -31,6 +30,8 @@ Il worker apre una connessione MetaApi Streaming, attende la sincronizzazione MT
 Il loop interno controlla il terminal state ogni 250 ms di default. La quota mostrata dalla dashboard viene persistita circa ogni secondo. Quando nasce una nuova candela M1, la candela precedente viene considerata chiusa e viene eseguita la strategia.
 
 Se `AUTO_EXEC=true`, BUY/SELL vengono inviati direttamente tramite la stessa connessione MetaApi Streaming.
+
+L'esecuzione su MT5 avviene **soltanto** nel worker: la dashboard e `/api/generate` si limitano all'analisi. Le posizioni si chiudono solo per SL/TP, flatten di fine sessione o STOP TUTTO: non esiste alcuna chiusura per durata.
 
 ## STOP TUTTO
 

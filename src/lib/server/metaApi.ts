@@ -107,16 +107,8 @@ export async function fetchCandles(timeframe: "1m" | "5m", limit: number): Promi
   });
 }
 
-type Position = { id: string; symbol: string; openPrice: number; stopLoss?: number; takeProfit?: number; volume: number; clientId?: string };
-type Deal = { price?: number; profit?: number; entryType?: string; time?: string };
-type TradeResponse = { numericCode?: number; stringCode?: string; message?: string; orderId?: string; positionId?: string };
+type Deal = { price?: number; profit?: number; volume?: number; entryType?: string; time?: string };
 
-export async function positions(): Promise<Position[]> {
-  return withRegion(async region => {
-    const d = await request(`${clientBase(region)}/users/current/accounts/${accountId()}/positions?refreshTerminalState=true`);
-    return Array.isArray(d) ? d as Position[] : [];
-  });
-}
 export async function deals(positionId: string): Promise<Deal[]> {
   const pausedUntil = await activeHistoryBackoff();
   if (pausedUntil) throw new Error(`MetaApi history backoff active until ${pausedUntil}`);
@@ -132,25 +124,4 @@ export async function deals(positionId: string): Promise<Deal[]> {
     }
     throw error;
   }
-}
-function ok(r: TradeResponse) {
-  return [10008,10009,10010].includes(Number(r.numericCode)) || ["TRADE_RETCODE_PLACED","TRADE_RETCODE_DONE","TRADE_RETCODE_DONE_PARTIAL"].includes(r.stringCode ?? "");
-}
-async function trade(body: Record<string, unknown>) {
-  return withRegion(async region => request(`${clientBase(region)}/users/current/accounts/${accountId()}/trade`, { method: "POST", body: JSON.stringify(body) }) as Promise<TradeResponse>);
-}
-function clientId(signalId: string) {
-  const compact = signalId.replace(/-/g, "").slice(-10);
-  return `SC_XAUUSD_${compact}`;
-}
-export async function openMarket(signalId: string, direction: "BUY"|"SELL", volume: number, stopLoss: number, takeProfit: number) {
-  const r = await trade({ actionType: direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL", symbol: symbol(), volume,
-    stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), stopLossUnits: "ABSOLUTE_PRICE", takeProfitUnits: "ABSOLUTE_PRICE", clientId: clientId(signalId) });
-  if (!ok(r)) throw new Error(`Ordine MT5 rifiutato: ${r.stringCode ?? r.numericCode ?? "?"} ${r.message ?? ""}`.trim());
-  return r;
-}
-export async function closePosition(positionId: string, signalId: string) {
-  const r = await trade({ actionType: "POSITION_CLOSE_ID", positionId, clientId: clientId(signalId) });
-  if (!ok(r)) throw new Error(`Chiusura MT5 rifiutata: ${r.stringCode ?? r.numericCode ?? "?"} ${r.message ?? ""}`.trim());
-  return r;
 }
