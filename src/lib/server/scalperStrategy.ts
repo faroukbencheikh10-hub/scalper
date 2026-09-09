@@ -50,6 +50,31 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const trendUp = lastM5Close > fast5! && fast5! > slow5!;
   const trendDown = lastM5Close < fast5! && fast5! < slow5!;
 
+  // Solo filtro anti-accumulo M1: non modifica direzione, setup, SL o TP originali.
+  // Blocca le zone con candele sovrapposte/alternate e riparte solo dopo una rottura chiara della fascia recente.
+  const rangeBars = m1.slice(Math.max(0, m1.length - 12), m1.length - 2);
+  const rangeHigh = Math.max(...rangeBars.map(c => c.high));
+  const rangeLow = Math.min(...rangeBars.map(c => c.low));
+  const rangeWidth = rangeHigh - rangeLow;
+  const emaGap = Math.abs(fast1! - slow1!);
+  let flips = 0;
+  let previousSign = 0;
+  for (const candle of m1.slice(-9, -1)) {
+    const sign = Math.sign(candle.close - candle.open);
+    if (sign !== 0 && previousSign !== 0 && sign !== previousSign) flips++;
+    if (sign !== 0) previousSign = sign;
+  }
+  const compressed = rangeWidth <= atr1 * envN("SCALPER_RANGE_WIDTH_ATR", 2.8)
+    && emaGap <= atr1 * envN("SCALPER_EMA_COMPRESSION_ATR", 0.35);
+  const choppy = flips >= Math.floor(envN("SCALPER_RANGE_FLIPS", 4))
+    && rangeWidth <= atr1 * envN("SCALPER_CHOP_WIDTH_ATR", 3.5);
+  const breakoutBuffer = atr1 * envN("SCALPER_BREAKOUT_BUFFER_ATR", 0.12);
+  const breakoutUp = bullish(last) && last.close > rangeHigh + breakoutBuffer;
+  const breakoutDown = bearish(last) && last.close < rangeLow - breakoutBuffer;
+  if ((compressed || choppy) && !breakoutUp && !breakoutDown) {
+    return no(`Accumulo M1: range ${rangeWidth.toFixed(2)}$, gap EMA ${emaGap.toFixed(2)}$, inversioni ${flips}. Attendo uscita chiara dalla fascia.`);
+  }
+
   let direction: "BUY" | "SELL" | null = null;
   let setup: "micro_pullback" | "liquidity_sweep" | null = null;
   let structureStop: number | null = null;
