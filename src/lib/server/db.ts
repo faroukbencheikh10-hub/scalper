@@ -162,6 +162,12 @@ export async function getSetting(key: string) {
   const r = await dbQuery(`SELECT value FROM scalper_settings WHERE key=$1`, [key]);
   return r.rows[0]?.value as string | undefined;
 }
+export async function getSettings(keys: readonly string[]) {
+  const r = await dbQuery(`SELECT key,value FROM scalper_settings WHERE key = ANY($1::text[])`, [keys]);
+  const map = new Map<string, string>();
+  for (const row of r.rows as Array<{ key: string; value: string }>) map.set(row.key, row.value);
+  return map;
+}
 export async function setSetting(key: string, value: string) {
   await dbQuery(`INSERT INTO scalper_settings(key,value) VALUES($1,$2)
     ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`, [key, value]);

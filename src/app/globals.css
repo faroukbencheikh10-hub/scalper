@@ -221,6 +221,17 @@ main {
 .system-control strong { display: block; font-size: 13px; letter-spacing: .12em; }
 .system-control span { display: block; margin-top: 5px; color: var(--muted); font-size: 13px; line-height: 1.5; }
 .system-control p { grid-column: 1 / -1; margin: 2px 0 0; color: #c8d1e6; font-size: 13px; }
+.control-actions { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+.lot-picker { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid rgba(255,255,255,.18); border-radius: 13px; background: rgba(8,12,26,.55); }
+.lot-picker span { margin: 0; color: var(--muted); font: 800 11px ui-monospace, monospace; letter-spacing: .1em; text-transform: uppercase; }
+.lot-picker select { min-height: 32px; padding: 4px 8px; border: 1px solid rgba(255,255,255,.2); border-radius: 9px; color: #e9eefc; background: rgba(10,14,30,.9); font: 800 14px ui-monospace, monospace; cursor: pointer; }
+.lot-picker select:disabled { opacity: .55; cursor: not-allowed; }
+.lot-picker select:focus-visible { outline: 3px solid rgba(89,243,255,.65); outline-offset: 3px; }
+.system-control p.lot-metrics { font: 650 12px ui-monospace, monospace; color: #9aa7c7; }
+.lot-metrics strong { color: #e9eefc; }
+.lot-metrics strong.negative { color: #ff9db1; }
+.lot-metrics .lot-note { color: var(--muted); }
+.lot-metrics .negative { color: #ff9db1; }
 .system-control.running strong { color: var(--green); }
 .system-control.stopped strong { color: #ff9db1; }
 button {
@@ -399,6 +410,7 @@ article p { position: relative; z-index: 1; margin: 10px 0 0; color: #aeb9d2; fo
   .status-shell { grid-template-columns: 1fr; gap: 20px; padding: 23px 21px; border-radius: 20px; }
   .state-badge { justify-self: start; min-width: 112px; }
   .system-control { grid-template-columns: 1fr; padding: 17px; }
+  .lot-picker { justify-content: space-between; }
   .system-control button { width: 100%; margin-top: 5px; }
   .system-control p { grid-column: 1; }
   .dashboard-head { align-items: flex-start; flex-direction: column; }

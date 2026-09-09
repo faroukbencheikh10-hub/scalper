@@ -1,6 +1,7 @@
 import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
-import { dbQuery, ensureSchema, setSetting, systemStopActive } from "../src/lib/server/db";
-import { autoExecEnabled, lots } from "../src/lib/server/tradingConfig";
+import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
+import { autoExecEnabled, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
+import { EXEC_LOTS_SETTING_KEY } from "../src/lib/lots";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
@@ -183,7 +184,16 @@ async function main() {
 
   let subscribed = false;
   let ready = false;
-  let stopped = await systemStopActive();
+  let activeLots = lots();
+
+  // Unica lettura del ciclo di controllo: kill switch + lotti scelti dalla dashboard.
+  const refreshControl = async () => {
+    const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY]);
+    activeLots = resolveLots(settings.get(EXEC_LOTS_SETTING_KEY));
+    return settings.get("system_stop") === "true";
+  };
+
+  let stopped = await refreshControl();
   let m1: Candle[] = [];
   let m5: Candle[] = [];
   let latestQuote: Quote | null = null;
@@ -203,10 +213,28 @@ async function main() {
   const marketDataSubscriptions = [{ type: "quotes" as const }];
   const marketDataUnsubscriptions = [{ type: "quotes" as const }];
 
+  const accountSnapshot = () => {
+    const info = tradingConnection.terminalState.accountInformation;
+    if (!info) return null;
+    const num = (value: unknown) => (Number.isFinite(Number(value)) ? Number(value) : null);
+    return {
+      balance: num(info.balance),
+      equity: num(info.equity),
+      margin: num(info.margin),
+      freeMargin: num(info.freeMargin),
+      leverage: num(info.leverage),
+      currency: typeof info.currency === "string" ? info.currency : null,
+    };
+  };
+
   const workerDetail = () => ({
     symbol: symbol(),
-    mode: "MetaApi WebSocket event-driven intrabar + max 3 same-direction positions",
+    mode: `MetaApi WebSocket event-driven intrabar + max ${maxOpenPositions} same-direction positions`,
     autoExec: autoExecEnabled(),
+    lots: activeLots,
+    lotsMin: lotsMin(),
+    lotsMax: lotsMax(),
+    account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
     m1: m1.length,
@@ -491,7 +519,7 @@ async function main() {
         signal.stopLoss!,
         signal.takeProfit!,
         tradingConnection,
-        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true },
+        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: activeLots, price: quote.mid },
       );
 
       if ([
@@ -501,6 +529,7 @@ async function main() {
         "blocked_position_limit",
         "blocked_opposite_position",
         "blocked_unknown_position_direction",
+        "insufficient_margin",
         "system_stopped",
       ].includes(execution.status)) {
         const reason = "reason" in execution ? String(execution.reason ?? "") : "";
@@ -566,7 +595,7 @@ async function main() {
     controlBusy = true;
     void (async () => {
       try {
-        const nextStopped = await systemStopActive();
+        const nextStopped = await refreshControl();
         if (nextStopped && !stopped) {
           stopped = true;
           ready = false;

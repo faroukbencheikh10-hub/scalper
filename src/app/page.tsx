@@ -8,7 +8,8 @@ type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quoted
 type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string };
 type StreamError = { message: string; at: string | null };
 type Flatten = { at?: string; closed?: string[]; canceled?: string[]; reason?: string; failures?: string[] };
-type Signal = { direction?: string; reasoning?: string; mt5_position_id?: string | null };
+type Signal = { direction?: string; reasoning?: string; mt5_position_id?: string | null; entry?: number | string | null; stop_loss?: number | string | null };
+type Account = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
 type ResultItem = { outcome?: string; mt5_profit?: number | string | null; result_r?: number | string | null };
 
 type DashboardState = {
@@ -32,10 +33,14 @@ type DashboardState = {
   quote?: Quote | null;
   autoExec?: boolean | null;
   lots?: number;
+  lotsMin?: number;
+  lotsMax?: number;
+  lotChoices?: number[];
+  account?: Account | null;
   stream?: {
     status?: string;
     heartbeat?: string | null;
-    detail?: { symbol?: string; mode?: string; autoExec?: boolean; m1?: number; m5?: number } | null;
+    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; m1?: number; m5?: number } | null;
     lastDecision?: Decision | null;
     lastFlatten?: Flatten | null;
     currentError?: StreamError | null;
@@ -134,6 +139,7 @@ export default function Home() {
   const totalR = Number(results?.resultR ?? 0);
   const lastProfit = Number(lastResult?.mt5_profit ?? 0);
   const lastR = Number(lastResult?.result_r ?? 0);
+  const account = data?.account ?? data?.stream?.detail?.account ?? null;
   const flatten = data?.stream?.lastFlatten;
   const nextFlatten = data?.session?.nextFlattenAt;
 
@@ -182,7 +188,19 @@ export default function Home() {
 
       {pollError ? <p style={{ margin: "0 0 16px", padding: "10px 14px", border: "1px solid rgba(255,95,121,.4)", borderRadius: 12, color: "#ffb0c0", background: "rgba(120,25,49,.12)" }}>Aggiornamento non riuscito: {pollError}. Riprovo ogni 5 s.</p> : null}
 
-      {data ? <SystemControl stopped={data.systemStopped} onChanged={(stopped) => setData((current) => current ? { ...current, systemStopped: stopped } : current)} /> : null}
+      {data ? (
+        <SystemControl
+          stopped={data.systemStopped}
+          lots={data.lots}
+          lotChoices={data.lotChoices}
+          price={Number.isFinite(quote?.mid) ? Number(quote?.mid) : null}
+          entry={last?.entry === null || last?.entry === undefined ? null : Number(last.entry)}
+          stopLoss={last?.stop_loss === null || last?.stop_loss === undefined ? null : Number(last.stop_loss)}
+          account={data.account ?? data.stream?.detail?.account ?? null}
+          onChanged={(stopped) => setData((current) => current ? { ...current, systemStopped: stopped } : current)}
+          onLotsChanged={(lots) => setData((current) => current ? { ...current, lots } : current)}
+        />
+      ) : null}
 
       {data?.stream?.currentError ? (
         <article className="rules-card" style={{ marginBottom: 18, borderColor: "rgba(255,95,121,.5)" }}>
@@ -218,7 +236,8 @@ export default function Home() {
           <div className="card-heading"><div><span className="card-index">03</span><h3>Esecuzione</h3></div><span className="signal-glyph">⚡</span></div>
           <dl className="metrics">
             <div><dt>Auto MT5</dt><dd className={data?.autoExec === true ? "positive" : "negative"}>{data?.autoExec === true ? "ON" : data?.autoExec === false ? "OFF" : "—"}</dd></div>
-            <div><dt>Lotti</dt><dd>{data?.lots ?? "—"}</dd></div>
+            <div><dt>Lotti</dt><dd>{Number.isFinite(data?.lots) ? Number(data?.lots).toFixed(2) : "—"}</dd></div>
+            <div><dt>Margine libero</dt><dd>{money(Number(account?.freeMargin ?? Number.NaN))}</dd></div>
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Posizione</dt><dd className="mt5-value">{data?.systemStopped ? "flatten + STOP" : last?.mt5_position_id ? "aperta" : "nessuna"}</dd></div>
           </dl>

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { dbQuery, ensureSchema, getSetting, setSetting, systemStopActive } from "./db";
-import { autoExecEnabled, lots } from "./tradingConfig";
+import { autoExecEnabled, clampLots, lots } from "./tradingConfig";
+import { requiredMargin } from "@/lib/lots";
 import { deals, symbol } from "./metaApi";
 
 type StreamPosition = {
@@ -12,8 +13,19 @@ type StreamPosition = {
   type?: string;
 };
 
+export type StreamAccountInformation = {
+  balance?: number;
+  equity?: number;
+  margin?: number;
+  freeMargin?: number;
+  marginLevel?: number;
+  leverage?: number;
+  currency?: string;
+};
+
 type StreamTerminalState = {
   positions: StreamPosition[];
+  accountInformation?: StreamAccountInformation;
 };
 
 export type StreamingConnectionLike = {
@@ -33,6 +45,10 @@ type ExecuteOptions = {
   skipSync?: boolean;
   systemStopped?: boolean;
   preflightDone?: boolean;
+  /** Lotti attivi scelti dalla dashboard; senza valore si usa EXEC_LOTS. */
+  lots?: number;
+  /** Prezzo corrente usato per stimare il margine richiesto. */
+  price?: number;
 };
 
 type ReserveSignalInput = {
@@ -391,8 +407,25 @@ export async function executeStreaming(
   }
 
   const positionIdsBeforeOrder = new Set(openPositions.map((position) => position.id));
+  const orderLots = clampLots(options.lots ?? lots());
+
+  const marginPrice = Number(options.price);
+  const freeMargin = Number(connection.terminalState.accountInformation?.freeMargin);
+  if (Number.isFinite(marginPrice) && marginPrice > 0 && Number.isFinite(freeMargin)) {
+    const needed = requiredMargin(orderLots, marginPrice);
+    if (needed > freeMargin) {
+      console.warn("[scalper-worker] insufficient_margin", { lots: orderLots, needed, freeMargin });
+      return {
+        status: "insufficient_margin" as const,
+        reason: `${orderLots} lotti @ ${marginPrice.toFixed(2)}: richiesti ${needed.toFixed(2)}, liberi ${freeMargin.toFixed(2)}`,
+        lots: orderLots,
+        requiredMargin: Number(needed.toFixed(2)),
+        freeMargin: Number(freeMargin.toFixed(2)),
+      };
+    }
+  }
+
   const orderClientId = shortClientId();
-  const orderLots = lots();
   await dbQuery(`UPDATE scalper_signals SET client_id=$2 WHERE id=$1`, [signalId, orderClientId]);
   console.log("[scalper-worker] order_send", {
     clientId: orderClientId,
