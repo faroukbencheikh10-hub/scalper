@@ -39,6 +39,11 @@ export async function ensureSchema() {
       closed_at timestamptz
     );
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS quality_score integer;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS setup_key text;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS client_id text;
+    CREATE UNIQUE INDEX IF NOT EXISTS scalper_signals_setup_key_unique
+      ON scalper_signals(setup_key)
+      WHERE setup_key IS NOT NULL AND COALESCE(outcome,'') NOT IN ('ERROR','SKIPPED');
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS mt5_volume numeric;
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
     CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)

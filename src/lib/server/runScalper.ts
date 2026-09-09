@@ -17,7 +17,7 @@ export async function runScalper() {
   if(active.rows[0]) return {ok:true,skipped:true,reason:"signal_active",active:active.rows[0]};
 
   const m1Candles = envInt("SCALPER_M1_CANDLES", 500, 50, 1000);
-  const m5Candles = envInt("SCALPER_M5_CANDLES", 300, 50, 1000);
+  const m5Candles = envInt("SCALPER_M5_CANDLES", 300, 120, 1000);
   const [quote,m1,m5]=await Promise.all([fetchQuote(),fetchCandles("1m",m1Candles),fetchCandles("5m",m5Candles)]);
   const s=evaluateScalper({quote,m1,m5});
   if(s.direction==="NO_TRADE") return {ok:true,direction:"NO_TRADE",reasoning:s.reasoning,quote};

@@ -5,7 +5,9 @@ import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
-import { evaluateScalper } from "../src/lib/server/scalperStrategy";
+import { evaluateScalper, plannedEntryValid, STRATEGY_VERSION } from "../src/lib/server/scalperStrategy";
+import { aggregateM15, closedBars } from "../src/lib/server/marketStructure";
+import { riskPerLot } from "../src/lib/server/orderSafety";
 import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
 import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../src/lib/types";
@@ -57,13 +59,13 @@ function priceTimeMs(price: Record<string, unknown>) {
     const parsed = new Date(raw).getTime();
     if (Number.isFinite(parsed)) return parsed;
   }
-  return Date.now();
+  return Number.NaN;
 }
 
 function quoteFromPrice(price: Record<string, unknown>): Quote | null {
   const bid = Number(price.bid);
   const ask = Number(price.ask);
-  if (!Number.isFinite(bid) || !Number.isFinite(ask) || ask < bid) return null;
+  if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid <= 0 || ask < bid || !Number.isFinite(priceTimeMs(price))) return null;
   return {
     bid,
     ask,
@@ -180,7 +182,7 @@ async function main() {
   const token = required("METAAPI_TOKEN");
   const accountId = required("METAAPI_ACCOUNT_ID");
   const m1Max = envInt("SCALPER_M1_CANDLES", 500, 50, 1000);
-  const m5Max = envInt("SCALPER_M5_CANDLES", 300, 50, 1000);
+  const m5Max = envInt("SCALPER_M5_CANDLES", 300, 120, 1000);
   const controlPollMs = envInt("SCALPER_CONTROL_POLL_MS", 250, 100, 10_000);
   const heartbeatMs = envInt("SCALPER_STREAM_HEARTBEAT_MS", 3000, 1000, 60_000);
   const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 250, 100, 30_000);
@@ -239,6 +241,7 @@ async function main() {
   let lossPauseUntil = 0;
   const knownPositionIds = new Set<string>();
   let lastPositionCloseAt = 0;
+  let lastReseedAttempt = 0;
 
   const closedAtMs = (value: unknown) => {
     const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ""));
@@ -333,7 +336,8 @@ async function main() {
 
   const workerDetail = () => ({
     symbol: symbol(),
-    mode: `MetaApi WebSocket event-driven intrabar + max ${maxOpenPositions} same-direction positions`,
+    mode: `M15 trend / M5 pullback-retest / M1 chiusa + max ${maxOpenPositions} posizioni`,
+    strategyVersion: STRATEGY_VERSION,
     autoExec: autoExecEnabled(),
     lots: activeLots,
     lotsMin: lotsMin(),
@@ -349,6 +353,7 @@ async function main() {
     ...lossGuards(),
     m1: m1.length,
     m5: m5.length,
+    m15: aggregateM15(closedBars(m5, 5, Date.now()) ?? []).length,
     hoursUtc: sessionConfig.hoursUtc,
     flattenBeforeEndMin: sessionConfig.flattenBeforeEndMin,
     fridayCloseUtc: sessionConfig.fridayCloseUtc,
@@ -577,10 +582,27 @@ async function main() {
 
     const quote = quoteFromPrice(price);
     if (!quote) return;
+    if (quote.quotedAt! > Date.now() + 500 || Date.now() - quote.quotedAt! > finalQuoteMaxAgeMs
+      || (latestQuote?.quotedAt && quote.quotedAt! < latestQuote.quotedAt)) return;
+    const previousQuoteAt = latestQuote?.quotedAt ?? 0;
+    if (previousQuoteAt > 0 && quote.quotedAt! - previousQuoteAt > 60_000 && Date.now() - lastReseedAttempt > 30_000) {
+      lastReseedAttempt = Date.now();
+      ready = false;
+      try {
+        const seeded = await seedCandles(m1Max, m5Max);
+        m1 = seeded.m1; m5 = seeded.m5;
+      } catch (error) {
+        await setSetting("stream_last_error", new Date().toISOString() + " Ripristino storico dopo gap: " + String(error));
+        return;
+      } finally { ready = !stopped; }
+      // Reevaluate only on the next fresh quote, after history has been restored.
+      latestQuote = quote;
+      return;
+    }
     latestQuote = quote;
 
-    upsertTick(m1, 1, quote.mid, quote.quotedAt ?? Date.now(), m1Max);
-    upsertTick(m5, 5, quote.mid, quote.quotedAt ?? Date.now(), m5Max);
+    upsertTick(m1, 1, quote.bid, quote.quotedAt ?? Date.now(), m1Max);
+    upsertTick(m5, 5, quote.bid, quote.quotedAt ?? Date.now(), m5Max);
 
     const gate = sessionGuard(quote);
     if (!gate.allowed) {
@@ -687,6 +709,8 @@ async function main() {
     }
 
     decisionBusy = true;
+    let reservedSignalId: string | null = null;
+    let executionStarted = false;
     try {
       const preReservationGate = sessionGuard(quote);
       if (!preReservationGate.allowed) {
@@ -695,6 +719,7 @@ async function main() {
       }
 
       const reservation = await reserveStreamingSignal({
+        setupKey: signal.setupKey!,
         direction: signal.direction,
         setup: signal.setup,
         entry: signal.entry!,
@@ -724,6 +749,7 @@ async function main() {
       }
 
       const signalId = reservation.signalId;
+      reservedSignalId = signalId;
       const finalGate = sessionGuard(latestQuote ?? quote);
       if (!finalGate.allowed) {
         await markSkipped(signalId, finalGate.reasoning!);
@@ -745,7 +771,7 @@ async function main() {
       }
 
       const finalSignal = evaluateScalper({ quote: finalQuote, m1, m5 });
-      if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup) {
+      if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup || finalSignal.setupKey !== signal.setupKey) {
         const reason = finalSignal.direction === "NO_TRADE"
           ? `Final preflight: ${signal.direction}/${signal.setup ?? "—"} invalidato — ${finalSignal.reasoning}`
           : `Final preflight: segnale cambiato ${signal.direction}/${signal.setup ?? "—"} → ${finalSignal.direction}/${finalSignal.setup ?? "—"}.`;
@@ -790,15 +816,25 @@ async function main() {
       const slDistance = Math.abs(finalSignal.entry! - finalSignal.stopLoss!);
       const balanceKnown = Number.isFinite(balance) && balance > 0;
       const riskCap = riskMaxPct > 0 && balanceKnown ? (balance * riskMaxPct) / 100 : null;
+      const perLot = riskPerLot(slDistance,
+        Number(connection.terminalState.specification(symbol())?.tickSize),
+        Number(connection.terminalState.price(symbol())?.lossTickValue));
+      const orderRisk = (size: number) => perLot === null ? lossAtStop(size, slDistance) : size * perLot;
       let orderLots = activeLots;
       let lotsCapped = false;
-      if (riskCap !== null && lossAtStop(orderLots, slDistance) > riskCap) {
+      if (riskCap !== null && orderRisk(orderLots) > riskCap) {
         const reduced = clampLots(riskFallbackLots);
         lotsCapped = reduced !== orderLots;
         orderLots = reduced;
       }
-      const riskMoney = lossAtStop(orderLots, slDistance);
-      const riskPct = balanceKnown ? (riskMoney / balance) * 100 : null;
+      const riskMoney = orderRisk(orderLots);
+      if (riskMaxPct > 0 && (!balanceKnown || perLot === null || (riskCap !== null && riskMoney > riskCap))) {
+        const reason = "Cap rischio: saldo non disponibile o rischio ancora eccessivo dopo la riduzione dei lotti.";
+        await markSkipped(signalId, reason);
+        latestDecision = noTradeDecision(reason, finalQuote, { setup: finalSignal.setup, evaluations: finalSignal.evaluations });
+        return;
+      }
+      const riskPct = balanceKnown && perLot !== null ? (riskMoney / balance) * 100 : null;
       const riskPlan = {
         lots: orderLots,
         requestedLots: activeLots,
@@ -810,7 +846,7 @@ async function main() {
         riskPct: riskPct === null ? null : Number(riskPct.toFixed(2)),
         riskMaxPct,
         riskCapActive: riskCap !== null,
-        currency: account?.currency ?? null,
+        currency: perLot === null ? "USD (stima)" : account?.currency ?? null,
         overCap: riskCap !== null && riskMoney > riskCap,
         slPlan: finalSignal.slPlan,
       };
@@ -826,13 +862,17 @@ async function main() {
         sendAgeMs > finalQuoteMaxAgeMs
         || sendCheck.direction !== finalSignal.direction
         || sendCheck.setup !== finalSignal.setup
+        || sendCheck.setupKey !== finalSignal.setupKey
         || entryDrift > maxEntryDrift
+        || !plannedEntryValid(finalSignal, sendQuote)
       ) {
         const reason = sendAgeMs > finalQuoteMaxAgeMs
           ? `Final send-check: quote vecchia ${Math.round(sendAgeMs)} ms.`
           : sendCheck.direction !== finalSignal.direction || sendCheck.setup !== finalSignal.setup
             ? `Final send-check: ${finalSignal.direction}/${finalSignal.setup ?? "—"} non più valido, ora ${sendCheck.direction}/${sendCheck.setup ?? "—"}.`
-            : `Final send-check: prezzo mosso di ${entryDrift.toFixed(2)}$ oltre il massimo ${maxEntryDrift.toFixed(2)}$.`;
+            : !plannedEntryValid(finalSignal, sendQuote)
+              ? "Final send-check: SL/TP pianificati non rispettano più il rapporto netto o il limite di stop."
+              : `Final send-check: prezzo mosso di ${entryDrift.toFixed(2)}$ oltre il massimo ${maxEntryDrift.toFixed(2)}$.`;
         await markSkipped(signalId, reason);
         latestDecision = {
           at: new Date().toISOString(),
@@ -872,6 +912,7 @@ async function main() {
         ...riskPlan,
       }));
 
+      executionStarted = true;
       const execution = await executeStreaming(
         signalId,
         finalSignal.direction,
@@ -889,6 +930,7 @@ async function main() {
         "blocked_opposite_position",
         "blocked_unknown_position_direction",
         "insufficient_margin",
+        "disabled",
         "system_stopped",
       ].includes(execution.status)) {
         const reason = "reason" in execution ? String(execution.reason ?? "") : "";
@@ -907,7 +949,7 @@ async function main() {
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
-      } else if (execution.status === "error") {
+      } else if (execution.status === "error" || execution.status === "pending_confirmation") {
         orderErrorUntil = Date.now() + 60_000;
         void sendTelegram(
           `\u26a0\ufe0f SCALPER ${symbol()} · errore ordine ${finalSignal.direction}`
@@ -934,6 +976,7 @@ async function main() {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (reservedSignalId && !executionStarted) await markSkipped(reservedSignalId, "Preflight fallito: " + message).catch(() => undefined);
       await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
     } finally {
       decisionBusy = false;
@@ -947,7 +990,7 @@ async function main() {
   const purged = await dbQuery(
     `UPDATE scalper_signals
         SET outcome='ERROR',closed_at=now(),mt5_error='purged at startup'
-      WHERE outcome IS NULL AND mt5_position_id IS NULL`,
+      WHERE outcome IS NULL AND mt5_position_id IS NULL AND mt5_order_id IS NULL AND client_id IS NULL`,
   );
   await refreshLossGuards();
   console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount, lossGuards: lossGuards() });

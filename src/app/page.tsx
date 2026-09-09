@@ -43,7 +43,7 @@ type DashboardState = {
   stream?: {
     status?: string;
     heartbeat?: string | null;
-    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number } | null;
+    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; m15?: number } | null;
     lastDecision?: Decision | null;
     lastFlatten?: Flatten | null;
     currentError?: StreamError | null;
@@ -236,7 +236,7 @@ export default function Home() {
       <section className="dashboard-head">
         <div><span className="eyebrow">REAL-TIME OPERATIONS · POLLING 5S</span><h2>Control center</h2></div>
         <div className="micro-status">
-          <span>M1 {data?.stream?.detail?.m1 ?? "—"}</span><span>M5 {data?.stream?.detail?.m5 ?? "—"}</span>
+          <span>M1 {data?.stream?.detail?.m1 ?? "—"}</span><span>M5 {data?.stream?.detail?.m5 ?? "—"}</span><span>M15 {data?.stream?.detail?.m15 ?? "—"}</span>
           <span>{data?.session?.hoursUtc ?? "—"} UTC</span><span>MT5 {data?.autoExec === true ? "AUTO ON" : data?.autoExec === false ? "AUTO OFF" : "—"}</span>
         </div>
       </section>

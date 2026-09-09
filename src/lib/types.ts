@@ -29,6 +29,8 @@ export type SetupEvaluation = {
 
 /** Come e' stata costruita la distanza di stop del segnale. */
 export type ScalperSlPlan = {
+  estimatedCostPrice?: number;
+  minNetR?: number;
   /** Distanza SL richiesta dalla struttura del setup. */
   structural: number;
   /** Distanza SL richiesta dall'ATR M1 (SL_ATR_MULT * ATR). */
@@ -41,6 +43,8 @@ export type ScalperSlPlan = {
 };
 
 export type ScalperSignal = {
+  /** Stable identity of the M5 impulse and pullback; only execution reserves it. */
+  setupKey: string | null;
   direction: Direction;
   entry: number | null;
   stopLoss: number | null;

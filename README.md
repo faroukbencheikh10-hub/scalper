@@ -11,93 +11,47 @@ Progetto standalone XAUUSD, completamente separato da `soldi-trend`.
 
 Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto come fallback opzionale.
 
-## Strategia
+## Strategia M15 / M5 / M1
 
-- M1: trigger operativo, valutato tick per tick sull'ultima candela chiusa.
-- M5: contesto immediato, non piu' un muro (vedi gate sotto).
-- Setup, in ordine di priorita' a ogni tick: `liquidity_sweep` → `momentum_breakout` → `breakout_retest` → `micro_pullback` → NO_TRADE. Vince il primo valido; un solo ordine per tick.
-- Storico iniziale: 500 M1 e 300 M5, configurabile fino a 1000.
-- Stop dimensionato sull'ATR M1 (vedi sotto), TP sempre proporzionale allo stop.
-- **Una sola posizione XAUUSD aperta alla volta** (`SCALPER_MAX_OPEN_POSITIONS=1`).
-- Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive; pausa re-entry 120 s.
-- **Blocchi dopo una perdita a scadenza**: la direzione appena chiusa in perdita resta ferma `LOSS_LOCK_MINUTES`; dopo `CONSEC_LOSS_COUNT` perdite consecutive nella sessione si ferma tutto per `CONSEC_LOSS_PAUSE_MINUTES`. Il fermo per l'intera sessione resta solo nei limiti giornalieri (`MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS`).
-- Spread massimo, ATR minimo/massimo e SL controllato restano **invariati**.
+Versione: `mtf-continuation-v1`. Una sola strategia di continuazione, simmetrica BUY/SELL. Il worker decide ed esegue; le API web fanno soltanto analisi e controllo.
 
-### SL e TP
+- **M15 — contesto:** 30 candele complete minime, aggregate da tre M5 chiuse consecutive e allineate UTC. EMA9/21, pendenza e massimi/minimi di due blocchi consecutivi di tre M15 devono indicare la stessa direzione. Efficienza delle ultime otto chiusure almeno 0.35; range e transizione producono NO_TRADE.
+- **M5 — setup:** impulso direzionale, seguito da almeno una candela di ritracciamento realmente contraria. Il rientro deve toccare la zona del livello rotto (`breakout_retest`) oppure EMA9 M5 (`micro_pullback`), mantenendo la struttura. Il setup scade dopo sei M5 senza ingresso.
+- **M1 — conferma:** candela chiusa nella direzione M15, corpo almeno 45%, chiusura oltre gli estremi delle due M1 precedenti. Niente ingresso su candela incompleta, shock o movimento già esteso. La valutazione avviene ad ogni quote, ma una candela in formazione non crea conferme.
+- **Dati:** quote fresche, candele valide e ordinate, niente riempimento artificiale dei buchi. Le ultime 15 M1, 10 M5 e 8 M15 devono essere consecutive. Dopo un gap delle quote superiore a un minuto il worker ricarica lo storico. M15 non richiede una terza chiamata dati. Il buffer M5 ha minimo 120 candele.
+- **SL:** oltre gli estremi del pullback M5 e della microstruttura M1, con buffer spread/ATR. Distanza = max(struttura, 1.3 ATR M1, 3 USD di prezzo), massimo 8 USD di prezzo. Lo stop non viene stretto per far passare un setup.
+- **TP:** massimo 2R, limitato dal prossimo estremo dell'impulso o pivot confermato M5/M15 davanti all'ingresso. Occorre almeno 1.5R netto stimato dopo commissioni/slippage. Un ostacolo vicino fa scartare il trade, non viene ignorato per allontanare il target. Nessuna chiusura a importo fisso.
+- **Costi:** bid/ask includono già lo spread nell'ingresso; si aggiungono una stima di commissione round trip (7 USD per lotto, parametrica) e slippage (0.05 ATR M1). Queste sono ipotesi di filtro, non tariffe broker verificate né garanzie di esecuzione.
+- **Un ingresso per setup:** identità persistente di impulso e primo pullback M5. La funzione di analisi è pura: preview e preflight non consumano il setup. La prenotazione DB è esclusiva; gli SKIPPED e i rifiuti broker definitivi la liberano. Gli ordini accettati, chiusi o con esito incerto la conservano anche dopo riavvio. Un timeout viene riconciliato mediante clientId su posizioni/deal streaming; mentre resta irrisolto blocca nuove aperture.
 
-Lo stop non viene più preso dal rumore: la distanza è il **massimo** fra tre valori, e non viene mai stretta per rientrare in un limite.
+Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nessuna inversione automatica della posizione e nessun trade per il solo breakout M1.
 
-```
-distanza SL = max( struttura del setup , SL_ATR_MULT × ATR M1 , SL_MIN_USD )
-distanza TP = distanza SL × TP_RR
-```
-
-- Se la distanza richiesta supera `SL_MAX_USD` il trade viene **scartato** con motivo "SL troppo ampio" (il setup scelto compare come `rejected` nel log del tick), invece di essere strizzato su un livello che il rumore raggiunge subito.
-- Non esiste più alcun TP fisso in dollari né il vecchio clamp `SCALPER_MIN_RISK`/`SCALPER_MAX_RISK`, e `SCALPER_RR` non viene più letto: il rapporto è `TP_RR`.
-- Il piano finisce in `stream_last_decision` e nel log `[scalper-worker] order_plan`: struttura, quota ATR, distanza applicata, distanza TP e R:R.
-
-### Rischio per ordine
-
-Prima di ogni invio il worker calcola il rischio dell'ordine come `distanza SL × lotti × 100` (once per lotto). Il valore è **informativo**: con `RISK_MAX_PCT=0` (default) l'ordine parte sempre con i lotti scelti in dashboard, senza alcun taglio.
-
-Impostando `RISK_MAX_PCT` a un valore maggiore di zero il cap si riattiva: sopra quella percentuale del saldo i lotti dell'ordine scendono a `RISK_FALLBACK_LOTS` (0.01) solo per quell'ordine, senza sovrascrivere la size salvata in dashboard, e la riduzione è segnalata come `lotsCapped`.
-
-Il rischio calcolato compare nel log `order_plan`, in `stream_last_decision.risk`, sulla dashboard (righe *SL / TP ultimo ordine* e *Rischio ultimo ordine*) e nel messaggio Telegram di apertura. L'importo è nominale in valuta del conto: non viene applicata alcuna conversione FX fra il dollaro della quotazione XAUUSD e l'euro del conto.
-
-### Gate M5 e direzionalità M1
-
-- **M5 contrario** alla direzione dell'M1: blocco sempre, per tutti i setup.
-- **M5 allineato**: `micro_pullback` BUY con trend M5 rialzista, SELL con ribassista, come prima.
-- **M5 neutro**: il `micro_pullback` passa solo con M1 forte — EMA9/EMA20 M1 allineate da almeno `M1_ALIGN_BARS` candele, prezzo dal lato giusto di entrambe e accelerazione reale (ultime `ACCEL_BARS` candele nella stessa direzione, range medio ≥ `ACCEL_ATR_MULT` × ATR M1, corpi ≥ `ACCEL_BODY_RATIO` del range). Gli altri setup portano le proprie conferme e con M5 neutro passano senza il requisito di accelerazione.
-
-### momentum_breakout
-
-Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range, chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1 ma **non oltre** `BREAKOUT_MAX_EXT_ATR` × ATR M1 (motivo di scarto "movimento già esteso": il movimento è già andato e non si insegue), EMA9 > EMA20 (long) o viceversa, spread e ATR validi. La candela di rottura è l'ultima M1 chiusa: l'ingresso cade sulla candela successiva, con SL sotto/sopra la candela di rottura. Il prezzo deve essere ancora oltre il livello al momento dell'ingresso.
-
-### breakout_retest
-
-L'ingresso diretto sulla candela shock (range > `SHOCK_ATR_MULT` × ATR M1, minimo 5.50 $) resta scartato, ma il movimento non viene perso: entro `RETEST_MAX_BARS` candele dalla shock, se il prezzo ritraccia verso il livello rotto **o** l'EMA9 M1 (entro `RETEST_ZONE_ATR` × ATR) senza chiudere dall'altra parte del livello, e poi riparte nella direzione della shock con corpo ≥ `RETEST_BODY_RATIO` e chiusura dal lato giusto dell'EMA9, si entra al riavvio. SL oltre il minimo (long) o il massimo (short) del retest.
-
-### Anti-accumulo
-
-Al posto del vecchio `compressed OR choppy` si blocca solo il **range sporco**: ampiezza delle ultime `RANGE_LOOKBACK` candele M1 sotto `RANGE_ATR_MULT` × ATR M1 **e** EMA9/EMA20 M1 piatte (variazione ≤ `EMA_FLAT_SLOPE_ATR` × ATR su `EMA_SLOPE_BARS` candele). Se c'è accelerazione M1 reale (stessa definizione del gate M5) il filtro non blocca mai.
-
-### Anti-duplicazione
-
-Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi, stesso setup per `DUP_SETUP_BARS` candele M1 (inclusa quella dell'ordine). Restano attive la pausa re-entry `SCALPER_MIN_REENTRY_SEC` e tutti i limiti di sessione.
-
-### Variabili della logica di ingresso
+### Parametri della strategia
 
 | Variabile | Default | Significato |
 | --- | --- | --- |
-| `M1_ALIGN_BARS` | 3 | Candele con EMA9/EMA20 M1 allineate per considerare l'M1 direzionale |
-| `ACCEL_ATR_MULT` | 1.2 | Range medio delle ultime candele in multipli di ATR M1 |
-| `ACCEL_BARS` / `ACCEL_BODY_RATIO` | 3 / 0.60 | Candele e corpo minimo dell'accelerazione |
-| `BREAKOUT_LOOKBACK` | 12 | Canale M1 rotto dal momentum breakout |
-| `BREAKOUT_BODY_RATIO` | 0.60 | Corpo minimo della candela di rottura |
-| `BREAKOUT_CLOSE_ATR_MULT` | 0.15 | Distanza minima della chiusura oltre il livello, in ATR M1 |
-| `BREAKOUT_MAX_EXT_ATR` | 1.5 | Distanza massima della chiusura oltre il livello: sopra, movimento già esteso |
-| `SHOCK_ATR_MULT` | 2.2 | Soglia della candela shock (minimo assoluto 5.50 $) |
-| `RETEST_MAX_BARS` | 4 | Candele entro cui il retest deve completarsi |
-| `RETEST_ZONE_ATR` / `RETEST_BODY_RATIO` | 0.50 / 0.50 | Ampiezza della zona di retest e corpo minimo del riavvio |
-| `RANGE_ATR_MULT` | 1.5 | Ampiezza massima (in ATR M1) del range sporco |
-| `RANGE_LOOKBACK` | 12 | Candele su cui si misura l'ampiezza |
-| `EMA_SLOPE_BARS` / `EMA_FLAT_SLOPE_ATR` | 5 / 0.12 | Soglia di pendenza per considerare piatte le EMA M1 |
-| `SL_ATR_MULT` | 1.3 | Quota ATR M1 della distanza di stop |
-| `SL_MIN_USD` / `SL_MAX_USD` | 3.0 / 8.0 | Distanza SL minima e massima; oltre il massimo il trade viene scartato |
-| `TP_RR` | 1.5 | Rapporto TP/SL |
-| `RISK_MAX_PCT` / `RISK_FALLBACK_LOTS` | 0 / 0.01 | Cap di rischio per ordine in % del saldo (0 = disattivato) e lotti di ripiego |
-| `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
-| `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
-| `SCALPER_MAX_OPEN_POSITIONS` | 1 | Posizioni XAUUSD aperte contemporaneamente |
-| `LOSS_LOCK_MINUTES` | 30 | Blocco della stessa direzione dopo una chiusura in perdita |
-| `CONSEC_LOSS_COUNT` / `CONSEC_LOSS_PAUSE_MINUTES` | 3 / 120 | Perdite consecutive che fermano tutto e durata della pausa |
-| `SCALPER_LOSS_LOCK_REFRESH_MS` | 30000 | Rilettura periodica delle chiusure per i blocchi da perdita |
-| `SCALPER_TICK_LOG_MS` | 1000 | Throttle del log per tick dei setup valutati |
+| `MTF_M15_MIN_SEP_ATR` | 0.08 | Separazione EMA9/21 M15 in ATR |
+| `MTF_M15_MIN_EFFICIENCY` | 0.35 | Efficienza direzionale M15 |
+| `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
+| `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
+| `MTF_M1_BODY_MIN` | 0.45 | Corpo minimo della conferma M1 |
+| `MTF_MAX_CHASE_ATR` | 0.45 | Massima estensione dal close di conferma in ATR M1 |
+| `MTF_MAX_SPREAD_RISK` | 0.20 | Spread massimo rispetto al rischio sul prezzo |
+| `MTF_MIN_NET_RR` / `MTF_TARGET_RR` | 1.5 / 2 | R netto stimato minimo / obiettivo massimo |
+| `MTF_ROUNDTRIP_COMMISSION_PER_LOT_USD` | 7 | Stima costi round trip per lotto standard XAUUSD |
+| `MTF_SLIPPAGE_ATR` | 0.05 | Stima slippage in ATR M1 |
+| `SL_ATR_MULT` / `SL_MIN_USD` / `SL_MAX_USD` | 1.3 / 3 / 8 | Dimensionamento SL sul prezzo |
+| `SHOCK_ATR_MULT` | 2.2 | Shock M1 in multipli di ATR |
 
-### Log dei setup valutati
+Le vecchie variabili `SCALPER_QUICK_PROFIT`, `SCALPER_RR`, `TP_RR`, `ACCEL_*`, `CLEAN_LEG_*`, `BREAKOUT_*`, `RETEST_*` e `RANGE_*` non governano questa strategia. La vecchia logica resta nella cronologia Git.
 
-A ogni tick il worker scrive su stdout (`[scalper-worker] tick`) e in `scalper_settings.stream_last_decision` l'elenco dei quattro setup con esito e motivo dello scarto, invece del solo "Nessun trigger scalper M1". Il setup finisce in `scalper_signals.setup`, nella colonna `trades.setup` (oltre che in `trades.payload`), nel messaggio Telegram di apertura e sulla dashboard, che mostra il setup usato e la card **Setup valutati**.
+### Rischio per ordine
+
+I lotti restano quelli della dashboard. Quando `RISK_MAX_PCT > 0`, il rischio di prezzo allo stop viene calcolato da tickSize e lossTickValue del broker, come nel calcolo P/L del SDK; sopra il cap si prova `RISK_FALLBACK_LOTS`. Se anche il volume ridotto supera il cap, oppure saldo/tick value non sono disponibili, l'ordine viene scartato. Questo è un limite sul rischio di prezzo stimato: gap, commissioni e slippage possono aumentare la perdita effettiva.
+
+Con `RISK_MAX_PCT=0` il cap è disattivato. Se i tick value non sono disponibili, il rischio mostrato è esplicitamente una stima USD e non viene presentato come euro. I dati dei tick sono descritti nella [documentazione MetaApi](https://metaapi.cloud/docs/client/models/metatraderSymbolPrice/).
+
+La strategia è verificata su scenari sintetici di correttezza, non validata come redditizia. Prima di ottimizzare i parametri occorre un replay dei dati broker con costi reali, periodi fuori campione e risultati separati BUY/SELL e per sessione.
 
 ## Streaming
 
@@ -174,11 +128,11 @@ Lo stato è persistente nel database. Quando STOP TUTTO è attivo:
 - non invia nuovi ordini MT5;
 - la dashboard mostra STOP.
 
-Le posizioni già aperte non vengono liquidate dal kill switch e mantengono SL/TP già presenti sul broker.
+STOP TUTTO richiede al worker la chiusura delle posizioni XAUUSD e la cancellazione degli ordini sul simbolo, oltre a bloccare gli ingressi. Un normale deploy non cambia SL/TP delle posizioni già aperte.
 
 ## Scenari sintetici
 
-`npm run scenarios` esegue `scripts/strategy-scenarios.ts`: costruisce serie M1/M5 sintetiche e verifica priorità dei setup, gate M5, anti-accumulo, breakout retest e dimensionamento SL/TP (compresi i casi "SL strutturale sotto ATR" e "SL oltre il massimo"). Non tocca MetaApi né il database.
+`npm run scenarios` esegue scenari deterministici offline per BUY/SELL, M15 in range, M5 pullback/retest, conferma M1, dati mancanti, costi, stop, ripetizione dei preflight, recupero ordini e rischio con tick value. Non chiama MetaApi né il database.
 
 ## Avvio web
 
@@ -199,3 +153,4 @@ npm run worker
 Usare le stesse `DATABASE_URL`, `METAAPI_TOKEN`, `METAAPI_ACCOUNT_ID` e impostazioni scalper del progetto.
 
 `AUTO_EXEC=false` resta il default di sicurezza. Attivarlo solo dopo verifica completa su conto demo.
+

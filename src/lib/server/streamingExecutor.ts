@@ -4,6 +4,7 @@ import { autoExecEnabled, clampLots, lots } from "./tradingConfig";
 import { requiredMargin } from "@/lib/lots";
 import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
+import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
 
 type StreamPosition = {
   id: string;
@@ -30,6 +31,7 @@ type StreamTerminalState = {
 };
 
 export type StreamingConnectionLike = {
+  historyStorage?: { deals: RecoveryDeal[] };
   terminalState: StreamTerminalState;
   createMarketBuyOrder: (symbol: string, volume: number, stopLoss?: number, takeProfit?: number, options?: Record<string, unknown>) => Promise<Record<string, unknown>>;
   createMarketSellOrder: (symbol: string, volume: number, stopLoss?: number, takeProfit?: number, options?: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -53,6 +55,7 @@ type ExecuteOptions = {
 };
 
 type ReserveSignalInput = {
+  setupKey: string;
   direction: "BUY" | "SELL";
   setup: string | null;
   entry: number;
@@ -230,6 +233,7 @@ async function limits() {
 }
 
 export async function reserveStreamingSignal(input: ReserveSignalInput) {
+  if (!input.setupKey) return { ok: false as const, status: "blocked" as const, reason: "missing_setup_key" };
   const positionLimit = maxOpenPositions();
   if (input.openPositionCount >= positionLimit) {
     return { ok: false as const, status: "blocked" as const, reason: "max_open_positions" };
@@ -279,6 +283,10 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      ),
      control AS (
        SELECT COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
+              EXISTS(SELECT 1 FROM scalper_signals WHERE setup_key=$15
+                AND COALESCE(outcome,'') NOT IN ('ERROR','SKIPPED')) AS same_setup,
+              EXISTS(SELECT 1 FROM scalper_signals WHERE outcome IS NULL
+                AND client_id IS NOT NULL AND mt5_position_id IS NULL) AS unresolved_order,
               (SELECT id::text FROM scalper_signals
                 WHERE created_at >= date_trunc('minute', now())
                   AND direction IN ('BUY','SELL')
@@ -289,6 +297,8 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      decision AS (
        SELECT CASE
          WHEN control.stopped THEN 'system_stopped'
+         WHEN control.unresolved_order THEN 'unresolved_order'
+         WHEN control.same_setup THEN 'same_setup_signal'
          WHEN control.same_minute_signal_id IS NOT NULL THEN 'same_minute_signal'
          WHEN daily.trades >= $8::int THEN 'max_trades_per_day'
          WHEN daily.profit <= -$9::float8 THEN 'max_daily_loss'
@@ -308,8 +318,9 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
        FROM daily,recent_summary,control,last_close
      ),
      inserted AS (
-       INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
-       SELECT $1,$2,$3,$4,$5,$6,$7 FROM decision WHERE reason IS NULL
+       INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$15 FROM decision WHERE reason IS NULL
+       ON CONFLICT DO NOTHING
        RETURNING id::text AS id
      )
      SELECT decision.reason, inserted.id, control.same_minute_signal_id
@@ -330,6 +341,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       start.toISOString(),
       minReentrySec(),
       tradeDedupSec(),
+      input.setupKey,
     ],
   );
 
@@ -348,6 +360,19 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
   if (!options.schemaReady) await ensureSchema();
   const stopped = options.systemStopped ?? await systemStopActive();
   if (stopped) return { checked: 0, closed: 0, closures: [] as StreamClosure[], stopped: true };
+
+  const unlinked = await dbQuery(
+    "SELECT id,client_id FROM scalper_signals WHERE outcome IS NULL AND mt5_position_id IS NULL AND client_id IS NOT NULL",
+  );
+  for (const row of unlinked.rows) {
+    const recovered = recoverOrder(String(row.client_id), symbol(), connection.terminalState.positions ?? [], connection.historyStorage?.deals ?? []);
+    if (!recovered) continue;
+    await dbQuery(
+      `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=COALESCE(mt5_open_price,$3),
+        mt5_volume=COALESCE(mt5_volume,$4),mt5_order_id=COALESCE(mt5_order_id,$5),mt5_error=NULL WHERE id=$1`,
+      [row.id, recovered.positionId, recovered.openPrice, recovered.volume, recovered.orderId],
+    );
+  }
 
   const rows = await dbQuery(
     `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
@@ -500,18 +525,24 @@ export async function executeStreaming(
     result = direction === "BUY"
       ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions)
       : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions);
+    if (![10008, 10009, 10010].includes(Number(result.numericCode))
+      && !["TRADE_RETCODE_PLACED", "TRADE_RETCODE_DONE", "TRADE_RETCODE_DONE_PARTIAL"].includes(String(result.stringCode))) {
+      throw Object.assign(new Error("Esito ordine non confermato: " + JSON.stringify(result)), { numericCode: result.numericCode });
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const rejected = definitelyRejected(error);
     await dbQuery(
-      `UPDATE scalper_signals SET mt5_error=$2,outcome='ERROR',closed_at=now() WHERE id=$1`,
-      [signalId, message],
+      `UPDATE scalper_signals SET mt5_error=$2,outcome=CASE WHEN $3 THEN 'ERROR' ELSE NULL END,
+        closed_at=CASE WHEN $3 THEN now() ELSE NULL END WHERE id=$1`,
+      [signalId, message, rejected],
     );
     console.error("[scalper-worker] order_error", {
       clientId: orderClientId,
       direction,
       error: message,
     });
-    return { status: "error" as const, error: message, clientId: orderClientId };
+    return { status: rejected ? "error" as const : "pending_confirmation" as const, error: message, clientId: orderClientId };
   }
 
   const orderId = typeof result.orderId === "string" ? result.orderId : null;

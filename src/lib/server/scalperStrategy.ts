@@ -1,649 +1,161 @@
-import type { Candle, Quote, ScalperSetup, ScalperSignal, SetupEvaluation } from "@/lib/types";
-import { setupLabel } from "@/lib/setups";
+import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../types";
 import { atr, emaCloseSeries } from "./indicators";
+import { aggregateM15, closedBars, MINUTE, recentBarsReady, swingLevels } from "./marketStructure";
+import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
 
-type CleanLegDirection = "BUY" | "SELL";
-type CleanLegState = {
-  direction: CleanLegDirection;
-  armedAt: number;
-  refreshedAt: number;
-  efficiency: number;
-  netAtr: number;
-  sessionStartMs: number;
-  lastPullbackKey: string | null;
-  lastTriggerCandle: string | null;
-};
+export const STRATEGY_VERSION = "mtf-continuation-v1";
 
-let cleanLegState: CleanLegState | null = null;
+function env(name: string, fallback: number, min: number, max: number) {
+  const raw = process.env[name]?.trim(), value = raw ? Number(raw) : NaN;
+  return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
+}
+function reject(reason: string, evaluations?: SetupEvaluation[]): ScalperSignal {
+  return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
+    takeProfit: null, riskReward: null, slPlan: null, reasoning: reason,
+    evaluations: evaluations ?? [{ setup: "filtri", status: "rejected", reason }] };
+}
+function range(c: Candle) { return Math.max(0.001, c.high - c.low); }
+function body(c: Candle) { return Math.abs(c.close - c.open) / range(c); }
+function maxHigh(bars: Candle[]) { return Math.max(...bars.map(c => c.high)); }
+function minLow(bars: Candle[]) { return Math.min(...bars.map(c => c.low)); }
+function signed(direction: "BUY" | "SELL", value: number) { return direction === "BUY" ? value : -value; }
 
-export function resetCleanLegState() {
-  cleanLegState = null;
+/** Validate the already planned SL/TP at the quote used immediately before sending. */
+export function plannedEntryValid(signal: ScalperSignal, quote: Quote) {
+  if (signal.direction === "NO_TRADE" || signal.stopLoss === null || signal.takeProfit === null || !signal.slPlan) return false;
+  const entry = signal.direction === "BUY" ? quote.ask : quote.bid;
+  const risk = signed(signal.direction, entry - signal.stopLoss);
+  const reward = signed(signal.direction, signal.takeProfit - entry);
+  const cost = signal.slPlan.estimatedCostPrice ?? 0;
+  return risk > 0 && risk <= signal.slPlan.maxUsd + 0.011
+    && (reward - cost) / (risk + cost) >= (signal.slPlan.minNetR ?? 1.5);
 }
 
-function envN(name: string, fallback: number) {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) ? v : fallback;
-}
-function envI(name: string, fallback: number, min: number, max: number) {
-  const v = Number(process.env[name]);
-  if (!Number.isFinite(v)) return fallback;
-  return Math.min(max, Math.max(min, Math.floor(v)));
-}
-function no(reasoning: string, evaluations: SetupEvaluation[] = []): ScalperSignal {
-  return { direction: "NO_TRADE", entry: null, stopLoss: null, takeProfit: null, riskReward: null, setup: null, slPlan: null, reasoning, evaluations };
-}
-function blockedByFilter(reason: string): SetupEvaluation[] {
-  return [{ setup: "filtri", status: "rejected", reason }];
-}
-function parseClockMinutes(value: string) {
-  const [h, m] = value.split(":").map(Number);
-  if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
-  return h * 60 + m;
-}
-function hoursAllowed(now = new Date()) {
-  const raw = process.env.SCALPER_HOURS_UTC?.trim() || "06:30-20:30";
-  const [a, b] = raw.split("-");
-  const start = a ? parseClockMinutes(a) : null;
-  const end = b ? parseClockMinutes(b) : null;
-  if (start === null || end === null) return true;
-  const cur = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (start === end) return true;
-  return start < end ? cur >= start && cur <= end : cur >= start || cur <= end;
-}
-function currentSessionStartMs(nowMs: number) {
-  const raw = process.env.SCALPER_HOURS_UTC?.trim() || "06:30-20:30";
-  const [a, b] = raw.split("-");
-  const start = a ? parseClockMinutes(a) : null;
-  const end = b ? parseClockMinutes(b) : null;
-  if (start === null || end === null) return null;
-  const now = new Date(nowMs);
-  const dayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-  const cur = now.getUTCHours() * 60 + now.getUTCMinutes();
-  if (start === end) return dayStart;
-  if (start < end) return cur >= start && cur <= end ? dayStart + start * 60_000 : null;
-  if (cur >= start) return dayStart + start * 60_000;
-  if (cur <= end) return dayStart - 24 * 60 * 60_000 + start * 60_000;
-  return null;
-}
-function bullish(c: Candle) { return c.close > c.open; }
-function bearish(c: Candle) { return c.close < c.open; }
-function candleRange(c: Candle) { return Math.max(0.01, c.high - c.low); }
-function bodyRatio(c: Candle) { return Math.abs(c.close - c.open) / candleRange(c); }
-function isClosed(c: Candle, minutes: number, nowMs: number) {
-  const startedAt = Date.parse(c.datetime);
-  return Number.isFinite(startedAt) && startedAt + minutes * 60_000 <= nowMs;
-}
+/** Pure evaluation: a preview or failed preflight never consumes a setup. */
+export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number }): ScalperSignal {
+  const { quote } = input;
+  const nowMs = input.nowMs ?? Date.now();
+  const quoteMaxAge = env("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);
+  if (!Number.isFinite(nowMs) || quote.quotedAt === null || !Number.isFinite(quote.quotedAt)
+    || nowMs - quote.quotedAt > quoteMaxAge || quote.quotedAt > nowMs + 500
+    || ![quote.bid, quote.ask, quote.mid, quote.spread].every(Number.isFinite)
+    || quote.bid <= 0 || quote.ask < quote.bid || quote.spread < 0) return reject("Quote assente, vecchia o non valida.");
+  const spread = quote.ask - quote.bid;
+  if (spread > env("SCALPER_MAX_SPREAD", 1.2, 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
 
-export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[] }): ScalperSignal {
-  const { quote, m1, m5 } = input;
-  const nowMs = quote.quotedAt ?? Date.now();
-  const now = new Date(nowMs);
-  if (!hoursAllowed(now)) {
-    const reason = `Fuori fascia scalper ${process.env.SCALPER_HOURS_UTC || "06:30-20:30"} UTC.`;
-    return no(reason, blockedByFilter(reason));
+  const sessionConfig = sessionConfigFromEnv();
+  if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
+  const session = getSessionStatus(new Date(nowMs), sessionConfig);
+  if (!session.inside || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
+  const m1 = closedBars(input.m1, 1, nowMs), m5 = closedBars(input.m5, 5, nowMs);
+  if (!m1 || !m5) return reject("Candele non valide, duplicate o fuori ordine.");
+  const m15 = aggregateM15(m5);
+  if (m1.length < 35 || m5.length < 35 || m15.length < 30) return reject("Storico insufficiente: servono M1/M5 e almeno 30 M15 complete.");
+  if (!recentBarsReady(m1, 1, 15, nowMs) || !recentBarsReady(m5, 5, 10, nowMs)
+    || !recentBarsReady(m15, 15, 8, nowMs)) return reject("Storico recente M1/M5/M15 incompleto o non aggiornato: attendo continuità dei dati.");
+  const warmup = env("SCALPER_SESSION_WARMUP_MIN", 5, 0, 30) * MINUTE;
+  if (session.sessionStartAt && nowMs < Date.parse(session.sessionStartAt) + warmup) return reject("Warm-up nuova sessione: attendo la prima M5 chiusa.");
+
+  const atr1 = atr(m1, 14, true)!, atr5 = atr(m5, 14, true)!, atr15 = atr(m15, 14, true)!;
+  if (!(atr1 > 0 && atr5 > 0 && atr15 > 0)) return reject("ATR non disponibile.");
+  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
+    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return reject("Volatilità M1 fuori limiti: ATR " + atr1.toFixed(2) + "$.");
+
+  const fast15 = emaCloseSeries(m15, 9), slow15 = emaCloseSeries(m15, 21);
+  const fast = fast15.at(-1)!, slow = slow15.at(-1)!;
+  const slope = fast! - fast15.at(-4)!;
+  const older = m15.slice(-6, -3), newer = m15.slice(-3), structureBuffer = atr15 * 0.05;
+  const rising = maxHigh(newer) > maxHigh(older) + structureBuffer && minLow(newer) > minLow(older) + structureBuffer;
+  const falling = maxHigh(newer) < maxHigh(older) - structureBuffer && minLow(newer) < minLow(older) - structureBuffer;
+  const window15 = m15.slice(-8);
+  let travel = 0;
+  for (let i = 1; i < window15.length; i++) travel += Math.abs(window15[i].close - window15[i - 1].close);
+  const efficiency = travel > 0 ? Math.abs(window15.at(-1)!.close - window15[0].close) / travel : 0;
+  const sep = Math.abs(fast! - slow!) / atr15, last15 = m15.at(-1)!;
+  let direction: "BUY" | "SELL" | null = null;
+  if (sep >= env("MTF_M15_MIN_SEP_ATR", 0.08, 0, 2) && efficiency >= env("MTF_M15_MIN_EFFICIENCY", 0.35, 0, 1)) {
+    if (rising && fast! > slow! && slope > atr15 * 0.05 && last15.close > slow!) direction = "BUY";
+    if (falling && fast! < slow! && slope < -atr15 * 0.05 && last15.close < slow!) direction = "SELL";
   }
+  if (!direction) return reject("M15 in range o transizione: manca un trend strutturale confermato.");
+  const d = direction;
+  const fast5 = emaCloseSeries(m5, 9), slow5 = emaCloseSeries(m5, 21);
+  if (signed(d, fast5.at(-1)! - slow5.at(-1)!) <= 0
+    || signed(d, m5.at(-1)!.close - slow5.at(-1)!) < -atr5 * 0.25) return reject("M15 " + d + ", ma M5 contrario o struttura del pullback rotta.");
 
-  const sessionStartMs = currentSessionStartMs(nowMs);
-  const sessionWarmupMin = envI("SCALPER_SESSION_WARMUP_MIN", 5, 0, 30);
-  if (cleanLegState && sessionStartMs !== null && cleanLegState.sessionStartMs !== sessionStartMs) resetCleanLegState();
-  if (sessionStartMs !== null && sessionWarmupMin > 0 && nowMs < sessionStartMs + sessionWarmupMin * 60_000) {
-    resetCleanLegState();
-    const remaining = Math.max(1, Math.ceil((sessionStartMs + sessionWarmupMin * 60_000 - nowMs) / 60_000));
-    const reason = `Warm-up nuova sessione: attendo la prima M5 chiusa (${remaining} min).`;
-    return no(reason, blockedByFilter(reason));
-  }
+  const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
+  const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
+  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) return reject("Candela M1 shock: attendo un nuovo setup, nessun inseguimento.");
+  const preceding = m1.slice(-3, -1);
+  const triggerLevel = d === "BUY" ? maxHigh(preceding) : minLow(preceding);
+  if (signed(d, trigger.close - trigger.open) <= 0 || body(trigger) < env("MTF_M1_BODY_MIN", 0.45, 0.1, 0.95)
+    || signed(d, trigger.close - triggerLevel) < atr1 * 0.03) return reject("M15 " + d + ": attendo chiusura M1 di ripartenza oltre la microstruttura.");
+  const entry = d === "BUY" ? quote.ask : quote.bid;
+  const exitQuote = d === "BUY" ? quote.bid : quote.ask;
+  const drift = signed(d, entry - trigger.close);
+  if (drift > atr1 * env("MTF_MAX_CHASE_ATR", 0.45, 0.05, 2)
+    || signed(d, exitQuote - triggerLevel) < -atr1 * 0.1) return reject("Conferma M1 persa o ingresso già troppo esteso.");
 
-  if (m1.length < 35 || m5.length < 30) return no("Storico M1/M5 insufficiente.", blockedByFilter("Storico M1/M5 insufficiente."));
-
-  const maxSpread = envN("SCALPER_MAX_SPREAD", 1.2);
-  if (quote.spread > maxSpread) {
-    const reason = `Spread ${quote.spread.toFixed(2)}$ sopra massimo ${maxSpread.toFixed(2)}$.`;
-    return no(reason, blockedByFilter(reason));
-  }
-
-  const atr1 = atr(m1, 14, true);
-  if (!atr1) return no("ATR M1 non disponibile.", blockedByFilter("ATR M1 non disponibile."));
-  const minAtr = envN("SCALPER_MIN_ATR_M1", 0.8), maxAtr = envN("SCALPER_MAX_ATR_M1", 6);
-  if (atr1 < minAtr) {
-    const reason = `Volatilità M1 troppo bassa: ATR ${atr1.toFixed(2)}$.`;
-    return no(reason, blockedByFilter(reason));
-  }
-  if (atr1 > maxAtr) {
-    const reason = `Volatilità M1 troppo alta: ATR ${atr1.toFixed(2)}$.`;
-    return no(reason, blockedByFilter(reason));
-  }
-
-  const last = m1[m1.length - 1], prev = m1[m1.length - 2];
-  const shockThreshold = Math.max(atr1 * envN("SHOCK_ATR_MULT", 2.2), 5.5);
-  const isShock = (candle: Candle) => candle.high - candle.low > shockThreshold;
-  if (isShock(last)) {
-    const reason = `Candela M1 shock ${(last.high - last.low).toFixed(2)}$: niente inseguimento, attendo il retest.`;
-    return no(reason, blockedByFilter(reason));
-  }
-
-  const closedM5 = m5.filter((c) => isClosed(c, 5, nowMs));
-  if (closedM5.length < 30) return no("Storico M5 chiuso insufficiente.", blockedByFilter("Storico M5 chiuso insufficiente."));
-  if (sessionStartMs !== null && sessionWarmupMin > 0) {
-    const hasClosedSessionM5 = closedM5.some((c) => {
-      const startedAt = Date.parse(c.datetime);
-      return Number.isFinite(startedAt) && startedAt >= sessionStartMs;
-    });
-    if (!hasClosedSessionM5) {
-      resetCleanLegState();
-      const reason = "Warm-up nuova sessione: nessuna M5 della sessione ancora chiusa.";
-      return no(reason, blockedByFilter(reason));
-    }
-  }
-
-  const fast5Series = emaCloseSeries(closedM5, 9), slow5Series = emaCloseSeries(closedM5, 21);
-  const fast5 = fast5Series.at(-1) ?? null, slow5 = slow5Series.at(-1) ?? null;
-  const atr5 = atr(closedM5, 14, true);
-  const fast1Series = emaCloseSeries(m1, 9), slow1Series = emaCloseSeries(m1, 20);
-  const fast1 = fast1Series[m1.length - 1], slow1 = slow1Series[m1.length - 1];
-  if ([fast5, slow5, atr5, fast1, slow1].some(v => v === null)) return no("EMA/ATR non disponibili.", blockedByFilter("EMA/ATR non disponibili."));
-
-  const m5SlopeBars = envI("M5_SLOPE_BARS", 3, 1, 12);
-  const slopeIdx = closedM5.length - 1 - m5SlopeBars;
-  const fast5Past = slopeIdx >= 0 ? fast5Series[slopeIdx] : null;
-  const minSepAtr = envN("M5_MIN_EMA_SEP_ATR", 0.08);
-  const pullbackSlopeAtr = envN("M5_PULLBACK_SLOPE_ATR", 0.08);
-  const emaSep = Math.abs(fast5! - slow5!);
-  const separated = emaSep >= atr5! * minSepAtr;
-  const trendUp = separated && fast5! > slow5!
-    && fast5Past !== null && fast5! >= fast5Past - atr5! * pullbackSlopeAtr;
-  const trendDown = separated && fast5! < slow5!
-    && fast5Past !== null && fast5! <= fast5Past + atr5! * pullbackSlopeAtr;
-
-  const alignBars = envI("M1_ALIGN_BARS", 3, 1, 20);
-  const alignFast = fast1Series.slice(m1.length - alignBars);
-  const alignSlow = slow1Series.slice(m1.length - alignBars);
-  const alignReady = alignFast.length === alignBars && alignFast.every(v => v !== null) && alignSlow.every(v => v !== null);
-  const alignedUp = alignReady && alignFast.every((v, i) => v! > alignSlow[i]!);
-  const alignedDown = alignReady && alignFast.every((v, i) => v! < alignSlow[i]!);
-  const priceAbove = last.close > fast1! && last.close > slow1!;
-  const priceBelow = last.close < fast1! && last.close < slow1!;
-
-  const accelBars = envI("ACCEL_BARS", 3, 2, 10);
-  const accelAtrMult = envN("ACCEL_ATR_MULT", 1.2);
-  const accelBodyMin = envN("ACCEL_BODY_RATIO", 0.6);
-  const accelSlice = m1.slice(m1.length - accelBars);
-  const accelRangeAvg = accelSlice.reduce((sum, c) => sum + (c.high - c.low), 0) / accelSlice.length;
-  const accelFast = accelRangeAvg >= atr1 * accelAtrMult;
-  const accelBodies = accelSlice.every(c => bodyRatio(c) >= accelBodyMin);
-  const accelUp = accelFast && accelBodies && accelSlice.every(bullish);
-  const accelDown = accelFast && accelBodies && accelSlice.every(bearish);
-
-  const transitionUp = trendDown && alignedUp && priceAbove && accelUp;
-  const transitionDown = trendUp && alignedDown && priceBelow && accelDown;
-
-  const cleanLegBars = envI("CLEAN_LEG_M5_BARS", 4, 3, 8);
-  const cleanSlice = closedM5.slice(-cleanLegBars);
-  let cleanGross = 0;
-  if (cleanSlice.length > 0) {
-    cleanGross = Math.abs(cleanSlice[0].close - cleanSlice[0].open);
-    for (let i = 1; i < cleanSlice.length; i++) cleanGross += Math.abs(cleanSlice[i].close - cleanSlice[i - 1].close);
-  }
-  const cleanNetSigned = cleanSlice.length > 0 ? cleanSlice.at(-1)!.close - cleanSlice[0].open : 0;
-  const cleanEfficiency = cleanGross > 0 ? Math.abs(cleanNetSigned) / cleanGross : 0;
-  const cleanNetAtr = atr5! > 0 ? Math.abs(cleanNetSigned) / atr5! : 0;
-  const upRatio = cleanSlice.length > 0 ? cleanSlice.filter(bullish).length / cleanSlice.length : 0;
-  const downRatio = cleanSlice.length > 0 ? cleanSlice.filter(bearish).length / cleanSlice.length : 0;
-  const cleanSlopeStartIdx = Math.max(0, closedM5.length - cleanLegBars);
-  const cleanFastPast = fast5Series[cleanSlopeStartIdx] ?? null;
-  const cleanFastSlope = cleanFastPast === null ? 0 : fast5! - cleanFastPast;
-  const cleanMinEfficiency = envN("CLEAN_LEG_MIN_EFFICIENCY", 0.58);
-  const cleanMinNetAtr = envN("CLEAN_LEG_MIN_NET_ATR", 1.0);
-  const cleanMinDirRatio = envN("CLEAN_LEG_MIN_DIR_RATIO", 0.65);
-  const cleanMinSlopeAtr = envN("CLEAN_LEG_MIN_SLOPE_ATR", 0.12);
-  let detectedCleanLeg: CleanLegDirection | null = null;
-  if (cleanSlice.length === cleanLegBars && cleanEfficiency >= cleanMinEfficiency && cleanNetAtr >= cleanMinNetAtr) {
-    if (cleanNetSigned > 0 && upRatio >= cleanMinDirRatio && cleanFastSlope >= atr5! * cleanMinSlopeAtr && cleanSlice.at(-1)!.close > fast5!) {
-      detectedCleanLeg = "BUY";
-    } else if (cleanNetSigned < 0 && downRatio >= cleanMinDirRatio && cleanFastSlope <= -atr5! * cleanMinSlopeAtr && cleanSlice.at(-1)!.close < fast5!) {
-      detectedCleanLeg = "SELL";
-    }
-  }
-
-  if (cleanLegState && nowMs + 60_000 < cleanLegState.armedAt) resetCleanLegState();
-  if (cleanLegState) {
-    const maxAgeMs = envI("CLEAN_LEG_MAX_MINUTES", 35, 10, 120) * 60_000;
-    const breakAtr = envN("CLEAN_LEG_BREAK_ATR", 0.25);
-    const lastClosedM5 = closedM5.at(-1)!;
-    const brokeSlow = cleanLegState.direction === "BUY"
-      ? lastClosedM5.close < slow5! - atr5! * breakAtr
-      : lastClosedM5.close > slow5! + atr5! * breakAtr;
-    if (nowMs - cleanLegState.refreshedAt > maxAgeMs || brokeSlow) resetCleanLegState();
-  }
-
-  if (detectedCleanLeg) {
-    if (!cleanLegState || cleanLegState.direction !== detectedCleanLeg) {
-      cleanLegState = {
-        direction: detectedCleanLeg,
-        armedAt: nowMs,
-        refreshedAt: nowMs,
-        efficiency: cleanEfficiency,
-        netAtr: cleanNetAtr,
-        sessionStartMs: sessionStartMs ?? 0,
-        lastPullbackKey: null,
-        lastTriggerCandle: null,
-      };
-    } else {
-      cleanLegState = {
-        ...cleanLegState,
-        refreshedAt: nowMs,
-        efficiency: cleanEfficiency,
-        netAtr: cleanNetAtr,
-      };
-    }
-  }
-
-  const cleanLegDirection = cleanLegState?.direction ?? null;
-  const cleanLegEfficiency = cleanLegState?.efficiency ?? cleanEfficiency;
-  const cleanLegNetAtr = cleanLegState?.netAtr ?? cleanNetAtr;
-
-  const rangeLookback = envI("RANGE_LOOKBACK", 12, 4, 60);
-  const rangeBars = m1.slice(Math.max(0, m1.length - rangeLookback - 1), m1.length - 1);
-  const rangeHigh = Math.max(...rangeBars.map(c => c.high));
-  const rangeLow = Math.min(...rangeBars.map(c => c.low));
-  const rangeWidth = Math.max(0.01, rangeHigh - rangeLow);
-  const rangeAtrMult = envN("RANGE_ATR_MULT", 1.5);
-  const slopeBars = envI("EMA_SLOPE_BARS", 5, 2, 30);
-  const flatSlopeAtr = envN("EMA_FLAT_SLOPE_ATR", 0.12);
-  const slopeOf = (series: (number | null)[]) => {
-    const head = series[m1.length - 1], tail = series[m1.length - 1 - slopeBars];
-    return head === null || head === undefined || tail === null || tail === undefined ? null : Math.abs(head - tail);
-  };
-  const fastSlope = slopeOf(fast1Series), slowSlope = slopeOf(slow1Series);
-  const emaFlat = fastSlope !== null && slowSlope !== null
-    && fastSlope <= atr1 * flatSlopeAtr && slowSlope <= atr1 * flatSlopeAtr;
-  const rangeCompressed = rangeWidth < atr1 * rangeAtrMult && emaFlat;
-
-  let grossMove = 0;
-  for (let i = 1; i < rangeBars.length; i++) grossMove += Math.abs(rangeBars[i].close - rangeBars[i - 1].close);
-  const netMove = rangeBars.length >= 2 ? Math.abs(rangeBars.at(-1)!.close - rangeBars[0].close) : 0;
-  const rangeEfficiency = grossMove > 0 ? netMove / grossMove : 0;
-  const maxRangeEfficiency = envN("RANGE_MAX_EFFICIENCY", 0.32);
-  const structuralRange = !trendUp && !trendDown && rangeBars.length >= 8 && rangeEfficiency <= maxRangeEfficiency;
-  const marketRange = rangeCompressed || structuralRange;
-  const rawRangePosition = (quote.mid - rangeLow) / rangeWidth;
-  const rangePosition = Math.min(1, Math.max(0, rawRangePosition));
-  const rangeEdge = envN("RANGE_EDGE_FRACTION", 0.32);
-
-  const m5Label = cleanLegDirection ? `gamba pulita ${cleanLegDirection}`
-    : transitionUp ? "transizione rialzista"
-      : transitionDown ? "transizione ribassista"
-        : marketRange ? "range"
-          : trendUp ? "rialzista"
-            : trendDown ? "ribassista" : "transizione/neutro";
-
-  type GateLevel = "accelerata" | "struttura";
-  const m5Gate = (direction: "BUY" | "SELL", level: GateLevel): string | null => {
-    if (direction === "BUY" && trendDown && !transitionUp) return "bias M5 chiuso ribassista contrario al long";
-    if (direction === "SELL" && trendUp && !transitionDown) return "bias M5 chiuso rialzista contrario allo short";
-    const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
-    if (alignedTrend) return null;
-    const structure = direction === "BUY" ? alignedUp && priceAbove : alignedDown && priceBelow;
-    if (!structure) {
-      const emaOk = direction === "BUY" ? alignedUp : alignedDown;
-      return `${m5Label}: M1 non conferma ${direction} (${emaOk ? "prezzo non dal lato giusto delle EMA M1" : `EMA9/EMA20 M1 non allineate da ${alignBars} candele`})`;
-    }
-    if (level === "struttura") return null;
-    const accel = direction === "BUY" ? accelUp : accelDown;
-    if (!accel) {
-      const missing = !accelFast
-        ? `range medio ${accelRangeAvg.toFixed(2)}$ < ${(atr1 * accelAtrMult).toFixed(2)}$`
-        : !accelBodies ? `corpi sotto il ${(accelBodyMin * 100).toFixed(0)}% del range` : "candele non tutte nella stessa direzione";
-      return `${m5Label}: manca accelerazione M1 ${direction} (${missing})`;
-    }
-    return null;
-  };
-
-  const gateForSetup = (direction: "BUY" | "SELL", setup: ScalperSetup): string | null => {
-    if (cleanLegDirection) {
-      if (direction !== cleanLegDirection) return `gamba pulita ${cleanLegDirection} attiva: ${direction} bloccato finché la struttura M5 non si rompe`;
-      if (setup !== "micro_pullback") return `gamba pulita ${cleanLegDirection} attiva: ${setup} disattivato, accetto solo clean pullback M1`;
-      return null;
-    }
-    if (marketRange) {
-      const atEdge = direction === "BUY" ? rangePosition <= rangeEdge : rangePosition >= 1 - rangeEdge;
-      if (setup === "liquidity_sweep" && atEdge) return null;
-      const where = `${(rangePosition * 100).toFixed(0)}% del range ${rangeLow.toFixed(2)}$-${rangeHigh.toFixed(2)}$`;
-      return setup === "liquidity_sweep"
-        ? `regime RANGE: sweep ${direction} fuori dal bordo utile (${where})`
-        : `regime RANGE: ${setup} bloccato (${where}), attendo bordo o breakout+retest`;
-    }
-    const level: GateLevel = setup === "momentum_breakout" || setup === "micro_pullback" ? "accelerata" : "struttura";
-    return m5Gate(direction, level);
-  };
-
-  type Candidate = { setup: ScalperSetup; direction: "BUY" | "SELL"; structureStop: number; score: number };
+  // A directional M5 impulse followed by an actual retracement defines one persistent setup.
+  const lookback = Math.floor(env("MTF_M5_SETUP_BARS", 6, 2, 12));
   const evaluations: SetupEvaluation[] = [];
-  const candidates: Candidate[] = [];
-  const record = (setup: ScalperSetup, status: "triggered" | "rejected", reason: string, direction?: "BUY" | "SELL") => {
-    evaluations.push(direction ? { setup, status, direction, reason } : { setup, status, reason });
-  };
-  const scoreCandidate = (setup: ScalperSetup, direction: "BUY" | "SELL") => {
-    const base = setup === "breakout_retest" ? 78 : setup === "micro_pullback" ? 76 : setup === "liquidity_sweep" ? 74 : 72;
-    const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
-    const structure = direction === "BUY" ? alignedUp && priceAbove : alignedDown && priceBelow;
-    const liveAligned = direction === "BUY" ? bullish(last) : bearish(last);
-    let score = base + (alignedTrend ? 16 : 0) + (structure ? 8 : 0) + (liveAligned ? 5 : 0);
-    if (marketRange && setup === "liquidity_sweep") score += 14;
-    if ((transitionUp && direction === "BUY") || (transitionDown && direction === "SELL")) score += 8;
-    if (cleanLegDirection === direction && setup === "micro_pullback") score += 24;
-    return score;
-  };
-  const addCandidate = (setup: ScalperSetup, direction: "BUY" | "SELL", structureStop: number) => {
-    candidates.push({ setup, direction, structureStop, score: scoreCandidate(setup, direction) });
-  };
-
-  const breakoutLookback = envI("BREAKOUT_LOOKBACK", 12, 5, 60);
-  const breakoutBody = bodyRatio(prev);
-
-  {
-    let low = Infinity, high = -Infinity;
-    for (let i = Math.max(0, m1.length - 10); i < Math.max(0, m1.length - 2); i++) {
-      low = Math.min(low, m1[i].low);
-      high = Math.max(high, m1[i].high);
+  for (let i = m5.length - 2; i >= Math.max(21, m5.length - 1 - lookback); i--) {
+    const impulse = m5[i], tail = m5.slice(i + 1);
+    if (signed(d, impulse.close - impulse.open) <= 0 || body(impulse) < 0.5 || range(impulse) < atr5 * 0.8) continue;
+    const breakoutLevel = d === "BUY" ? maxHigh(m5.slice(i - 4, i)) : minLow(m5.slice(i - 4, i));
+    const brokeLevel = signed(d, impulse.close - breakoutLevel) > atr5 * 0.05;
+    if (!brokeLevel && signed(d, impulse.close - fast5[i]!) < atr5 * 0.4) continue;
+    const pbOffset = tail.findIndex((bar, index) => signed(d, bar.close - bar.open) < 0
+      && signed(d, bar.close - (index ? tail[index - 1].close : impulse.close)) < 0);
+    if (pbOffset < 0) continue;
+    const pullback = tail.slice(pbOffset), firstPullback = pullback[0];
+    if (Date.parse(trigger.datetime) < Date.parse(firstPullback.datetime) + 5 * MINUTE) continue;
+    const extreme = d === "BUY" ? impulse.high : impulse.low;
+    const invalidation = d === "BUY" ? impulse.low : impulse.high;
+    if (pullback.some(bar => signed(d, bar.close - invalidation) < -atr5 * 0.1
+      || signed(d, bar.close - extreme) > atr5 * 0.1)) continue;
+    const zone = atr5 * env("MTF_M5_ZONE_ATR", 0.3, 0.05, 1);
+    const touches = (bar: Candle, level: number) => bar.low <= level + zone && bar.high >= level - zone;
+    const retest = brokeLevel && pullback.some(bar => touches(bar, breakoutLevel));
+    const emaTouch = pullback.some((bar, j) => touches(bar, fast5[i + 1 + pbOffset + j]!));
+    if (!retest && !emaTouch) continue;
+    const setup = retest ? "breakout_retest" : "micro_pullback";
+    const key = [STRATEGY_VERSION, d, impulse.datetime, firstPullback.datetime].join(":");
+    const stopBuffer = Math.max(spread, atr1 * 0.15);
+    const structureStop = d === "BUY" ? Math.min(minLow(pullback), minLow(m1.slice(-3))) - stopBuffer
+      : Math.max(maxHigh(pullback), maxHigh(m1.slice(-3))) + stopBuffer;
+    const structural = signed(d, entry - structureStop);
+    const minUsd = env("SL_MIN_USD", 3, 0.1, 50), maxUsd = env("SL_MAX_USD", 8, 0.1, 100);
+    const atrRisk = atr1 * env("SL_ATR_MULT", 1.3, 0.5, 5);
+    const risk = Math.max(structural, atrRisk, minUsd);
+    if (structural <= 0 || risk > maxUsd || spread / risk > env("MTF_MAX_SPREAD_RISK", 0.2, 0.01, 0.5)) {
+      evaluations.push({ setup, direction: d, status: "rejected", reason: "SL o costi eccessivi: rischio " + risk.toFixed(2) + "$, spread " + spread.toFixed(2) + "$." });
+      continue;
     }
-    const buy = prev.low < low && prev.close > low && last.close > prev.high && bullish(last);
-    const sell = prev.high > high && prev.close < high && last.close < prev.low && bearish(last);
-    if (!buy && !sell) {
-      record("liquidity_sweep", "rejected", `nessuno sweep dei minimi ${low.toFixed(2)}$ / massimi ${high.toFixed(2)}$ con rientro`);
-    } else {
-      const direction = buy ? "BUY" : "SELL";
-      const blocked = gateForSetup(direction, "liquidity_sweep");
-      if (blocked) record("liquidity_sweep", "rejected", blocked, direction);
-      else {
-        const structureStop = direction === "BUY" ? prev.low - 0.25 : prev.high + 0.25;
-        addCandidate("liquidity_sweep", direction, structureStop);
-        record("liquidity_sweep", "triggered", `sweep ${direction === "BUY" ? "dei minimi" : "dei massimi"} con rientro (regime ${m5Label})`, direction);
-      }
+    // Spread is in the bid/ask entry already. These are additional estimated costs, in price units.
+    const cost = env("MTF_ROUNDTRIP_COMMISSION_PER_LOT_USD", 7, 0, 100) / 100
+      + atr1 * env("MTF_SLIPPAGE_ATR", 0.05, 0, 1);
+    const minNetR = env("MTF_MIN_NET_RR", 1.5, 1, 5), targetR = env("MTF_TARGET_RR", 2, 1.5, 5);
+    const levels = [extreme, ...swingLevels(m5.slice(-60), d), ...swingLevels(m15.slice(-60), d)];
+    const distances = levels.map(level => signed(d, level - entry)).filter(distance => distance > 0);
+    const available = distances.length ? Math.min(...distances) - Math.max(spread, atr1 * 0.1) : Infinity;
+    const reward = Math.min(risk * targetR, available);
+    const sl = d === "BUY" ? Math.floor((entry - risk) * 100) / 100 : Math.ceil((entry + risk) * 100) / 100;
+    const tp = d === "BUY" ? Math.floor((entry + reward) * 100) / 100 : Math.ceil((entry - reward) * 100) / 100;
+    const appliedRisk = Math.abs(entry - sl), appliedReward = signed(d, tp - entry);
+    const netR = (appliedReward - cost) / (appliedRisk + cost);
+    if (!Number.isFinite(netR) || appliedRisk > maxUsd + 0.011 || netR < minNetR) {
+      evaluations.push({ setup, direction: d, status: "rejected", reason: "Ostacolo M5/M15 troppo vicino: R netto stimato " + netR.toFixed(2) + " < " + minNetR + "." });
+      continue;
     }
+    const rr = appliedReward / appliedRisk, score = Math.min(95, Math.round(65 + efficiency * 15 + body(trigger) * 10));
+    evaluations.push({ setup, direction: d, status: "triggered", reason: "M15 " + d + " → M5 " + setup + " → conferma M1 chiusa." });
+    return { direction: d, setup, setupKey: key, entry, stopLoss: sl, takeProfit: tp,
+      riskReward: Number(rr.toFixed(2)), slPlan: { structural: Number(structural.toFixed(2)), atr: Number(atrRisk.toFixed(2)),
+        applied: Number(appliedRisk.toFixed(2)), minUsd, maxUsd, rr: Number(rr.toFixed(2)), estimatedCostPrice: cost, minNetR }, evaluations,
+      reasoning: STRATEGY_VERSION + ": M15 " + d + " con struttura e EMA9/21 coerenti; M5 " + setup + "; conferma M1 " + trigger.datetime + "."
+        + " SL strutturale " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R), netto stimato " + netR.toFixed(2) + "R."
+        + " Setup " + key + ". [shadow-score:" + score + "]" };
   }
-
-  {
-    const bodyMin = envN("BREAKOUT_BODY_RATIO", 0.6);
-    const closeMult = envN("BREAKOUT_CLOSE_ATR_MULT", 0.15);
-    const maxExtMult = envN("BREAKOUT_MAX_EXT_ATR", 1.5);
-    const maxRetraceAtr = envN("BREAKOUT_MAX_RETRACE_ATR", 0.35);
-    const breakIdx = m1.length - 2;
-    const windowStart = breakIdx - breakoutLookback;
-    if (windowStart < 0) {
-      record("momentum_breakout", "rejected", `storico M1 insufficiente (servono ${breakoutLookback + 2} candele)`);
-    } else {
-      const window = m1.slice(windowStart, breakIdx);
-      const high = Math.max(...window.map(c => c.high));
-      const low = Math.min(...window.map(c => c.low));
-      const buffer = atr1 * closeMult;
-      const brokeUp = bullish(prev) && prev.close >= high + buffer;
-      const brokeDown = bearish(prev) && prev.close <= low - buffer;
-      if (!brokeUp && !brokeDown) {
-        record("momentum_breakout", "rejected",
-          `chiusura ${prev.close.toFixed(2)}$ dentro il canale ${breakoutLookback} candele ${low.toFixed(2)}$-${high.toFixed(2)}$ (serve oltre ${buffer.toFixed(2)}$)`);
-      } else {
-        const direction = brokeUp ? "BUY" : "SELL";
-        const emaAt = fast1Series[breakIdx], emaSlowAt = slow1Series[breakIdx];
-        const emaOk = emaAt !== null && emaSlowAt !== null && (direction === "BUY" ? emaAt > emaSlowAt : emaAt < emaSlowAt);
-        const frozenLevel = direction === "BUY" ? high : low;
-        const livePrice = direction === "BUY" ? quote.bid : quote.ask;
-        const holds = direction === "BUY" ? livePrice > frozenLevel : livePrice < frozenLevel;
-        const extensionAtBreak = direction === "BUY" ? prev.close - frozenLevel : frozenLevel - prev.close;
-        const liveExtension = direction === "BUY" ? quote.ask - frozenLevel : frozenLevel - quote.bid;
-        const maxExtension = atr1 * maxExtMult;
-        const currentAligned = direction === "BUY"
-          ? bullish(last) && last.close >= prev.close - atr1 * 0.10
-          : bearish(last) && last.close <= prev.close + atr1 * 0.10;
-        const rejection = direction === "BUY" ? last.high - quote.bid : quote.ask - last.low;
-        const missing: string[] = [];
-        if (extensionAtBreak > maxExtension) missing.push(`breakout già esteso: ${extensionAtBreak.toFixed(2)}$ oltre il livello, massimo ${maxExtension.toFixed(2)}$`);
-        if (liveExtension > maxExtension) missing.push(`prezzo live troppo lontano dal livello congelato ${frozenLevel.toFixed(2)}$: ${liveExtension.toFixed(2)}$ > ${maxExtension.toFixed(2)}$`);
-        if (breakoutBody < bodyMin) missing.push(`corpo ${(breakoutBody * 100).toFixed(0)}% sotto il ${(bodyMin * 100).toFixed(0)}% del range`);
-        if (!emaOk) missing.push(`EMA9/EMA20 M1 non allineate ${direction}`);
-        if (!holds) missing.push(`prezzo live rientrato oltre il livello congelato ${frozenLevel.toFixed(2)}$`);
-        if (!currentAligned) missing.push(`candela M1 live non sta piu' spingendo ${direction}`);
-        if (rejection > atr1 * maxRetraceAtr) missing.push(`rigetto dall'estremo ${rejection.toFixed(2)}$ > ${(atr1 * maxRetraceAtr).toFixed(2)}$`);
-        const blocked = gateForSetup(direction, "momentum_breakout");
-        if (blocked) missing.push(blocked);
-        if (missing.length > 0) record("momentum_breakout", "rejected", missing.join("; "), direction);
-        else {
-          const structureStop = direction === "BUY" ? prev.low - 0.25 : prev.high + 0.25;
-          addCandidate("momentum_breakout", direction, structureStop);
-          record("momentum_breakout", "triggered",
-            `rottura ${direction === "BUY" ? "del massimo" : "del minimo"} congelato ${frozenLevel.toFixed(2)}$ con conferma live (regime ${m5Label})`, direction);
-        }
-      }
-    }
-  }
-
-  {
-    const retestMaxBars = envI("RETEST_MAX_BARS", 4, 2, 12);
-    const retestZoneAtr = envN("RETEST_ZONE_ATR", 0.5);
-    const entryIdx = m1.length - 1;
-    let shockIdx = -1;
-    for (let offset = 2; offset <= retestMaxBars; offset++) {
-      const index = entryIdx - offset;
-      if (index < 1) break;
-      if (isShock(m1[index])) { shockIdx = index; break; }
-    }
-    if (shockIdx < 0) {
-      record("breakout_retest", "rejected", `nessuna candela shock (> ${shockThreshold.toFixed(2)}$) nelle ultime ${retestMaxBars} candele M1`);
-    } else {
-      const shock = m1[shockIdx];
-      const direction: "BUY" | "SELL" | null = bullish(shock) ? "BUY" : bearish(shock) ? "SELL" : null;
-      const windowStart = Math.max(0, shockIdx - breakoutLookback);
-      const window = m1.slice(windowStart, shockIdx);
-      const retest = m1.slice(shockIdx + 1, entryIdx);
-      if (!direction || window.length < 3 || retest.length < 1) {
-        record("breakout_retest", "rejected", "candela shock senza direzione o storico di retest insufficiente");
-      } else {
-        const level = direction === "BUY" ? Math.max(...window.map(c => c.high)) : Math.min(...window.map(c => c.low));
-        const ema9 = fast1Series[entryIdx - 1] ?? fast1!;
-        const anchor = direction === "BUY" ? Math.max(level, ema9) : Math.min(level, ema9);
-        const zone = atr1 * retestZoneAtr;
-        const retestLow = Math.min(...retest.map(c => c.low));
-        const retestHigh = Math.max(...retest.map(c => c.high));
-        const broke = direction === "BUY" ? shock.close > level : shock.close < level;
-        const pulled = direction === "BUY" ? retestLow <= anchor + zone : retestHigh >= anchor - zone;
-        const heldLevel = direction === "BUY"
-          ? retest.every(c => c.close > level) && last.close > level
-          : retest.every(c => c.close < level) && last.close < level;
-        const restartBody = envN("RETEST_BODY_RATIO", 0.5);
-        const restart = bodyRatio(last) >= restartBody && (direction === "BUY"
-          ? bullish(last) && last.close > prev.close && last.close > ema9
-          : bearish(last) && last.close < prev.close && last.close < ema9);
-        const missing: string[] = [];
-        if (!broke) missing.push(`la shock non ha rotto il livello ${level.toFixed(2)}$`);
-        if (!pulled) missing.push(`nessun ritracciamento verso ${anchor.toFixed(2)}$ (min/max retest ${(direction === "BUY" ? retestLow : retestHigh).toFixed(2)}$)`);
-        if (!heldLevel) missing.push(`livello ${level.toFixed(2)}$ chiuso dall'altra parte durante il retest`);
-        if (!restart) missing.push(`nessun riavvio ${direction} oltre ${prev.close.toFixed(2)}$ con corpo pieno dal lato giusto dell'EMA9`);
-        const blocked = gateForSetup(direction, "breakout_retest");
-        if (blocked) missing.push(blocked);
-        if (missing.length > 0) record("breakout_retest", "rejected", missing.join("; "), direction);
-        else {
-          const structureStop = direction === "BUY"
-            ? Math.min(retestLow, last.low) - 0.25
-            : Math.max(retestHigh, last.high) + 0.25;
-          addCandidate("breakout_retest", direction, structureStop);
-          record("breakout_retest", "triggered",
-            `retest del livello ${level.toFixed(2)}$ dopo shock ${(shock.high - shock.low).toFixed(2)}$ e riavvio ${direction} (regime ${m5Label})`, direction);
-        }
-      }
-    }
-  }
-
-  let cleanPullbackKey: string | null = null;
-  {
-    const standardBuy = prev.low <= fast1! && last.close > fast1! && bullish(last) && last.close > prev.close;
-    const standardSell = prev.high >= fast1! && last.close < fast1! && bearish(last) && last.close < prev.close;
-
-    const legZone = atr1 * envN("CLEAN_LEG_PULLBACK_ZONE_ATR", 0.35);
-    const legHoldBuffer = atr1 * envN("CLEAN_LEG_SLOW_HOLD_ATR", 0.35);
-    const legRestartBody = envN("CLEAN_LEG_RESTART_BODY_RATIO", 0.30);
-    const legMaxEntryExt = atr1 * envN("CLEAN_LEG_MAX_ENTRY_EXT_ATR", 0.90);
-    const legFreshExtension = atr1 * envN("CLEAN_LEG_FRESH_EXTENSION_ATR", 0.55);
-    const pullbackLookback = envI("CLEAN_LEG_PULLBACK_LOOKBACK", 6, 3, 12);
-    const extensionLookback = envI("CLEAN_LEG_EXTENSION_LOOKBACK", 3, 1, 6);
-
-    let touchIdx = -1;
-    if (cleanLegDirection) {
-      for (let i = m1.length - 2; i >= Math.max(1, m1.length - 1 - pullbackLookback); i--) {
-        const fastAt = fast1Series[i], slowAt = slow1Series[i];
-        if (fastAt === null || slowAt === null) continue;
-        const touched = cleanLegDirection === "BUY"
-          ? m1[i].low <= fastAt + legZone && m1[i].close >= slowAt - legHoldBuffer
-          : m1[i].high >= fastAt - legZone && m1[i].close <= slowAt + legHoldBuffer;
-        if (touched) { touchIdx = i; break; }
-      }
-    }
-
-    let freshExtension = false;
-    let legLow = prev.low;
-    let legHigh = prev.high;
-    let held = false;
-    if (cleanLegDirection && touchIdx >= 0) {
-      const extensionStart = Math.max(0, touchIdx - extensionLookback);
-      for (let i = extensionStart; i < touchIdx; i++) {
-        const fastAt = fast1Series[i];
-        if (fastAt === null) continue;
-        if (cleanLegDirection === "BUY" && m1[i].close >= fastAt + legFreshExtension) freshExtension = true;
-        if (cleanLegDirection === "SELL" && m1[i].close <= fastAt - legFreshExtension) freshExtension = true;
-      }
-      const pullbackBars = m1.slice(touchIdx, m1.length - 1);
-      legLow = Math.min(...pullbackBars.map(c => c.low));
-      legHigh = Math.max(...pullbackBars.map(c => c.high));
-      held = pullbackBars.every((c, offset) => {
-        const index = touchIdx + offset;
-        const slowAt = slow1Series[index];
-        if (slowAt === null) return false;
-        return cleanLegDirection === "BUY" ? c.close >= slowAt - legHoldBuffer : c.close <= slowAt + legHoldBuffer;
-      }) && (cleanLegDirection === "BUY" ? last.close > slow1! : last.close < slow1!);
-      cleanPullbackKey = `${cleanLegDirection}:${m1[touchIdx].datetime}`;
-    }
-
-    const legBuyRestart = bullish(last) && bodyRatio(last) >= legRestartBody && last.close > prev.close && last.close > fast1! && fast1! > slow1!;
-    const legSellRestart = bearish(last) && bodyRatio(last) >= legRestartBody && last.close < prev.close && last.close < fast1! && fast1! < slow1!;
-    const buyEntryExt = Math.max(0, quote.ask - fast1!);
-    const sellEntryExt = Math.max(0, fast1! - quote.bid);
-    const sameConsumedPullback = cleanPullbackKey !== null && cleanLegState?.lastPullbackKey === cleanPullbackKey;
-    const sameTriggerCandle = sameConsumedPullback && cleanLegState?.lastTriggerCandle === last.datetime;
-    const pullbackAvailable = !sameConsumedPullback || sameTriggerCandle;
-    const cleanBuy = cleanLegDirection === "BUY" && touchIdx >= 0 && freshExtension && held && legBuyRestart && buyEntryExt <= legMaxEntryExt && pullbackAvailable;
-    const cleanSell = cleanLegDirection === "SELL" && touchIdx >= 0 && freshExtension && held && legSellRestart && sellEntryExt <= legMaxEntryExt && pullbackAvailable;
-
-    const buy = cleanLegDirection ? cleanBuy : standardBuy;
-    const sell = cleanLegDirection ? cleanSell : standardSell;
-    if (!buy && !sell) {
-      if (cleanLegDirection) {
-        const reasons: string[] = [];
-        if (touchIdx < 0) reasons.push(`nessun pullback recente verso EMA9 ± ${legZone.toFixed(2)}$`);
-        else {
-          if (!freshExtension) reasons.push(`manca una nuova estensione di almeno ${legFreshExtension.toFixed(2)}$ prima del pullback`);
-          if (!held) reasons.push("pullback non ha tenuto la struttura EMA20 M1");
-          if (cleanLegDirection === "BUY" && !legBuyRestart) reasons.push("manca ripartenza BUY forte");
-          if (cleanLegDirection === "SELL" && !legSellRestart) reasons.push("manca ripartenza SELL forte");
-          if (cleanLegDirection === "BUY" && buyEntryExt > legMaxEntryExt) reasons.push(`BUY già esteso ${buyEntryExt.toFixed(2)}$ dall'EMA9`);
-          if (cleanLegDirection === "SELL" && sellEntryExt > legMaxEntryExt) reasons.push(`SELL già esteso ${sellEntryExt.toFixed(2)}$ dall'EMA9`);
-          if (!pullbackAvailable) reasons.push("questo pullback è già stato usato: attendo nuova estensione e nuovo rientro");
-        }
-        record("micro_pullback", "rejected", `gamba pulita ${cleanLegDirection}: ${reasons.join("; ") || "attendo pullback pulito"}`, cleanLegDirection);
-      } else {
-        record("micro_pullback", "rejected", `nessun rientro su EMA9 M1 ${fast1!.toFixed(2)}$ con candela di ripartenza`);
-      }
-    } else {
-      const direction = buy ? "BUY" : "SELL";
-      const cleanEntry = cleanLegDirection === direction;
-      const blocked = gateForSetup(direction, "micro_pullback");
-      if (blocked) record("micro_pullback", "rejected", blocked, direction);
-      else {
-        const structureStop = cleanEntry
-          ? direction === "BUY" ? Math.min(legLow, last.low) - 0.25 : Math.max(legHigh, last.high) + 0.25
-          : direction === "BUY" ? Math.min(prev.low, last.low) - 0.25 : Math.max(prev.high, last.high) + 0.25;
-        addCandidate("micro_pullback", direction, structureStop);
-        record("micro_pullback", "triggered",
-          cleanEntry
-            ? `gamba pulita ${direction}: nuova estensione, pullback M1 su EMA9 e ripartenza confermata; pullback ${cleanPullbackKey}`
-            : `rientro su EMA9 M1 e ripartenza ${direction} (regime ${m5Label})`,
-          direction);
-      }
-    }
-  }
-
-  const chosen = [...candidates].sort((a, b) => b.score - a.score)[0];
-  if (!chosen) {
-    const cleanSummary = cleanLegDirection
-      ? ` Gamba pulita ${cleanLegDirection} attiva (efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5): accetto solo un clean pullback per ciclo.`
-      : "";
-    return no(
-      `Nessun trigger scalper M1. Regime ${m5Label}; ATR M1 ${atr1.toFixed(2)}$; efficienza range ${(rangeEfficiency * 100).toFixed(0)}%. ${cleanSummary}`
-      + evaluations.map(e => `${e.setup}${e.direction ? ` ${e.direction}` : ""}: ${e.reason}`).join(" | "),
-      evaluations,
-    );
-  }
-
-  const { direction, setup, structureStop } = chosen;
-  const entry = direction === "BUY" ? quote.ask : quote.bid;
-  const structuralRisk = Math.abs(entry - structureStop);
-  const slAtrMult = envN("SL_ATR_MULT", 1.3);
-  const slMinUsd = envN("SL_MIN_USD", 3);
-  const slMaxUsd = envN("SL_MAX_USD", 8);
-  const atrRisk = atr1 * slAtrMult;
-  const risk = Math.max(structuralRisk, atrRisk, slMinUsd);
-  const rr = envN("TP_RR", 1.5);
-  if (risk > slMaxUsd) {
-    const detail = `SL troppo ampio: servono ${risk.toFixed(2)}$ (struttura ${structuralRisk.toFixed(2)}$, ATR ${atrRisk.toFixed(2)}$, minimo ${slMinUsd.toFixed(2)}$)`
-      + ` sopra il massimo ${slMaxUsd.toFixed(2)}$`;
-    const chosenIndex = evaluations.findIndex((item) => item.setup === setup && item.status === "triggered" && item.direction === direction);
-    if (chosenIndex >= 0) evaluations[chosenIndex] = { ...evaluations[chosenIndex], status: "rejected", reason: `${evaluations[chosenIndex].reason} — ${detail}` };
-    return no(`${detail}. Setup ${setup} ${direction} scartato.`, evaluations);
-  }
-  const stopLoss = direction === "BUY" ? entry - risk : entry + risk;
-  const takeProfit = direction === "BUY" ? entry + risk * rr : entry - risk * rr;
-  const slPlan = {
-    structural: Number(structuralRisk.toFixed(2)),
-    atr: Number(atrRisk.toFixed(2)),
-    applied: Number(risk.toFixed(2)),
-    minUsd: slMinUsd,
-    maxUsd: slMaxUsd,
-    rr,
-  };
-
-  const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
-  const cleanAligned = cleanLegDirection === direction && setup === "micro_pullback";
-  if (cleanAligned && cleanLegState && cleanPullbackKey) {
-    cleanLegState = { ...cleanLegState, lastPullbackKey: cleanPullbackKey, lastTriggerCandle: last.datetime };
-  }
-  const trendScore = cleanAligned ? 24 : alignedTrend ? 20 : marketRange && setup === "liquidity_sweep" ? 18 : 12;
-  const lastBody = bodyRatio(last);
-  const moveAtr = Math.abs(last.close - prev.close) / atr1;
-  const triggerScore = setup === "liquidity_sweep"
-    ? Math.min(25, 20 + Math.round(Math.min(1, lastBody) * 5))
-    : setup === "momentum_breakout"
-      ? Math.min(25, 18 + Math.round(Math.min(1, breakoutBody) * 7))
-      : setup === "breakout_retest"
-        ? Math.min(25, 18 + Math.round(Math.min(1, lastBody) * 7))
-        : Math.min(25, (cleanAligned ? 19 : 15) + Math.round(Math.min(0.5, moveAtr) * 12));
-  const accumulationScore = cleanAligned ? 15 : marketRange && setup !== "liquidity_sweep" ? 5 : marketRange ? 14 : 15;
-  const atrScore = atr1 >= 1.2 && atr1 <= 3.5 ? 10 : atr1 >= 1.0 && atr1 <= 4.5 ? 8 : 5;
-  const spreadRatio = maxSpread > 0 ? quote.spread / maxSpread : 1;
-  const spreadScore = spreadRatio <= 0.35 ? 10 : spreadRatio <= 0.6 ? 8 : spreadRatio <= 0.8 ? 6 : 4;
-  const structureScore = structuralRisk >= atrRisk ? 10 : structuralRisk >= atrRisk * 0.6 ? 8 : 5;
-  const candleScore = lastBody >= 0.65 ? 10 : lastBody >= 0.45 ? 8 : lastBody >= 0.3 ? 6 : 4;
-  const qualityScore = Math.min(100, Math.max(0,
-    trendScore + triggerScore + accumulationScore + atrScore + spreadScore + structureScore + candleScore,
-  ));
-  const scoreBreakdown = `regime ${trendScore}, trigger ${triggerScore}, range ${accumulationScore}, ATR ${atrScore}, spread ${spreadScore}, SL ${structureScore}, candela ${candleScore}`;
-  const cleanReason = cleanAligned
-    ? ` Clean leg ${direction}: efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5; un solo ingresso per pullback, bias mantenuto fino a rottura M5.`
-    : "";
-
-  return {
-    direction, setup, slPlan,
-    entry: Number(entry.toFixed(2)), stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), riskReward: Number(rr.toFixed(2)),
-    evaluations,
-    reasoning: `${setupLabel(setup)} M1 ${direction}. Regime ${m5Label} da M5 chiuse; candidate score ${chosen.score}. ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$.`
-      + cleanReason
-      + ` SL ${risk.toFixed(2)}$ (struttura ${structuralRisk.toFixed(2)}$, ATR x${slAtrMult} ${atrRisk.toFixed(2)}$), TP ${(risk * rr).toFixed(2)}$ a ${rr}R.`
-      + ` Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
-  };
+  return reject("M15 " + d + ": attendo un pullback/retest M5 valido con spazio fino al prossimo ostacolo.", evaluations.length ? evaluations : undefined);
 }
