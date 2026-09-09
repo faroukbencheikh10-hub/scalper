@@ -23,25 +23,32 @@ function signed(direction: "BUY" | "SELL", value: number) { return direction ===
 function expectedXauClosureGap(previousStartMs: number, nextStartMs: number, sizeMs: number) {
   const missingFrom = previousStartMs + sizeMs;
   if (missingFrom >= nextStartMs) return false;
-  const from = new Date(missingFrom), to = new Date(nextStartMs);
-  const fromMinute = from.getUTCHours() * 60 + from.getUTCMinutes();
-  const toMinute = to.getUTCHours() * 60 + to.getUTCMinutes();
-  if (fromMinute !== 21 * 60 || toMinute !== 22 * 60) return false;
-  if (from.getUTCDay() === 5) {
-    return to.getUTCDay() === 0 && nextStartMs - missingFrom === 49 * 60 * MINUTE;
-  }
-  return from.getUTCDay() >= 1 && from.getUTCDay() <= 4
-    && to.getUTCDay() === from.getUTCDay()
-    && nextStartMs - missingFrom === 60 * MINUTE;
+  const from = new Date(missingFrom);
+  const dayStart = Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate());
+  const closureStart = dayStart + 21 * 60 * MINUTE;
+  const reopen = from.getUTCDay() === 5
+    ? dayStart + (2 * 24 + 22) * 60 * MINUTE
+    : dayStart + 22 * 60 * MINUTE;
+  if (from.getUTCDay() !== 5 && (from.getUTCDay() < 1 || from.getUTCDay() > 4)) return false;
+  // Around a reopen, the broker may omit the boundary bucket itself. Permit at most
+  // one timeframe of alignment slack on each side, but only when the gap spans the
+  // known XAUUSD closure. Arbitrary intraday gaps still fail continuity.
+  return missingFrom >= closureStart - sizeMs
+    && missingFrom <= closureStart
+    && nextStartMs >= reopen
+    && nextStartMs <= reopen + sizeMs;
 }
 
-function recentBarsReadyWithMarketClosures(
-  bars: Candle[], minutes: number, count: number, nowMs: number, maxAgeMs?: number,
-) {
+function latestBarFresh(bars: Candle[], minutes: number, nowMs: number, maxAgeMs: number) {
+  const last = bars.at(-1);
+  if (!last) return false;
+  const lastCloseAt = Date.parse(last.datetime) + minutes * MINUTE;
+  return Number.isFinite(lastCloseAt) && nowMs - lastCloseAt >= 0 && nowMs - lastCloseAt <= maxAgeMs;
+}
+
+function recentBarsReadyWithMarketClosures(bars: Candle[], minutes: number, count: number) {
   const recent = bars.slice(-count), size = minutes * MINUTE;
   if (recent.length < count) return false;
-  const lastCloseAt = Date.parse(recent.at(-1)!.datetime) + size;
-  if (maxAgeMs !== undefined && (!Number.isFinite(lastCloseAt) || nowMs - lastCloseAt < 0 || nowMs - lastCloseAt > maxAgeMs)) return false;
   return recent.every((bar, i) => {
     if (i === 0) return true;
     const previous = Date.parse(recent[i - 1].datetime), current = Date.parse(bar.datetime);
@@ -81,9 +88,9 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   if (!m1 || !m5) return reject("Candele non valide, duplicate o fuori ordine.");
   const m15 = aggregateM15(m5);
   if (m1.length < 35 || m5.length < 35 || m15.length < 30) return reject("Storico insufficiente: servono M1/M5 e almeno 30 M15 complete.");
-  if (!recentBarsReadyWithMarketClosures(m1, 1, 15, nowMs, 3 * MINUTE)
-    || !recentBarsReadyWithMarketClosures(m5, 5, 10, nowMs)
-    || !recentBarsReadyWithMarketClosures(m15, 15, 8, nowMs)) return reject("Storico recente M1/M5/M15 incompleto o non aggiornato: attendo continuità dei dati.");
+  if (!latestBarFresh(m1, 1, nowMs, 3 * MINUTE)
+    || !recentBarsReadyWithMarketClosures(m5, 5, 10)
+    || !recentBarsReadyWithMarketClosures(m15, 15, 8)) return reject("Storico recente M1/M5/M15 incompleto o non aggiornato: attendo continuità dei dati.");
   const warmup = env("SCALPER_SESSION_WARMUP_MIN", 5, 0, 30) * MINUTE;
   if (session.sessionStartAt && nowMs < Date.parse(session.sessionStartAt) + warmup) return reject("Warm-up nuova sessione: attendo la prima M5 chiusa.");
 
