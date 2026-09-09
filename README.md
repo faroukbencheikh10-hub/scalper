@@ -20,7 +20,7 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 - Stop dinamico 2–5 USD, TP con lo stesso R:R (1.45R di default) per tutti i setup.
 - **Una sola posizione XAUUSD aperta alla volta** (`SCALPER_MAX_OPEN_POSITIONS=1`).
 - Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive; pausa re-entry 120 s.
-- **Nessun re-entry automatico** nella direzione di una perdita già chiusa nella sessione corrente: il blocco cade con la sessione successiva.
+- **Blocchi dopo una perdita a scadenza**: la direzione appena chiusa in perdita resta ferma `LOSS_LOCK_MINUTES`; dopo `CONSEC_LOSS_COUNT` perdite consecutive nella sessione si ferma tutto per `CONSEC_LOSS_PAUSE_MINUTES`. Il fermo per l'intera sessione resta solo nei limiti giornalieri (`MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS`).
 - Spread massimo, ATR minimo/massimo e SL controllato restano **invariati**.
 
 ### Gate M5 e direzionalità M1
@@ -64,7 +64,9 @@ Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi
 | `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
 | `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
 | `SCALPER_MAX_OPEN_POSITIONS` | 1 | Posizioni XAUUSD aperte contemporaneamente |
-| `SCALPER_LOSS_LOCK_REFRESH_MS` | 30000 | Rilettura delle direzioni in perdita nella sessione |
+| `LOSS_LOCK_MINUTES` | 30 | Blocco della stessa direzione dopo una chiusura in perdita |
+| `CONSEC_LOSS_COUNT` / `CONSEC_LOSS_PAUSE_MINUTES` | 3 / 120 | Perdite consecutive che fermano tutto e durata della pausa |
+| `SCALPER_LOSS_LOCK_REFRESH_MS` | 30000 | Rilettura periodica delle chiusure per i blocchi da perdita |
 | `SCALPER_TICK_LOG_MS` | 1000 | Throttle del log per tick dei setup valutati |
 
 ### Log dei setup valutati
@@ -100,7 +102,9 @@ Il cookie e' `secure`, quindi in sviluppo su `http://localhost` non viene accett
 
 `SCALPER_MIN_REENTRY_SEC` (default 120) impone una pausa minima fra la chiusura di una posizione reale e l'apertura successiva; il blocco compare in `stream_last_decision.execution.status` come `reentry_gap`.
 
-Dopo una chiusura in perdita il worker blocca **tutta la sessione corrente** per quella direzione: il motivo compare in `stream_last_decision.reasoning` e le direzioni bloccate sono elencate in `stream_worker_detail.lossLockedDirections` e sulla dashboard (card Esecuzione).
+Dopo una chiusura in perdita il worker blocca la **stessa direzione** per `LOSS_LOCK_MINUTES` (default 30) a partire dall'orario di chiusura, e dopo `CONSEC_LOSS_COUNT` (3) perdite consecutive nella sessione mette in pausa **tutti** gli ingressi per `CONSEC_LOSS_PAUSE_MINUTES` (120). Entrambi i blocchi scadono da soli e vengono ricalcolati all'avvio, a ogni chiusura e ogni `SCALPER_LOSS_LOCK_REFRESH_MS`.
+
+L'orario di sblocco compare ovunque: in `stream_last_decision.reasoning`, in `stream_worker_detail` (`lossLockedDirections`, `lossLockUntil`, `lossPauseUntil`), sulla dashboard (card Esecuzione, righe *Re-entry bloccato* e *Pausa perdite*) e su Telegram, sia nel messaggio di chiusura in perdita sia nella notifica di ingresso bloccato.
 
 ## Notifiche Telegram
 

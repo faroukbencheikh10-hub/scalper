@@ -187,6 +187,10 @@ async function main() {
   const dupSetupBars = envInt("DUP_SETUP_BARS", 3, 0, 30);
   const tickLogMs = envInt("SCALPER_TICK_LOG_MS", 1000, 0, 60_000);
   const lossLockRefreshMs = envInt("SCALPER_LOSS_LOCK_REFRESH_MS", 30_000, 5_000, 300_000);
+  // Blocchi dopo una perdita: nessun blocco di sessione intera, quello resta ai limiti giornalieri.
+  const lossLockMs = envInt("LOSS_LOCK_MINUTES", 30, 0, 1440) * 60_000;
+  const consecLossPauseMs = envInt("CONSEC_LOSS_PAUSE_MINUTES", 120, 0, 1440) * 60_000;
+  const consecLossCount = envInt("CONSEC_LOSS_COUNT", 3, 2, 10);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -225,21 +229,70 @@ async function main() {
   // stesso setup bloccato per DUP_SETUP_BARS candele M1 (bucket di apertura incluso).
   const dupDirectionUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   const dupSetupUntilBucket = new Map<string, number>();
-  // Nessun re-entry automatico nella direzione di una perdita gia' chiusa nella sessione corrente.
-  const lossLockedDirections = new Set<"BUY" | "SELL">();
+  // Dopo una chiusura in perdita la stessa direzione resta ferma LOSS_LOCK_MINUTES; dopo
+  // CONSEC_LOSS_COUNT perdite consecutive nella sessione si ferma tutto per CONSEC_LOSS_PAUSE_MINUTES.
+  // Entrambi i blocchi scadono da soli: il fermo per l'intera sessione resta solo nei limiti giornalieri.
+  const lossLockUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
+  let lossPauseUntil = 0;
 
-  // Direzioni gia' andate in perdita nella sessione corrente: restano bloccate fino alla sessione successiva.
-  const refreshLossLock = async () => {
+  const closedAtMs = (value: unknown) => {
+    const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ""));
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+
+  const refreshLossGuards = async () => {
     const start = sessionWindowStart(new Date(), sessionConfig);
     const result = await dbQuery(
-      `SELECT DISTINCT direction FROM scalper_signals
-        WHERE outcome='LOSS' AND mt5_position_id IS NOT NULL AND closed_at >= $1::timestamptz`,
+      `SELECT direction,outcome,closed_at FROM scalper_signals
+        WHERE outcome IN ('WIN','LOSS','BREAKEVEN') AND mt5_position_id IS NOT NULL
+          AND closed_at >= $1::timestamptz
+        ORDER BY closed_at DESC LIMIT 50`,
       [start.toISOString()],
     );
-    lossLockedDirections.clear();
-    for (const row of result.rows as Array<{ direction?: string }>) {
-      if (row.direction === "BUY" || row.direction === "SELL") lossLockedDirections.add(row.direction);
+    const rows = result.rows as Array<{ direction?: string; outcome?: string; closed_at?: unknown }>;
+    lossLockUntil.BUY = 0;
+    lossLockUntil.SELL = 0;
+    lossPauseUntil = 0;
+    // Righe in ordine decrescente: la prima perdita incontrata per direzione e' la piu' recente.
+    for (const row of rows) {
+      if (row.outcome !== "LOSS") continue;
+      const direction = row.direction === "BUY" || row.direction === "SELL" ? row.direction : null;
+      if (!direction || lossLockUntil[direction] > 0) continue;
+      lossLockUntil[direction] = closedAtMs(row.closed_at) + lossLockMs;
     }
+    let streak = 0;
+    for (const row of rows) {
+      if (row.outcome !== "LOSS") break;
+      streak += 1;
+      if (streak >= consecLossCount) {
+        lossPauseUntil = closedAtMs(rows[0]?.closed_at) + consecLossPauseMs;
+        break;
+      }
+    }
+  };
+
+  const hhmmUtc = (ms: number) => new Date(ms).toISOString().slice(11, 16);
+
+  /** Stato dei blocchi da perdita per heartbeat, dashboard e Telegram. */
+  const lossGuards = () => {
+    const now = Date.now();
+    const directions = (["BUY", "SELL"] as const).filter((direction) => lossLockUntil[direction] > now);
+    return {
+      lossLockedDirections: [...directions],
+      lossLockUntil: Object.fromEntries(directions.map((direction) => [direction, new Date(lossLockUntil[direction]).toISOString()])),
+      lossPauseUntil: lossPauseUntil > now ? new Date(lossPauseUntil).toISOString() : null,
+      lossLockMinutes: Math.round(lossLockMs / 60_000),
+      consecLossPauseMinutes: Math.round(consecLossPauseMs / 60_000),
+    };
+  };
+
+  const lossGuardLine = () => {
+    const now = Date.now();
+    const parts = (["BUY", "SELL"] as const)
+      .filter((direction) => lossLockUntil[direction] > now)
+      .map((direction) => `${direction} bloccato fino alle ${hhmmUtc(lossLockUntil[direction])} UTC`);
+    if (lossPauseUntil > now) parts.push(`pausa ${consecLossCount} perdite consecutive fino alle ${hhmmUtc(lossPauseUntil)} UTC`);
+    return parts.length > 0 ? parts.join(" \u00b7 ") : "nessun blocco da perdita attivo";
   };
 
   let lastTickLogKey = "";
@@ -285,7 +338,7 @@ async function main() {
     account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
-    lossLockedDirections: [...lossLockedDirections],
+    ...lossGuards(),
     m1: m1.length,
     m5: m5.length,
     hoursUtc: sessionConfig.hoursUtc,
@@ -447,7 +500,7 @@ async function main() {
         }
       }
 
-      await refreshLossLock().catch(() => undefined);
+      await refreshLossGuards().catch(() => undefined);
       await setSetting("stream_last_flatten", JSON.stringify({ at, closed, canceled, reason, failures }));
       if (reason === "end_of_session") {
         void sendTelegram(
@@ -559,9 +612,18 @@ async function main() {
       }
     }
 
-    if (lossLockedDirections.has(signal.direction)) {
-      const reason = `Perdita già chiusa in ${signal.direction} in questa sessione: nessun re-entry automatico nella stessa direzione.`;
+    const guardNow = Date.now();
+    if (lossPauseUntil > guardNow) {
+      const reason = `Pausa dopo ${consecLossCount} perdite consecutive: nessun ingresso fino alle ${hhmmUtc(lossPauseUntil)} UTC.`;
       latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      notifyBlock(reason);
+      logTick(signal, quote, reason);
+      return;
+    }
+    if (lossLockUntil[signal.direction] > guardNow) {
+      const reason = `Perdita recente in ${signal.direction}: direzione bloccata fino alle ${hhmmUtc(lossLockUntil[signal.direction])} UTC.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      notifyBlock(reason);
       logTick(signal, quote, reason);
       return;
     }
@@ -713,8 +775,8 @@ async function main() {
         SET outcome='ERROR',closed_at=now(),mt5_error='purged at startup'
       WHERE outcome IS NULL AND mt5_position_id IS NULL`,
   );
-  await refreshLossLock();
-  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount, lossLocked: [...lossLockedDirections] });
+  await refreshLossGuards();
+  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount, lossGuards: lossGuards() });
 
   const subscribe = async () => {
     ready = false;
@@ -810,15 +872,16 @@ async function main() {
     if (syncBusy || flattenBusy || stopped || !subscribed) return;
     syncBusy = true;
     void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
-      .then((result) => {
+      .then(async (result) => {
         if (result.closed > 0) {
           signalLockUntil = 0;
-          void refreshLossLock().catch((error) => console.error(error));
+          await refreshLossGuards().catch((error) => console.error(error));
         }
         for (const closure of result.closures ?? []) {
           void sendTelegram(
             `${closure.profit > 0 ? "\u2705" : closure.profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${closure.outcome} (SL/TP)`
             + `\nprofitto ${money(closure.profit)} · ${money(closure.openPrice)} \u2192 ${money(closure.closePrice)} · ${closure.resultR >= 0 ? "+" : ""}${closure.resultR}R`
+            + `${closure.outcome === "LOSS" ? `\n${lossGuardLine()}` : ""}`
             + `\n${balanceLine()}`,
           );
         }
@@ -856,7 +919,7 @@ async function main() {
   }, decisionPersistMs);
 
   const lossLockTimer = setInterval(() => {
-    void refreshLossLock().catch((error) => console.error(error));
+    void refreshLossGuards().catch((error) => console.error(error));
   }, lossLockRefreshMs);
 
   const heartbeatTimer = setInterval(() => {

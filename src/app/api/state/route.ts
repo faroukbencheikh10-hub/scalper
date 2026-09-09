@@ -22,7 +22,7 @@ const SETTING_KEYS = [
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type ParsedError = { raw: string; message: string; at: string | null; atMs: number | null };
 type WorkerAccount = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
-type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; lossLockedDirections?: string[]; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
+type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
 
 function parseJson<T = Record<string, unknown>>(value: string | undefined): T | null {
   if (!value) return null;
