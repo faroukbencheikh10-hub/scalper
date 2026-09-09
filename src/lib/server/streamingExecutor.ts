@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { dbQuery, ensureSchema, systemStopActive } from "./db";
+import { dbQuery, ensureSchema, getSetting, setSetting, systemStopActive } from "./db";
 import { autoExecEnabled, lots } from "./executor";
 import { deals, symbol } from "./metaApi";
 
@@ -46,7 +46,13 @@ type ReserveSignalInput = {
   openPositionCount: number;
 };
 
+type DealHistory = Awaited<ReturnType<typeof deals>>;
+
 const timeStopRequested = new Set<string>();
+const historyAttemptAt = new Map<string, number>();
+let historyBackoffUntil = 0;
+let historyBackoffLoaded = false;
+let historyErrorActive = false;
 
 function envN(name: string, fallback: number, min = 0) {
   const value = Number(process.env[name]);
@@ -55,6 +61,85 @@ function envN(name: string, fallback: number, min = 0) {
 
 function maxOpenPositions() {
   return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 3, 1))));
+}
+
+function historyRetryMs() {
+  return envN("SCALPER_HISTORY_RETRY_SEC", 30, 10) * 1000;
+}
+
+function historyBackoffMs() {
+  return envN("SCALPER_HISTORY_BACKOFF_MIN", 15, 1) * 60_000;
+}
+
+function errorText(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isHistoryRateLimit(error: unknown) {
+  const message = errorText(error);
+  return message.includes("429") || message.includes("TooManyRequestsError") || message.includes("cpu credits per 6h");
+}
+
+async function loadHistoryBackoff() {
+  if (historyBackoffLoaded) return;
+  historyBackoffLoaded = true;
+  const saved = await getSetting("metaapi_history_backoff_until");
+  if (!saved) return;
+  const parsed = Date.parse(saved);
+  historyErrorActive = true;
+  if (Number.isFinite(parsed) && parsed > Date.now()) historyBackoffUntil = parsed;
+}
+
+async function setHistoryRateLimitBackoff(error: unknown) {
+  const until = Math.max(historyBackoffUntil, Date.now() + historyBackoffMs());
+  historyBackoffUntil = until;
+  historyErrorActive = true;
+  const untilIso = new Date(until).toISOString();
+  const at = new Date().toISOString();
+  await Promise.all([
+    setSetting("metaapi_history_backoff_until", untilIso),
+    setSetting("stream_last_error", `${at} MetaApi storico in pausa fino a ${untilIso}: 429 getDealsByPosition`),
+  ]);
+  console.warn("[scalper-worker] history_backoff", { until: untilIso, error: errorText(error) });
+}
+
+async function clearHistoryErrorAfterRecovery() {
+  if (!historyErrorActive) return;
+  historyErrorActive = false;
+  historyBackoffUntil = 0;
+  const current = await getSetting("stream_last_error");
+  await setSetting("metaapi_history_backoff_until", "");
+  if (current && (current.includes("getDealsByPosition") || current.includes("MetaApi storico in pausa"))) {
+    await setSetting("stream_last_error", "");
+  }
+}
+
+async function fetchHistoryThrottled(positionId: string) {
+  await loadHistoryBackoff();
+  const now = Date.now();
+  if (historyBackoffUntil > now) {
+    return { status: "backoff" as const, history: [] as DealHistory };
+  }
+  if (historyBackoffUntil > 0) historyBackoffUntil = 0;
+
+  const lastAttempt = historyAttemptAt.get(positionId) ?? 0;
+  if (now - lastAttempt < historyRetryMs()) {
+    return { status: "throttled" as const, history: [] as DealHistory };
+  }
+  historyAttemptAt.set(positionId, now);
+
+  try {
+    const history = await deals(positionId);
+    await clearHistoryErrorAfterRecovery();
+    return { status: "ok" as const, history };
+  } catch (error) {
+    if (isHistoryRateLimit(error)) {
+      await setHistoryRateLimitBackoff(error);
+      return { status: "backoff" as const, history: [] as DealHistory };
+    }
+    console.warn("[scalper-worker] history_lookup_error", { positionId, error: errorText(error) });
+    return { status: "error" as const, history: [] as DealHistory };
+  }
 }
 
 function positionDirection(position: StreamPosition): "BUY" | "SELL" | null {
@@ -231,8 +316,11 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       continue;
     }
 
-    timeStopRequested.delete(String(signal.mt5_position_id));
-    const history = await deals(String(signal.mt5_position_id));
+    const positionId = String(signal.mt5_position_id);
+    timeStopRequested.delete(positionId);
+    const lookup = await fetchHistoryThrottled(positionId);
+    if (lookup.status !== "ok") continue;
+    const history = lookup.history;
     const out = history
       .filter((d) => d.entryType && d.entryType !== "DEAL_ENTRY_IN")
       .sort((a, b) => Date.parse(a.time ?? "") - Date.parse(b.time ?? ""))
@@ -255,6 +343,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
         WHERE id=$1`,
       [signal.id, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null],
     );
+    historyAttemptAt.delete(positionId);
     closed++;
   }
 
