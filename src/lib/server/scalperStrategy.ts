@@ -104,9 +104,31 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const rr = envN("SCALPER_RR", 1.45);
   const takeProfit = direction === "BUY" ? entry + risk * rr : entry - risk * rr;
 
+  // Shadow score 0-100: viene registrato ma NON blocca mai un trade.
+  const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
+  const trendScore = alignedTrend ? 20 : 12;
+  const lastRange = Math.max(0.01, last.high - last.low);
+  const bodyRatio = Math.abs(last.close - last.open) / lastRange;
+  const moveAtr = Math.abs(last.close - prev.close) / atr1;
+  const triggerScore = setup === "liquidity_sweep"
+    ? Math.min(25, 20 + Math.round(Math.min(1, bodyRatio) * 5))
+    : Math.min(25, 15 + Math.round(Math.min(0.5, moveAtr) * 20));
+  const accumulationScore = compressed || choppy ? 10 : 15;
+  const atrScore = atr1 >= 1.2 && atr1 <= 3.5 ? 10 : atr1 >= 1.0 && atr1 <= 4.5 ? 8 : 5;
+  const spreadRatio = maxSpread > 0 ? quote.spread / maxSpread : 1;
+  const spreadScore = spreadRatio <= 0.35 ? 10 : spreadRatio <= 0.6 ? 8 : spreadRatio <= 0.8 ? 6 : 4;
+  const structureScore = rawRisk >= minRisk && rawRisk <= maxRisk
+    ? 10
+    : rawRisk >= atr1 * 0.9 && rawRisk <= maxRisk * 1.25 ? 8 : 5;
+  const candleScore = bodyRatio >= 0.65 ? 10 : bodyRatio >= 0.45 ? 8 : bodyRatio >= 0.3 ? 6 : 4;
+  const qualityScore = Math.min(100, Math.max(0,
+    trendScore + triggerScore + accumulationScore + atrScore + spreadScore + structureScore + candleScore,
+  ));
+  const scoreBreakdown = `trend ${trendScore}, trigger ${triggerScore}, accumulo ${accumulationScore}, ATR ${atrScore}, spread ${spreadScore}, SL ${structureScore}, candela ${candleScore}`;
+
   return {
     direction, setup,
     entry: Number(entry.toFixed(2)), stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), riskReward: Number(rr.toFixed(2)),
-    reasoning: `${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Time-stop ${timeStopLabel()}.`
+    reasoning: `${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Time-stop ${timeStopLabel()}. Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
   };
 }
