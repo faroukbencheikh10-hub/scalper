@@ -9,9 +9,16 @@ type CleanLegState = {
   refreshedAt: number;
   efficiency: number;
   netAtr: number;
+  sessionStartMs: number;
+  lastPullbackKey: string | null;
+  lastTriggerCandle: string | null;
 };
 
 let cleanLegState: CleanLegState | null = null;
+
+export function resetCleanLegState() {
+  cleanLegState = null;
+}
 
 function envN(name: string, fallback: number) {
   const v = Number(process.env[name]);
@@ -28,15 +35,35 @@ function no(reasoning: string, evaluations: SetupEvaluation[] = []): ScalperSign
 function blockedByFilter(reason: string): SetupEvaluation[] {
   return [{ setup: "filtri", status: "rejected", reason }];
 }
+function parseClockMinutes(value: string) {
+  const [h, m] = value.split(":").map(Number);
+  if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || h > 23 || m < 0 || m > 59) return null;
+  return h * 60 + m;
+}
 function hoursAllowed(now = new Date()) {
   const raw = process.env.SCALPER_HOURS_UTC?.trim() || "06:30-20:30";
   const [a, b] = raw.split("-");
-  const mins = (s: string) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
-  if (!a || !b) return true;
-  const start = mins(a), end = mins(b);
+  const start = a ? parseClockMinutes(a) : null;
+  const end = b ? parseClockMinutes(b) : null;
+  if (start === null || end === null) return true;
   const cur = now.getUTCHours() * 60 + now.getUTCMinutes();
   if (start === end) return true;
   return start < end ? cur >= start && cur <= end : cur >= start || cur <= end;
+}
+function currentSessionStartMs(nowMs: number) {
+  const raw = process.env.SCALPER_HOURS_UTC?.trim() || "06:30-20:30";
+  const [a, b] = raw.split("-");
+  const start = a ? parseClockMinutes(a) : null;
+  const end = b ? parseClockMinutes(b) : null;
+  if (start === null || end === null) return null;
+  const now = new Date(nowMs);
+  const dayStart = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  const cur = now.getUTCHours() * 60 + now.getUTCMinutes();
+  if (start === end) return dayStart;
+  if (start < end) return cur >= start && cur <= end ? dayStart + start * 60_000 : null;
+  if (cur >= start) return dayStart + start * 60_000;
+  if (cur <= end) return dayStart - 24 * 60 * 60_000 + start * 60_000;
+  return null;
 }
 function bullish(c: Candle) { return c.close > c.open; }
 function bearish(c: Candle) { return c.close < c.open; }
@@ -49,10 +76,23 @@ function isClosed(c: Candle, minutes: number, nowMs: number) {
 
 export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[] }): ScalperSignal {
   const { quote, m1, m5 } = input;
-  if (!hoursAllowed()) {
+  const nowMs = quote.quotedAt ?? Date.now();
+  const now = new Date(nowMs);
+  if (!hoursAllowed(now)) {
     const reason = `Fuori fascia scalper ${process.env.SCALPER_HOURS_UTC || "06:30-20:30"} UTC.`;
     return no(reason, blockedByFilter(reason));
   }
+
+  const sessionStartMs = currentSessionStartMs(nowMs);
+  const sessionWarmupMin = envI("SCALPER_SESSION_WARMUP_MIN", 5, 0, 30);
+  if (cleanLegState && sessionStartMs !== null && cleanLegState.sessionStartMs !== sessionStartMs) resetCleanLegState();
+  if (sessionStartMs !== null && sessionWarmupMin > 0 && nowMs < sessionStartMs + sessionWarmupMin * 60_000) {
+    resetCleanLegState();
+    const remaining = Math.max(1, Math.ceil((sessionStartMs + sessionWarmupMin * 60_000 - nowMs) / 60_000));
+    const reason = `Warm-up nuova sessione: attendo la prima M5 chiusa (${remaining} min).`;
+    return no(reason, blockedByFilter(reason));
+  }
+
   if (m1.length < 35 || m5.length < 30) return no("Storico M1/M5 insufficiente.", blockedByFilter("Storico M1/M5 insufficiente."));
 
   const maxSpread = envN("SCALPER_MAX_SPREAD", 1.2);
@@ -81,9 +121,19 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     return no(reason, blockedByFilter(reason));
   }
 
-  const nowMs = quote.quotedAt ?? Date.now();
   const closedM5 = m5.filter((c) => isClosed(c, 5, nowMs));
   if (closedM5.length < 30) return no("Storico M5 chiuso insufficiente.", blockedByFilter("Storico M5 chiuso insufficiente."));
+  if (sessionStartMs !== null && sessionWarmupMin > 0) {
+    const hasClosedSessionM5 = closedM5.some((c) => {
+      const startedAt = Date.parse(c.datetime);
+      return Number.isFinite(startedAt) && startedAt >= sessionStartMs;
+    });
+    if (!hasClosedSessionM5) {
+      resetCleanLegState();
+      const reason = "Warm-up nuova sessione: nessuna M5 della sessione ancora chiusa.";
+      return no(reason, blockedByFilter(reason));
+    }
+  }
 
   const fast5Series = emaCloseSeries(closedM5, 9), slow5Series = emaCloseSeries(closedM5, 21);
   const fast5 = fast5Series.at(-1) ?? null, slow5 = slow5Series.at(-1) ?? null;
@@ -126,16 +176,12 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const transitionUp = trendDown && alignedUp && priceAbove && accelUp;
   const transitionDown = trendUp && alignedDown && priceBelow && accelDown;
 
-  // CLEAN TREND LEG: riconosce una gamba M5 pulita e mantiene il bias durante i normali pullback M1.
-  // Lo stato vive nel worker e viene ricostruito automaticamente dalle ultime M5 chiuse dopo un riavvio.
   const cleanLegBars = envI("CLEAN_LEG_M5_BARS", 4, 3, 8);
   const cleanSlice = closedM5.slice(-cleanLegBars);
   let cleanGross = 0;
   if (cleanSlice.length > 0) {
     cleanGross = Math.abs(cleanSlice[0].close - cleanSlice[0].open);
-    for (let i = 1; i < cleanSlice.length; i++) {
-      cleanGross += Math.abs(cleanSlice[i].close - cleanSlice[i - 1].close);
-    }
+    for (let i = 1; i < cleanSlice.length; i++) cleanGross += Math.abs(cleanSlice[i].close - cleanSlice[i - 1].close);
   }
   const cleanNetSigned = cleanSlice.length > 0 ? cleanSlice.at(-1)!.close - cleanSlice[0].open : 0;
   const cleanEfficiency = cleanGross > 0 ? Math.abs(cleanNetSigned) / cleanGross : 0;
@@ -150,23 +196,25 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const cleanMinDirRatio = envN("CLEAN_LEG_MIN_DIR_RATIO", 0.65);
   const cleanMinSlopeAtr = envN("CLEAN_LEG_MIN_SLOPE_ATR", 0.12);
   let detectedCleanLeg: CleanLegDirection | null = null;
-  if (cleanSlice.length === cleanLegBars
-    && cleanEfficiency >= cleanMinEfficiency
-    && cleanNetAtr >= cleanMinNetAtr) {
-    if (cleanNetSigned > 0
-      && upRatio >= cleanMinDirRatio
-      && cleanFastSlope >= atr5! * cleanMinSlopeAtr
-      && cleanSlice.at(-1)!.close > fast5!) {
+  if (cleanSlice.length === cleanLegBars && cleanEfficiency >= cleanMinEfficiency && cleanNetAtr >= cleanMinNetAtr) {
+    if (cleanNetSigned > 0 && upRatio >= cleanMinDirRatio && cleanFastSlope >= atr5! * cleanMinSlopeAtr && cleanSlice.at(-1)!.close > fast5!) {
       detectedCleanLeg = "BUY";
-    } else if (cleanNetSigned < 0
-      && downRatio >= cleanMinDirRatio
-      && cleanFastSlope <= -atr5! * cleanMinSlopeAtr
-      && cleanSlice.at(-1)!.close < fast5!) {
+    } else if (cleanNetSigned < 0 && downRatio >= cleanMinDirRatio && cleanFastSlope <= -atr5! * cleanMinSlopeAtr && cleanSlice.at(-1)!.close < fast5!) {
       detectedCleanLeg = "SELL";
     }
   }
 
-  if (cleanLegState && nowMs + 60_000 < cleanLegState.armedAt) cleanLegState = null;
+  if (cleanLegState && nowMs + 60_000 < cleanLegState.armedAt) resetCleanLegState();
+  if (cleanLegState) {
+    const maxAgeMs = envI("CLEAN_LEG_MAX_MINUTES", 35, 10, 120) * 60_000;
+    const breakAtr = envN("CLEAN_LEG_BREAK_ATR", 0.25);
+    const lastClosedM5 = closedM5.at(-1)!;
+    const brokeSlow = cleanLegState.direction === "BUY"
+      ? lastClosedM5.close < slow5! - atr5! * breakAtr
+      : lastClosedM5.close > slow5! + atr5! * breakAtr;
+    if (nowMs - cleanLegState.refreshedAt > maxAgeMs || brokeSlow) resetCleanLegState();
+  }
+
   if (detectedCleanLeg) {
     if (!cleanLegState || cleanLegState.direction !== detectedCleanLeg) {
       cleanLegState = {
@@ -175,6 +223,9 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
         refreshedAt: nowMs,
         efficiency: cleanEfficiency,
         netAtr: cleanNetAtr,
+        sessionStartMs: sessionStartMs ?? 0,
+        lastPullbackKey: null,
+        lastTriggerCandle: null,
       };
     } else {
       cleanLegState = {
@@ -184,17 +235,6 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
         netAtr: cleanNetAtr,
       };
     }
-  }
-
-  if (cleanLegState) {
-    const maxAgeMs = envI("CLEAN_LEG_MAX_MINUTES", 35, 10, 120) * 60_000;
-    const breakAtr = envN("CLEAN_LEG_BREAK_ATR", 0.25);
-    const lastClosedM5 = closedM5.at(-1)!;
-    const oppositeM1 = cleanLegState.direction === "BUY" ? transitionDown : transitionUp;
-    const brokeSlow = cleanLegState.direction === "BUY"
-      ? lastClosedM5.close < slow5! - atr5! * breakAtr
-      : lastClosedM5.close > slow5! + atr5! * breakAtr;
-    if (nowMs - cleanLegState.refreshedAt > maxAgeMs || oppositeM1 || brokeSlow) cleanLegState = null;
   }
 
   const cleanLegDirection = cleanLegState?.direction ?? null;
@@ -260,14 +300,8 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
 
   const gateForSetup = (direction: "BUY" | "SELL", setup: ScalperSetup): string | null => {
     if (cleanLegDirection) {
-      if (direction !== cleanLegDirection) {
-        return `gamba pulita ${cleanLegDirection} attiva: ${direction} bloccato finché la struttura non si rompe`;
-      }
-      if (setup === "liquidity_sweep" || setup === "momentum_breakout") {
-        return `gamba pulita ${cleanLegDirection} attiva: non inseguo il movimento con ${setup}, attendo pullback/retest M1`;
-      }
-      // Durante una gamba pulita, micro-pullback e breakout-retest nella stessa direzione
-      // sono il percorso preferito anche se l'M1 entra temporaneamente in compressione.
+      if (direction !== cleanLegDirection) return `gamba pulita ${cleanLegDirection} attiva: ${direction} bloccato finché la struttura M5 non si rompe`;
+      if (setup !== "micro_pullback") return `gamba pulita ${cleanLegDirection} attiva: ${setup} disattivato, accetto solo clean pullback M1`;
       return null;
     }
     if (marketRange) {
@@ -296,7 +330,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     let score = base + (alignedTrend ? 16 : 0) + (structure ? 8 : 0) + (liveAligned ? 5 : 0);
     if (marketRange && setup === "liquidity_sweep") score += 14;
     if ((transitionUp && direction === "BUY") || (transitionDown && direction === "SELL")) score += 8;
-    if (cleanLegDirection === direction && (setup === "micro_pullback" || setup === "breakout_retest")) score += 24;
+    if (cleanLegDirection === direction && setup === "micro_pullback") score += 24;
     return score;
   };
   const addCandidate = (setup: ScalperSetup, direction: "BUY" | "SELL", structureStop: number) => {
@@ -438,38 +472,87 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     }
   }
 
+  let cleanPullbackKey: string | null = null;
   {
     const standardBuy = prev.low <= fast1! && last.close > fast1! && bullish(last) && last.close > prev.close;
     const standardSell = prev.high >= fast1! && last.close < fast1! && bearish(last) && last.close < prev.close;
 
-    const legPullbackBars = m1.slice(Math.max(0, m1.length - 4), m1.length - 1);
     const legZone = atr1 * envN("CLEAN_LEG_PULLBACK_ZONE_ATR", 0.35);
     const legHoldBuffer = atr1 * envN("CLEAN_LEG_SLOW_HOLD_ATR", 0.35);
     const legRestartBody = envN("CLEAN_LEG_RESTART_BODY_RATIO", 0.30);
     const legMaxEntryExt = atr1 * envN("CLEAN_LEG_MAX_ENTRY_EXT_ATR", 0.90);
-    const legLow = legPullbackBars.length > 0 ? Math.min(...legPullbackBars.map(c => c.low)) : prev.low;
-    const legHigh = legPullbackBars.length > 0 ? Math.max(...legPullbackBars.map(c => c.high)) : prev.high;
-    const legBuyTouched = legPullbackBars.length > 0 && legLow <= fast1! + legZone;
-    const legSellTouched = legPullbackBars.length > 0 && legHigh >= fast1! - legZone;
-    const legBuyHeld = legPullbackBars.every(c => c.close >= slow1! - legHoldBuffer) && last.close > slow1!;
-    const legSellHeld = legPullbackBars.every(c => c.close <= slow1! + legHoldBuffer) && last.close < slow1!;
+    const legFreshExtension = atr1 * envN("CLEAN_LEG_FRESH_EXTENSION_ATR", 0.55);
+    const pullbackLookback = envI("CLEAN_LEG_PULLBACK_LOOKBACK", 6, 3, 12);
+    const extensionLookback = envI("CLEAN_LEG_EXTENSION_LOOKBACK", 3, 1, 6);
+
+    let touchIdx = -1;
+    if (cleanLegDirection) {
+      for (let i = m1.length - 2; i >= Math.max(1, m1.length - 1 - pullbackLookback); i--) {
+        const fastAt = fast1Series[i], slowAt = slow1Series[i];
+        if (fastAt === null || slowAt === null) continue;
+        const touched = cleanLegDirection === "BUY"
+          ? m1[i].low <= fastAt + legZone && m1[i].close >= slowAt - legHoldBuffer
+          : m1[i].high >= fastAt - legZone && m1[i].close <= slowAt + legHoldBuffer;
+        if (touched) { touchIdx = i; break; }
+      }
+    }
+
+    let freshExtension = false;
+    let legLow = prev.low;
+    let legHigh = prev.high;
+    let held = false;
+    if (cleanLegDirection && touchIdx >= 0) {
+      const extensionStart = Math.max(0, touchIdx - extensionLookback);
+      for (let i = extensionStart; i < touchIdx; i++) {
+        const fastAt = fast1Series[i];
+        if (fastAt === null) continue;
+        if (cleanLegDirection === "BUY" && m1[i].close >= fastAt + legFreshExtension) freshExtension = true;
+        if (cleanLegDirection === "SELL" && m1[i].close <= fastAt - legFreshExtension) freshExtension = true;
+      }
+      const pullbackBars = m1.slice(touchIdx, m1.length - 1);
+      legLow = Math.min(...pullbackBars.map(c => c.low));
+      legHigh = Math.max(...pullbackBars.map(c => c.high));
+      held = pullbackBars.every((c, offset) => {
+        const index = touchIdx + offset;
+        const slowAt = slow1Series[index];
+        if (slowAt === null) return false;
+        return cleanLegDirection === "BUY" ? c.close >= slowAt - legHoldBuffer : c.close <= slowAt + legHoldBuffer;
+      }) && (cleanLegDirection === "BUY" ? last.close > slow1! : last.close < slow1!);
+      cleanPullbackKey = `${cleanLegDirection}:${m1[touchIdx].datetime}`;
+    }
+
     const legBuyRestart = bullish(last) && bodyRatio(last) >= legRestartBody && last.close > prev.close && last.close > fast1! && fast1! > slow1!;
     const legSellRestart = bearish(last) && bodyRatio(last) >= legRestartBody && last.close < prev.close && last.close < fast1! && fast1! < slow1!;
     const buyEntryExt = Math.max(0, quote.ask - fast1!);
     const sellEntryExt = Math.max(0, fast1! - quote.bid);
-    const cleanBuy = cleanLegDirection === "BUY" && legBuyTouched && legBuyHeld && legBuyRestart && buyEntryExt <= legMaxEntryExt;
-    const cleanSell = cleanLegDirection === "SELL" && legSellTouched && legSellHeld && legSellRestart && sellEntryExt <= legMaxEntryExt;
+    const sameConsumedPullback = cleanPullbackKey !== null && cleanLegState?.lastPullbackKey === cleanPullbackKey;
+    const sameTriggerCandle = sameConsumedPullback && cleanLegState?.lastTriggerCandle === last.datetime;
+    const pullbackAvailable = !sameConsumedPullback || sameTriggerCandle;
+    const cleanBuy = cleanLegDirection === "BUY" && touchIdx >= 0 && freshExtension && held && legBuyRestart && buyEntryExt <= legMaxEntryExt && pullbackAvailable;
+    const cleanSell = cleanLegDirection === "SELL" && touchIdx >= 0 && freshExtension && held && legSellRestart && sellEntryExt <= legMaxEntryExt && pullbackAvailable;
 
-    const buy = standardBuy || cleanBuy;
-    const sell = standardSell || cleanSell;
+    const buy = cleanLegDirection ? cleanBuy : standardBuy;
+    const sell = cleanLegDirection ? cleanSell : standardSell;
     if (!buy && !sell) {
-      const cleanHint = cleanLegDirection
-        ? ` Gamba pulita ${cleanLegDirection} armata: attendo pullback entro EMA9 ± ${legZone.toFixed(2)}$ e ripartenza senza inseguire.`
-        : "";
-      record("micro_pullback", "rejected", `nessun rientro su EMA9 M1 ${fast1!.toFixed(2)}$ con candela di ripartenza.${cleanHint}`);
+      if (cleanLegDirection) {
+        const reasons: string[] = [];
+        if (touchIdx < 0) reasons.push(`nessun pullback recente verso EMA9 ± ${legZone.toFixed(2)}$`);
+        else {
+          if (!freshExtension) reasons.push(`manca una nuova estensione di almeno ${legFreshExtension.toFixed(2)}$ prima del pullback`);
+          if (!held) reasons.push("pullback non ha tenuto la struttura EMA20 M1");
+          if (cleanLegDirection === "BUY" && !legBuyRestart) reasons.push("manca ripartenza BUY forte");
+          if (cleanLegDirection === "SELL" && !legSellRestart) reasons.push("manca ripartenza SELL forte");
+          if (cleanLegDirection === "BUY" && buyEntryExt > legMaxEntryExt) reasons.push(`BUY già esteso ${buyEntryExt.toFixed(2)}$ dall'EMA9`);
+          if (cleanLegDirection === "SELL" && sellEntryExt > legMaxEntryExt) reasons.push(`SELL già esteso ${sellEntryExt.toFixed(2)}$ dall'EMA9`);
+          if (!pullbackAvailable) reasons.push("questo pullback è già stato usato: attendo nuova estensione e nuovo rientro");
+        }
+        record("micro_pullback", "rejected", `gamba pulita ${cleanLegDirection}: ${reasons.join("; ") || "attendo pullback pulito"}`, cleanLegDirection);
+      } else {
+        record("micro_pullback", "rejected", `nessun rientro su EMA9 M1 ${fast1!.toFixed(2)}$ con candela di ripartenza`);
+      }
     } else {
       const direction = buy ? "BUY" : "SELL";
-      const cleanEntry = direction === "BUY" ? cleanBuy : cleanSell;
+      const cleanEntry = cleanLegDirection === direction;
       const blocked = gateForSetup(direction, "micro_pullback");
       if (blocked) record("micro_pullback", "rejected", blocked, direction);
       else {
@@ -479,7 +562,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
         addCandidate("micro_pullback", direction, structureStop);
         record("micro_pullback", "triggered",
           cleanEntry
-            ? `gamba pulita ${direction}: pullback M1 su EMA9 e ripartenza confermata, ingresso non esteso (regime ${m5Label})`
+            ? `gamba pulita ${direction}: nuova estensione, pullback M1 su EMA9 e ripartenza confermata; pullback ${cleanPullbackKey}`
             : `rientro su EMA9 M1 e ripartenza ${direction} (regime ${m5Label})`,
           direction);
       }
@@ -489,7 +572,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const chosen = [...candidates].sort((a, b) => b.score - a.score)[0];
   if (!chosen) {
     const cleanSummary = cleanLegDirection
-      ? ` Gamba pulita ${cleanLegDirection} attiva (efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5): cerco solo pullback/retest coerenti.`
+      ? ` Gamba pulita ${cleanLegDirection} attiva (efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5): accetto solo un clean pullback per ciclo.`
       : "";
     return no(
       `Nessun trigger scalper M1. Regime ${m5Label}; ATR M1 ${atr1.toFixed(2)}$; efficienza range ${(rangeEfficiency * 100).toFixed(0)}%. ${cleanSummary}`
@@ -511,9 +594,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     const detail = `SL troppo ampio: servono ${risk.toFixed(2)}$ (struttura ${structuralRisk.toFixed(2)}$, ATR ${atrRisk.toFixed(2)}$, minimo ${slMinUsd.toFixed(2)}$)`
       + ` sopra il massimo ${slMaxUsd.toFixed(2)}$`;
     const chosenIndex = evaluations.findIndex((item) => item.setup === setup && item.status === "triggered" && item.direction === direction);
-    if (chosenIndex >= 0) {
-      evaluations[chosenIndex] = { ...evaluations[chosenIndex], status: "rejected", reason: `${evaluations[chosenIndex].reason} — ${detail}` };
-    }
+    if (chosenIndex >= 0) evaluations[chosenIndex] = { ...evaluations[chosenIndex], status: "rejected", reason: `${evaluations[chosenIndex].reason} — ${detail}` };
     return no(`${detail}. Setup ${setup} ${direction} scartato.`, evaluations);
   }
   const stopLoss = direction === "BUY" ? entry - risk : entry + risk;
@@ -528,7 +609,10 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   };
 
   const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
-  const cleanAligned = cleanLegDirection === direction;
+  const cleanAligned = cleanLegDirection === direction && setup === "micro_pullback";
+  if (cleanAligned && cleanLegState && cleanPullbackKey) {
+    cleanLegState = { ...cleanLegState, lastPullbackKey: cleanPullbackKey, lastTriggerCandle: last.datetime };
+  }
   const trendScore = cleanAligned ? 24 : alignedTrend ? 20 : marketRange && setup === "liquidity_sweep" ? 18 : 12;
   const lastBody = bodyRatio(last);
   const moveAtr = Math.abs(last.close - prev.close) / atr1;
@@ -550,7 +634,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   ));
   const scoreBreakdown = `regime ${trendScore}, trigger ${triggerScore}, range ${accumulationScore}, ATR ${atrScore}, spread ${spreadScore}, SL ${structureScore}, candela ${candleScore}`;
   const cleanReason = cleanAligned
-    ? ` Clean leg ${direction}: efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5; bias mantenuto fino a rottura struttura.`
+    ? ` Clean leg ${direction}: efficienza ${(cleanLegEfficiency * 100).toFixed(0)}%, movimento ${cleanLegNetAtr.toFixed(1)} ATR M5; un solo ingresso per pullback, bias mantenuto fino a rottura M5.`
     : "";
 
   return {
