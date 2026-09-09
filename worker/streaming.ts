@@ -187,24 +187,19 @@ async function main() {
   const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
   const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
   const maxOpenPositions = envInt("SCALPER_MAX_OPEN_POSITIONS", 1, 1, 3);
-  // Anti-duplicazione ingressi: si somma alla pausa re-entry SCALPER_MIN_REENTRY_SEC (invariata).
   const dupCooldownMs = envInt("DUP_COOLDOWN_S", 90, 0, 3600) * 1000;
   const dupSetupBars = envInt("DUP_SETUP_BARS", 3, 0, 30);
   const tickLogMs = envInt("SCALPER_TICK_LOG_MS", 1000, 0, 60_000);
   const lossLockRefreshMs = envInt("SCALPER_LOSS_LOCK_REFRESH_MS", 30_000, 5_000, 300_000);
-  // Blocchi dopo una perdita: nessun blocco di sessione intera, quello resta ai limiti giornalieri.
   const lossLockMs = envInt("LOSS_LOCK_MINUTES", 30, 0, 1440) * 60_000;
   const consecLossPauseMs = envInt("CONSEC_LOSS_PAUSE_MINUTES", 120, 0, 1440) * 60_000;
   const consecLossCount = envInt("CONSEC_LOSS_COUNT", 3, 2, 10);
-  // Rischio massimo per ordine in percentuale del saldo: 0 (default) disattiva il taglio e
-  // lascia sempre i lotti scelti in dashboard, il rischio resta solo informativo su log e Telegram.
   const riskMaxPct = envNum("RISK_MAX_PCT", 0);
   const riskFallbackLots = envNum("RISK_FALLBACK_LOTS", 0.01);
-  // Solo per l'heartbeat: i limiti veri vivono in reserveStreamingSignal, qui servono a mostrarli.
   const maxTradesPerDay = envInt("MAX_TRADES_PER_DAY", 12, 1, 1000);
   const tradeDedupSeconds = envNum("TRADE_DEDUP_SECONDS", 30);
-  // Pausa minima fra qualsiasi chiusura (WIN, LOSS o BREAKEVEN) e l'ingresso successivo.
   const reentryMs = envInt("SCALPER_MIN_REENTRY_SEC", 120, 0, 3600) * 1000;
+  const finalQuoteMaxAgeMs = envInt("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -216,7 +211,6 @@ async function main() {
   let ready = false;
   let activeLots = lots();
 
-  // Unica lettura del ciclo di controllo: kill switch + lotti scelti dalla dashboard.
   const refreshControl = async () => {
     const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY]);
     activeLots = resolveLots(settings.get(EXEC_LOTS_SETTING_KEY));
@@ -239,17 +233,10 @@ async function main() {
   let signalLockUntil = 0;
   let orderErrorUntil = 0;
   let lastEmptyFlattenMarker: string | null = null;
-  // Dopo ogni ordine inviato: stessa direzione bloccata per DUP_COOLDOWN_S,
-  // stesso setup bloccato per DUP_SETUP_BARS candele M1 (bucket di apertura incluso).
   const dupDirectionUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   const dupSetupUntilBucket = new Map<string, number>();
-  // Dopo una chiusura in perdita la stessa direzione resta ferma LOSS_LOCK_MINUTES; dopo
-  // CONSEC_LOSS_COUNT perdite consecutive nella sessione si ferma tutto per CONSEC_LOSS_PAUSE_MINUTES.
-  // Entrambi i blocchi scadono da soli: il fermo per l'intera sessione resta solo nei limiti giornalieri.
   const lossLockUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   let lossPauseUntil = 0;
-  // Posizioni viste sul terminal state: quando una sparisce parte la pausa re-entry,
-  // qualunque sia l'esito e senza aspettare che la chiusura venga scritta a database.
   const knownPositionIds = new Set<string>();
   let lastPositionCloseAt = 0;
 
@@ -271,7 +258,6 @@ async function main() {
     lossLockUntil.BUY = 0;
     lossLockUntil.SELL = 0;
     lossPauseUntil = 0;
-    // Righe in ordine decrescente: la prima perdita incontrata per direzione e' la piu' recente.
     for (const row of rows) {
       if (row.outcome !== "LOSS") continue;
       const direction = row.direction === "BUY" || row.direction === "SELL" ? row.direction : null;
@@ -291,7 +277,6 @@ async function main() {
 
   const hhmmUtc = (ms: number) => new Date(ms).toISOString().slice(11, 16);
 
-  /** Stato dei blocchi da perdita per heartbeat, dashboard e Telegram. */
   const lossGuards = () => {
     const now = Date.now();
     const directions = (["BUY", "SELL"] as const).filter((direction) => lossLockUntil[direction] > now);
@@ -360,6 +345,7 @@ async function main() {
     tradeDedupSeconds,
     riskMaxPct,
     riskCapActive: riskMaxPct > 0,
+    finalQuoteMaxAgeMs,
     ...lossGuards(),
     m1: m1.length,
     m5: m5.length,
@@ -544,8 +530,6 @@ async function main() {
     }
   };
 
-  // Log per tick: quali setup sono stati valutati e perche' sono stati scartati.
-  // Ripetuto solo quando il motivo cambia oppure ogni SCALPER_TICK_LOG_MS, per non inondare stdout.
   const logTick = (signal: ScalperSignal, quote: Quote, blocked?: string) => {
     const evaluations = signal.evaluations ?? [];
     const key = `${signal.direction}|${signal.setup ?? "-"}|${blocked ?? ""}|`
@@ -572,6 +556,18 @@ async function main() {
     if (status.inFlattenWindow) return { allowed: false, status, reasoning: `Chiusura sessione tra ${status.minutesUntilEnd ?? 0} min` };
     if (!status.inside) return { allowed: false, status, reasoning: `Fuori fascia scalper ${sessionConfig.hoursUtc} UTC` };
     return { allowed: true, status, reasoning: null as string | null };
+  };
+
+  const markSkipped = async (signalId: string, reason: string) => {
+    await dbQuery(
+      `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
+      [signalId, reason],
+    );
+  };
+
+  const quoteAgeMs = (quote: Quote | null) => {
+    if (!quote || quote.quotedAt === null || !Number.isFinite(quote.quotedAt)) return Number.POSITIVE_INFINITY;
+    return Math.max(0, Date.now() - quote.quotedAt);
   };
 
   const onPrice = async (price: Record<string, unknown>) => {
@@ -666,7 +662,6 @@ async function main() {
       return;
     }
 
-    // Anti-duplicazione: stessa direzione entro DUP_COOLDOWN_S o stesso setup entro DUP_SETUP_BARS candele M1.
     const nowMs = Date.now();
     const directionUntil = dupDirectionUntil[signal.direction];
     if (nowMs < directionUntil) {
@@ -691,7 +686,6 @@ async function main() {
       return;
     }
 
-    // decisionBusy serializza i tick: da qui in poi parte al massimo un ordine per tick di analisi.
     decisionBusy = true;
     try {
       const preReservationGate = sessionGuard(quote);
@@ -730,21 +724,70 @@ async function main() {
       }
 
       const signalId = reservation.signalId;
-      const finalGate = sessionGuard(quote);
+      const finalGate = sessionGuard(latestQuote ?? quote);
       if (!finalGate.allowed) {
-        await dbQuery(
-          `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
-          [signalId, finalGate.reasoning],
-        );
-        latestDecision = noTradeDecision(finalGate.reasoning!, quote, { setup: signal.setup, evaluations: signal.evaluations });
+        await markSkipped(signalId, finalGate.reasoning!);
+        latestDecision = noTradeDecision(finalGate.reasoning!, latestQuote ?? quote, { setup: signal.setup, evaluations: signal.evaluations });
         return;
       }
 
-      // Rischio dell'ordine: distanza SL * lotti * 100 once. Sopra RISK_MAX_PCT del saldo
-      // si scende ai lotti minimi invece di inviare l'ordine con la size scelta in dashboard.
+      const finalQuote = latestQuote;
+      const ageMs = quoteAgeMs(finalQuote);
+      if (!finalQuote || ageMs > finalQuoteMaxAgeMs) {
+        const reason = `Final preflight: quote non abbastanza fresca (${Number.isFinite(ageMs) ? `${Math.round(ageMs)} ms` : "n/d"}, massimo ${finalQuoteMaxAgeMs} ms).`;
+        await markSkipped(signalId, reason);
+        latestDecision = noTradeDecision(reason, finalQuote ?? quote, {
+          mode: "final_strategy_preflight",
+          setup: signal.setup,
+          evaluations: signal.evaluations,
+        });
+        return;
+      }
+
+      const finalSignal = evaluateScalper({ quote: finalQuote, m1, m5 });
+      if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup) {
+        const reason = finalSignal.direction === "NO_TRADE"
+          ? `Final preflight: ${signal.direction}/${signal.setup ?? "—"} invalidato — ${finalSignal.reasoning}`
+          : `Final preflight: segnale cambiato ${signal.direction}/${signal.setup ?? "—"} → ${finalSignal.direction}/${finalSignal.setup ?? "—"}.`;
+        await markSkipped(signalId, reason);
+        latestDecision = {
+          at: new Date().toISOString(),
+          mode: "final_strategy_preflight",
+          signalId,
+          direction: "NO_TRADE",
+          setup: signal.setup,
+          reasoning: reason,
+          quote: finalQuote,
+          evaluations: finalSignal.evaluations,
+          preflight: {
+            initialDirection: signal.direction,
+            initialSetup: signal.setup,
+            finalDirection: finalSignal.direction,
+            finalSetup: finalSignal.setup,
+            quoteAgeMs: ageMs,
+          },
+        };
+        logTick(finalSignal, finalQuote, reason);
+        return;
+      }
+
+      await dbQuery(
+        `UPDATE scalper_signals
+            SET entry=$2,stop_loss=$3,take_profit=$4,risk_reward=$5,reasoning=$6
+          WHERE id=$1 AND outcome IS NULL AND mt5_order_id IS NULL`,
+        [
+          signalId,
+          finalSignal.entry,
+          finalSignal.stopLoss,
+          finalSignal.takeProfit,
+          finalSignal.riskReward,
+          finalSignal.reasoning,
+        ],
+      );
+
       const account = accountSnapshot();
       const balance = Number(account?.balance);
-      const slDistance = Math.abs(signal.entry! - signal.stopLoss!);
+      const slDistance = Math.abs(finalSignal.entry! - finalSignal.stopLoss!);
       const balanceKnown = Number.isFinite(balance) && balance > 0;
       const riskCap = riskMaxPct > 0 && balanceKnown ? (balance * riskMaxPct) / 100 : null;
       let orderLots = activeLots;
@@ -761,33 +804,81 @@ async function main() {
         requestedLots: activeLots,
         lotsCapped,
         slDistance: Number(slDistance.toFixed(2)),
-        tpDistance: Number(Math.abs(signal.takeProfit! - signal.entry!).toFixed(2)),
-        riskReward: signal.riskReward,
+        tpDistance: Number(Math.abs(finalSignal.takeProfit! - finalSignal.entry!).toFixed(2)),
+        riskReward: finalSignal.riskReward,
         risk: Number(riskMoney.toFixed(2)),
         riskPct: riskPct === null ? null : Number(riskPct.toFixed(2)),
         riskMaxPct,
         riskCapActive: riskCap !== null,
         currency: account?.currency ?? null,
         overCap: riskCap !== null && riskMoney > riskCap,
-        slPlan: signal.slPlan,
+        slPlan: finalSignal.slPlan,
       };
+
+      const sendQuote = latestQuote ?? finalQuote;
+      const sendAgeMs = quoteAgeMs(sendQuote);
+      const sendCheck = evaluateScalper({ quote: sendQuote, m1, m5 });
+      const entryDrift = sendCheck.direction === "NO_TRADE" || sendCheck.entry === null
+        ? Number.POSITIVE_INFINITY
+        : Math.abs(sendCheck.entry - finalSignal.entry!);
+      const maxEntryDrift = Math.max(0.25, slDistance * 0.15);
+      if (
+        sendAgeMs > finalQuoteMaxAgeMs
+        || sendCheck.direction !== finalSignal.direction
+        || sendCheck.setup !== finalSignal.setup
+        || entryDrift > maxEntryDrift
+      ) {
+        const reason = sendAgeMs > finalQuoteMaxAgeMs
+          ? `Final send-check: quote vecchia ${Math.round(sendAgeMs)} ms.`
+          : sendCheck.direction !== finalSignal.direction || sendCheck.setup !== finalSignal.setup
+            ? `Final send-check: ${finalSignal.direction}/${finalSignal.setup ?? "—"} non più valido, ora ${sendCheck.direction}/${sendCheck.setup ?? "—"}.`
+            : `Final send-check: prezzo mosso di ${entryDrift.toFixed(2)}$ oltre il massimo ${maxEntryDrift.toFixed(2)}$.`;
+        await markSkipped(signalId, reason);
+        latestDecision = {
+          at: new Date().toISOString(),
+          mode: "final_strategy_preflight",
+          signalId,
+          direction: "NO_TRADE",
+          setup: finalSignal.setup,
+          reasoning: reason,
+          quote: sendQuote,
+          evaluations: sendCheck.evaluations,
+          preflight: {
+            initialDirection: signal.direction,
+            initialSetup: signal.setup,
+            finalDirection: sendCheck.direction,
+            finalSetup: sendCheck.setup,
+            quoteAgeMs: sendAgeMs,
+            entryDrift: Number.isFinite(entryDrift) ? Number(entryDrift.toFixed(2)) : null,
+            maxEntryDrift: Number(maxEntryDrift.toFixed(2)),
+          },
+        };
+        logTick(sendCheck, sendQuote, reason);
+        return;
+      }
+
       console.log("[scalper-worker] order_plan", JSON.stringify({
         signalId,
-        setup: signal.setup,
-        direction: signal.direction,
-        entry: signal.entry,
-        stopLoss: signal.stopLoss,
-        takeProfit: signal.takeProfit,
+        setup: finalSignal.setup,
+        direction: finalSignal.direction,
+        entry: finalSignal.entry,
+        stopLoss: finalSignal.stopLoss,
+        takeProfit: finalSignal.takeProfit,
+        finalPreflight: {
+          quoteAgeMs: sendAgeMs,
+          entryDrift: Number(entryDrift.toFixed(2)),
+          maxEntryDrift: Number(maxEntryDrift.toFixed(2)),
+        },
         ...riskPlan,
       }));
 
       const execution = await executeStreaming(
         signalId,
-        signal.direction,
-        signal.stopLoss!,
-        signal.takeProfit!,
+        finalSignal.direction,
+        finalSignal.stopLoss!,
+        finalSignal.takeProfit!,
         tradingConnection,
-        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: quote.mid },
+        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: sendQuote.mid },
       );
 
       if ([
@@ -801,43 +892,43 @@ async function main() {
         "system_stopped",
       ].includes(execution.status)) {
         const reason = "reason" in execution ? String(execution.reason ?? "") : "";
-        await dbQuery(
-          `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
-          [signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`],
-        );
+        await markSkipped(signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`);
       } else if (execution.status === "opened" || execution.status === "pending_position_link") {
         const sentAt = Date.now();
         signalLockUntil = sentAt + 5000;
-        // Ordine inviato: blocca la stessa direzione per DUP_COOLDOWN_S e lo stesso setup
-        // per DUP_SETUP_BARS candele M1, a partire dalla candela dell'ordine.
-        dupDirectionUntil[signal.direction] = sentAt + dupCooldownMs;
-        if (signal.setup) dupSetupUntilBucket.set(signal.setup, bucketStart(sentAt, 1) + dupSetupBars * 60_000);
+        dupDirectionUntil[finalSignal.direction] = sentAt + dupCooldownMs;
+        if (finalSignal.setup) dupSetupUntilBucket.set(finalSignal.setup, bucketStart(sentAt, 1) + dupSetupBars * 60_000);
         lastNotifiedBlock = null;
         void sendTelegram(
-          `\u{1f7e2} SCALPER ${symbol()} · apertura ${signal.direction}`
+          `\u{1f7e2} SCALPER ${symbol()} · apertura ${finalSignal.direction}`
           + `\nlotti ${orderLots}${lotsCapped ? ` (ridotti da ${activeLots} per il cap rischio)` : ""}`
-          + ` · entry ${money(signal.entry)} · SL ${money(signal.stopLoss)} · TP ${money(signal.takeProfit)}`
-          + `\nSL ${money(riskPlan.slDistance)}$ · TP ${money(riskPlan.tpDistance)}$ a ${signal.riskReward}R`
+          + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · TP ${money(finalSignal.takeProfit)}`
+          + `\nSL ${money(riskPlan.slDistance)}$ · TP ${money(riskPlan.tpDistance)}$ a ${finalSignal.riskReward}R`
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
-          + `\nsetup ${setupLabel(signal.setup)} (${signal.setup ?? "—"}) · ${balanceLine()}`,
+          + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error") {
         orderErrorUntil = Date.now() + 60_000;
         void sendTelegram(
-          `\u26a0\ufe0f SCALPER ${symbol()} · errore ordine ${signal.direction}`
+          `\u26a0\ufe0f SCALPER ${symbol()} · errore ordine ${finalSignal.direction}`
           + `\n${"error" in execution ? String(execution.error) : "errore sconosciuto"}`,
         );
       }
 
       latestDecision = {
         at: new Date().toISOString(),
-        mode: "event_driven_intrabar_fast_preflight",
+        mode: "event_driven_intrabar_final_preflight",
         signalId,
-        direction: signal.direction,
-        setup: signal.setup,
-        reasoning: signal.reasoning,
-        quote,
-        evaluations: signal.evaluations,
+        direction: finalSignal.direction,
+        setup: finalSignal.setup,
+        reasoning: finalSignal.reasoning,
+        quote: sendQuote,
+        evaluations: sendCheck.evaluations,
+        preflight: {
+          quoteAgeMs: sendAgeMs,
+          entryDrift: Number(entryDrift.toFixed(2)),
+          maxEntryDrift: Number(maxEntryDrift.toFixed(2)),
+        },
         risk: riskPlan,
         execution,
       };
