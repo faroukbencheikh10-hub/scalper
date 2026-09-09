@@ -42,7 +42,7 @@ type DashboardState = {
   stream?: {
     status?: string;
     heartbeat?: string | null;
-    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; m1?: number; m5?: number } | null;
+    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; lossLockedDirections?: string[]; m1?: number; m5?: number } | null;
     lastDecision?: Decision | null;
     lastFlatten?: Flatten | null;
     currentError?: StreamError | null;
@@ -141,6 +141,7 @@ export default function Home() {
   const direction = decision?.direction ?? last?.direction ?? "NO_TRADE";
   const decisionSetup = decision?.setup ?? null;
   const evaluations = decision?.evaluations ?? [];
+  const lossLocked = data?.stream?.detail?.lossLockedDirections ?? [];
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
   const lastResult = results?.last;
@@ -250,6 +251,7 @@ export default function Home() {
             <div><dt>Margine libero</dt><dd>{money(Number(account?.freeMargin ?? Number.NaN))}</dd></div>
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
+            <div><dt>Re-entry bloccato</dt><dd className="mt5-value">{lossLocked.length > 0 ? `${lossLocked.join(" · ")} (perdita in sessione)` : "nessuno"}</dd></div>
             <div><dt>Posizione</dt><dd className="mt5-value">{data?.systemStopped ? "flatten + STOP" : last?.mt5_position_id ? "aperta" : "nessuna"}</dd></div>
           </dl>
         </article>

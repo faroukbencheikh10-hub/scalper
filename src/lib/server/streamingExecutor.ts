@@ -86,7 +86,7 @@ function envN(name: string, fallback: number, min = 0) {
 }
 
 function maxOpenPositions() {
-  return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 3, 1))));
+  return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 1, 1))));
 }
 
 function minReentrySec() {

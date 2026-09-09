@@ -13,48 +13,37 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 
 ## Strategia
 
-- M1: trigger operativo, valutato alla chiusura reale della candela.
-- M5: contesto immediato.
-- Setup: micro-pullback, liquidity sweep o momentum breakout.
+- M1: trigger operativo, valutato tick per tick sull'ultima candela chiusa.
+- M5: contesto immediato, non piu' un muro (vedi gate sotto).
+- Setup, in ordine di priorita' a ogni tick: `liquidity_sweep` → `momentum_breakout` → `breakout_retest` → `micro_pullback` → NO_TRADE. Vince il primo valido; un solo ordine per tick.
 - Storico iniziale: 500 M1 e 300 M5, configurabile fino a 1000.
-- Stop dinamico 2–5 USD.
-- TP predefinito 1.45R (stesso R:R per tutti e tre i setup).
-- Una sola posizione XAUUSD alla volta.
-- Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive.
-- Filtro spread, ATR M1 e filtro shock **invariati**: la logica di ingresso non li tocca.
+- Stop dinamico 2–5 USD, TP con lo stesso R:R (1.45R di default) per tutti i setup.
+- **Una sola posizione XAUUSD aperta alla volta** (`SCALPER_MAX_OPEN_POSITIONS=1`).
+- Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive; pausa re-entry 120 s.
+- **Nessun re-entry automatico** nella direzione di una perdita già chiusa nella sessione corrente: il blocco cade con la sessione successiva.
+- Spread massimo, ATR minimo/massimo e SL controllato restano **invariati**.
 
-### Contesto M5 e direzionalità M1
+### Gate M5 e direzionalità M1
 
-Il gate M5 vale per tutti i setup:
+- **M5 contrario** alla direzione dell'M1: blocco sempre, per tutti i setup.
+- **M5 allineato**: `micro_pullback` BUY con trend M5 rialzista, SELL con ribassista, come prima.
+- **M5 neutro**: il `micro_pullback` passa solo con M1 forte — EMA9/EMA20 M1 allineate da almeno `M1_ALIGN_BARS` candele, prezzo dal lato giusto di entrambe e accelerazione reale (ultime `ACCEL_BARS` candele nella stessa direzione, range medio ≥ `ACCEL_ATR_MULT` × ATR M1, corpi ≥ `ACCEL_BODY_RATIO` del range). Gli altri setup portano le proprie conferme e con M5 neutro passano senza il requisito di accelerazione.
 
-- **M5 contrario** alla direzione dell'M1: blocco sempre.
-- **M5 allineato**: passa come prima.
-- **M5 neutro**: non blocca più di per sé. Il micro-pullback passa solo con M1 chiaramente direzionale — EMA9/EMA20 M1 allineate da almeno `M1_ALIGN_BARS` candele, prezzo dal lato giusto di entrambe e accelerazione reale (ultime `ACCEL_BARS` candele nella stessa direzione, range medio ≥ `ACCEL_ATR_MULT` × ATR M1 e corpi ≥ `ACCEL_BODY_RATIO` del range). Il momentum breakout richiede la sola parte strutturale (EMA allineate + prezzo dal lato giusto), perché porta già le proprie conferme di forza; il liquidity sweep mantiene il comportamento storico.
+### momentum_breakout
 
-### Momentum breakout M1
+Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range, chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1, EMA9 > EMA20 (long) o viceversa, spread e ATR validi. La candela di rottura è l'ultima M1 chiusa: l'ingresso cade sulla candela successiva, con SL sotto/sopra la candela di rottura. Il prezzo deve essere ancora oltre il livello al momento dell'ingresso.
 
-Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con:
+### breakout_retest
 
-- candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range;
-- ampiezza della candela di rottura sopra la media delle `BREAKOUT_VOL_BARS` precedenti (proxy di volume: MetaApi non fornisce il volume nel buffer di candele del worker, quindi si usa l'ampiezza);
-- EMA9 > EMA20 (long) o EMA9 < EMA20 (short) sull'M1;
-- chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1;
-- prezzo ancora oltre il livello sulla candela d'ingresso.
-
-La candela di rottura è l'ultima M1 **chiusa**: l'ingresso avviene sulla candela successiva, lo stop struttura va sotto (long) o sopra (short) la candela di rottura e il TP usa lo stesso R:R degli altri setup.
+L'ingresso diretto sulla candela shock (range > `SHOCK_ATR_MULT` × ATR M1, minimo 5.50 $) resta scartato, ma il movimento non viene perso: entro `RETEST_MAX_BARS` candele dalla shock, se il prezzo ritraccia verso il livello rotto **o** l'EMA9 M1 (entro `RETEST_ZONE_ATR` × ATR) senza chiudere dall'altra parte del livello, e poi riparte nella direzione della shock con corpo ≥ `RETEST_BODY_RATIO` e chiusura dal lato giusto dell'EMA9, si entra al riavvio. SL oltre il minimo (long) o il massimo (short) del retest.
 
 ### Anti-accumulo
 
-Blocca soltanto il range vero: ampiezza delle ultime `RANGE_LOOKBACK` candele M1 sotto `RANGE_ATR_MULT` × ATR M1 **e** EMA9/EMA20 M1 piatte (variazione ≤ `EMA_FLAT_SLOPE_ATR` × ATR su `EMA_SLOPE_BARS` candele). Una compressione breve seguita da espansione non blocca: basta una candela fra le ultime `RANGE_EXPANSION_BARS` con range ≥ `RANGE_EXPANSION_ATR` × ATR M1.
+Al posto del vecchio `compressed OR choppy` si blocca solo il **range sporco**: ampiezza delle ultime `RANGE_LOOKBACK` candele M1 sotto `RANGE_ATR_MULT` × ATR M1 **e** EMA9/EMA20 M1 piatte (variazione ≤ `EMA_FLAT_SLOPE_ATR` × ATR su `EMA_SLOPE_BARS` candele). Se c'è accelerazione M1 reale (stessa definizione del gate M5) il filtro non blocca mai.
 
 ### Anti-duplicazione
 
-Dopo ogni ordine inviato il worker blocca:
-
-- nuovi ingressi nella **stessa direzione** per `DUP_COOLDOWN_S` secondi;
-- nuovi ingressi sullo **stesso setup** per `DUP_SETUP_BARS` candele M1 (inclusa quella dell'ordine).
-
-Restano attive la pausa re-entry `SCALPER_MIN_REENTRY_SEC` (120 s) e tutti i limiti di sessione. Ogni tick di analisi può generare al massimo un ordine.
+Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi, stesso setup per `DUP_SETUP_BARS` candele M1 (inclusa quella dell'ordine). Restano attive la pausa re-entry `SCALPER_MIN_REENTRY_SEC` e tutti i limiti di sessione.
 
 ### Variabili della logica di ingresso
 
@@ -62,23 +51,25 @@ Restano attive la pausa re-entry `SCALPER_MIN_REENTRY_SEC` (120 s) e tutti i lim
 | --- | --- | --- |
 | `M1_ALIGN_BARS` | 3 | Candele con EMA9/EMA20 M1 allineate per considerare l'M1 direzionale |
 | `ACCEL_ATR_MULT` | 1.2 | Range medio delle ultime candele in multipli di ATR M1 |
-| `ACCEL_BARS` | 3 | Candele usate per l'accelerazione |
-| `ACCEL_BODY_RATIO` | 0.60 | Corpo minimo delle candele di accelerazione |
+| `ACCEL_BARS` / `ACCEL_BODY_RATIO` | 3 / 0.60 | Candele e corpo minimo dell'accelerazione |
 | `BREAKOUT_LOOKBACK` | 12 | Canale M1 rotto dal momentum breakout |
 | `BREAKOUT_BODY_RATIO` | 0.60 | Corpo minimo della candela di rottura |
 | `BREAKOUT_CLOSE_ATR_MULT` | 0.15 | Distanza minima della chiusura oltre il livello, in ATR M1 |
-| `BREAKOUT_VOL_BARS` / `BREAKOUT_VOL_MULT` | 20 / 1.0 | Media di confronto per l'ampiezza della candela di rottura |
-| `RANGE_ATR_MULT` | 1.5 | Ampiezza massima (in ATR M1) del range vero |
+| `SHOCK_ATR_MULT` | 2.2 | Soglia della candela shock (minimo assoluto 5.50 $) |
+| `RETEST_MAX_BARS` | 4 | Candele entro cui il retest deve completarsi |
+| `RETEST_ZONE_ATR` / `RETEST_BODY_RATIO` | 0.50 / 0.50 | Ampiezza della zona di retest e corpo minimo del riavvio |
+| `RANGE_ATR_MULT` | 1.5 | Ampiezza massima (in ATR M1) del range sporco |
 | `RANGE_LOOKBACK` | 12 | Candele su cui si misura l'ampiezza |
 | `EMA_SLOPE_BARS` / `EMA_FLAT_SLOPE_ATR` | 5 / 0.12 | Soglia di pendenza per considerare piatte le EMA M1 |
-| `RANGE_EXPANSION_BARS` / `RANGE_EXPANSION_ATR` | 3 / 1.2 | Espansione che sblocca una compressione breve |
 | `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
 | `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
+| `SCALPER_MAX_OPEN_POSITIONS` | 1 | Posizioni XAUUSD aperte contemporaneamente |
+| `SCALPER_LOSS_LOCK_REFRESH_MS` | 30000 | Rilettura delle direzioni in perdita nella sessione |
 | `SCALPER_TICK_LOG_MS` | 1000 | Throttle del log per tick dei setup valutati |
 
 ### Log dei setup valutati
 
-A ogni tick il worker scrive su stdout (`[scalper-worker] tick`) e in `scalper_settings.stream_last_decision` l'elenco dei tre setup con esito e motivo dello scarto, invece del solo "Nessun trigger scalper M1". La dashboard mostra il setup usato nell'ultima decisione e la card **Setup valutati** con lo stato di ognuno.
+A ogni tick il worker scrive su stdout (`[scalper-worker] tick`) e in `scalper_settings.stream_last_decision` l'elenco dei quattro setup con esito e motivo dello scarto, invece del solo "Nessun trigger scalper M1". Il setup finisce in `scalper_signals.setup`, nella colonna `trades.setup` (oltre che in `trades.payload`), nel messaggio Telegram di apertura e sulla dashboard, che mostra il setup usato e la card **Setup valutati**.
 
 ## Streaming
 
@@ -108,6 +99,8 @@ Il cookie e' `secure`, quindi in sviluppo su `http://localhost` non viene accett
 `MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS` e i cooldown sono calcolati sulla **sessione corrente**, non sul giorno di calendario UTC: la sessione parte dall'orario di apertura di `SCALPER_HOURS_UTC` (con `22:00-20:30` va dalle 22:00 alle 22:00 del giorno dopo). Il conteggio dei trade usa `created_at`, il P/L usa `mt5_profit` dei segnali con `closed_at` dentro la sessione.
 
 `SCALPER_MIN_REENTRY_SEC` (default 120) impone una pausa minima fra la chiusura di una posizione reale e l'apertura successiva; il blocco compare in `stream_last_decision.execution.status` come `reentry_gap`.
+
+Dopo una chiusura in perdita il worker blocca **tutta la sessione corrente** per quella direzione: il motivo compare in `stream_last_decision.reasoning` e le direzioni bloccate sono elencate in `stream_worker_detail.lossLockedDirections` e sulla dashboard (card Esecuzione).
 
 ## Notifiche Telegram
 

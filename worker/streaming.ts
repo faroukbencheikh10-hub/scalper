@@ -4,7 +4,7 @@ import { autoExecEnabled, lots, lotsMax, lotsMin, resolveLots } from "../src/lib
 import { EXEC_LOTS_SETTING_KEY } from "../src/lib/lots";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
-import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
+import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
 import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
@@ -181,11 +181,12 @@ async function main() {
   const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 250, 100, 30_000);
   const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
   const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
-  const maxOpenPositions = envInt("SCALPER_MAX_OPEN_POSITIONS", 3, 1, 3);
+  const maxOpenPositions = envInt("SCALPER_MAX_OPEN_POSITIONS", 1, 1, 3);
   // Anti-duplicazione ingressi: si somma alla pausa re-entry SCALPER_MIN_REENTRY_SEC (invariata).
   const dupCooldownMs = envInt("DUP_COOLDOWN_S", 90, 0, 3600) * 1000;
   const dupSetupBars = envInt("DUP_SETUP_BARS", 3, 0, 30);
   const tickLogMs = envInt("SCALPER_TICK_LOG_MS", 1000, 0, 60_000);
+  const lossLockRefreshMs = envInt("SCALPER_LOSS_LOCK_REFRESH_MS", 30_000, 5_000, 300_000);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -224,6 +225,23 @@ async function main() {
   // stesso setup bloccato per DUP_SETUP_BARS candele M1 (bucket di apertura incluso).
   const dupDirectionUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   const dupSetupUntilBucket = new Map<string, number>();
+  // Nessun re-entry automatico nella direzione di una perdita gia' chiusa nella sessione corrente.
+  const lossLockedDirections = new Set<"BUY" | "SELL">();
+
+  // Direzioni gia' andate in perdita nella sessione corrente: restano bloccate fino alla sessione successiva.
+  const refreshLossLock = async () => {
+    const start = sessionWindowStart(new Date(), sessionConfig);
+    const result = await dbQuery(
+      `SELECT DISTINCT direction FROM scalper_signals
+        WHERE outcome='LOSS' AND mt5_position_id IS NOT NULL AND closed_at >= $1::timestamptz`,
+      [start.toISOString()],
+    );
+    lossLockedDirections.clear();
+    for (const row of result.rows as Array<{ direction?: string }>) {
+      if (row.direction === "BUY" || row.direction === "SELL") lossLockedDirections.add(row.direction);
+    }
+  };
+
   let lastTickLogKey = "";
   let lastTickLogAt = 0;
 
@@ -267,6 +285,7 @@ async function main() {
     account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
+    lossLockedDirections: [...lossLockedDirections],
     m1: m1.length,
     m5: m5.length,
     hoursUtc: sessionConfig.hoursUtc,
@@ -428,6 +447,7 @@ async function main() {
         }
       }
 
+      await refreshLossLock().catch(() => undefined);
       await setSetting("stream_last_flatten", JSON.stringify({ at, closed, canceled, reason, failures }));
       if (reason === "end_of_session") {
         void sendTelegram(
@@ -537,6 +557,13 @@ async function main() {
         logTick(signal, quote, reason);
         return;
       }
+    }
+
+    if (lossLockedDirections.has(signal.direction)) {
+      const reason = `Perdita già chiusa in ${signal.direction} in questa sessione: nessun re-entry automatico nella stessa direzione.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      logTick(signal, quote, reason);
+      return;
     }
 
     // Anti-duplicazione: stessa direzione entro DUP_COOLDOWN_S o stesso setup entro DUP_SETUP_BARS candele M1.
@@ -686,7 +713,8 @@ async function main() {
         SET outcome='ERROR',closed_at=now(),mt5_error='purged at startup'
       WHERE outcome IS NULL AND mt5_position_id IS NULL`,
   );
-  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount });
+  await refreshLossLock();
+  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount, lossLocked: [...lossLockedDirections] });
 
   const subscribe = async () => {
     ready = false;
@@ -783,7 +811,10 @@ async function main() {
     syncBusy = true;
     void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
       .then((result) => {
-        if (result.closed > 0) signalLockUntil = 0;
+        if (result.closed > 0) {
+          signalLockUntil = 0;
+          void refreshLossLock().catch((error) => console.error(error));
+        }
         for (const closure of result.closures ?? []) {
           void sendTelegram(
             `${closure.profit > 0 ? "\u2705" : closure.profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${closure.outcome} (SL/TP)`
@@ -824,6 +855,10 @@ async function main() {
       });
   }, decisionPersistMs);
 
+  const lossLockTimer = setInterval(() => {
+    void refreshLossLock().catch((error) => console.error(error));
+  }, lossLockRefreshMs);
+
   const heartbeatTimer = setInterval(() => {
     if (heartbeatBusy) return;
     heartbeatBusy = true;
@@ -840,6 +875,7 @@ async function main() {
     clearInterval(syncTimer);
     clearInterval(quotePersistTimer);
     clearInterval(decisionPersistTimer);
+    clearInterval(lossLockTimer);
     clearInterval(heartbeatTimer);
     try {
       ready = false;
