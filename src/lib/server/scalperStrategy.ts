@@ -1,6 +1,6 @@
 import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../types";
 import { atr, emaCloseSeries } from "./indicators";
-import { aggregateM15, closedBars, MINUTE, recentBarsReady, swingLevels } from "./marketStructure";
+import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure";
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
 
 export const STRATEGY_VERSION = "mtf-continuation-v1";
@@ -19,6 +19,36 @@ function body(c: Candle) { return Math.abs(c.close - c.open) / range(c); }
 function maxHigh(bars: Candle[]) { return Math.max(...bars.map(c => c.high)); }
 function minLow(bars: Candle[]) { return Math.min(...bars.map(c => c.low)); }
 function signed(direction: "BUY" | "SELL", value: number) { return direction === "BUY" ? value : -value; }
+
+function expectedXauClosureGap(previousStartMs: number, nextStartMs: number, sizeMs: number) {
+  const missingFrom = previousStartMs + sizeMs;
+  if (missingFrom >= nextStartMs) return false;
+  const from = new Date(missingFrom), to = new Date(nextStartMs);
+  const fromMinute = from.getUTCHours() * 60 + from.getUTCMinutes();
+  const toMinute = to.getUTCHours() * 60 + to.getUTCMinutes();
+  if (fromMinute !== 21 * 60 || toMinute !== 22 * 60) return false;
+  if (from.getUTCDay() === 5) {
+    return to.getUTCDay() === 0 && nextStartMs - missingFrom === 49 * 60 * MINUTE;
+  }
+  return from.getUTCDay() >= 1 && from.getUTCDay() <= 4
+    && to.getUTCDay() === from.getUTCDay()
+    && nextStartMs - missingFrom === 60 * MINUTE;
+}
+
+function recentBarsReadyWithMarketClosures(
+  bars: Candle[], minutes: number, count: number, nowMs: number, maxAgeMs?: number,
+) {
+  const recent = bars.slice(-count), size = minutes * MINUTE;
+  if (recent.length < count) return false;
+  const lastCloseAt = Date.parse(recent.at(-1)!.datetime) + size;
+  if (maxAgeMs !== undefined && (!Number.isFinite(lastCloseAt) || nowMs - lastCloseAt < 0 || nowMs - lastCloseAt > maxAgeMs)) return false;
+  return recent.every((bar, i) => {
+    if (i === 0) return true;
+    const previous = Date.parse(recent[i - 1].datetime), current = Date.parse(bar.datetime);
+    const gap = current - previous;
+    return gap === size || (gap > size && gap % size === 0 && expectedXauClosureGap(previous, current, size));
+  });
+}
 
 /** Validate the already planned SL/TP at the quote used immediately before sending. */
 export function plannedEntryValid(signal: ScalperSignal, quote: Quote) {
@@ -51,8 +81,9 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   if (!m1 || !m5) return reject("Candele non valide, duplicate o fuori ordine.");
   const m15 = aggregateM15(m5);
   if (m1.length < 35 || m5.length < 35 || m15.length < 30) return reject("Storico insufficiente: servono M1/M5 e almeno 30 M15 complete.");
-  if (!recentBarsReady(m1, 1, 15, nowMs) || !recentBarsReady(m5, 5, 10, nowMs)
-    || !recentBarsReady(m15, 15, 8, nowMs)) return reject("Storico recente M1/M5/M15 incompleto o non aggiornato: attendo continuità dei dati.");
+  if (!recentBarsReadyWithMarketClosures(m1, 1, 15, nowMs, 3 * MINUTE)
+    || !recentBarsReadyWithMarketClosures(m5, 5, 10, nowMs)
+    || !recentBarsReadyWithMarketClosures(m15, 15, 8, nowMs)) return reject("Storico recente M1/M5/M15 incompleto o non aggiornato: attendo continuità dei dati.");
   const warmup = env("SCALPER_SESSION_WARMUP_MIN", 5, 0, 30) * MINUTE;
   if (session.sessionStartAt && nowMs < Date.parse(session.sessionStartAt) + warmup) return reject("Warm-up nuova sessione: attendo la prima M5 chiusa.");
 

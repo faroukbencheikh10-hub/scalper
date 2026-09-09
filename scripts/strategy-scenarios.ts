@@ -35,6 +35,23 @@ function mirror(input: Input): Input {
   return { ...input, m1: input.m1.map(invert), m5: input.m5.map(invert),
     quote: { ...input.quote, bid: 5000 - input.quote.ask, ask: 5000 - input.quote.bid, mid: 5000 - input.quote.mid } };
 }
+function withClosureGap(input: Input, cutoffMs: number, reopenMs: number, closureMs: number): Input {
+  const delta = reopenMs - cutoffMs;
+  const shift = (ms: number) => ms + delta - (ms < cutoffMs ? closureMs : 0);
+  const move = (c: Candle): Candle => ({ ...c, datetime: new Date(shift(Date.parse(c.datetime))).toISOString() });
+  return {
+    ...input,
+    nowMs: shift(input.nowMs),
+    m1: input.m1.map(move),
+    m5: input.m5.map(move),
+    quote: { ...input.quote, quotedAt: shift(input.quote.quotedAt) },
+  };
+}
+function withLiveSession(test: () => void) {
+  const previous = process.env.SCALPER_HOURS_UTC;
+  process.env.SCALPER_HOURS_UTC = "22:00-20:30";
+  try { test(); } finally { process.env.SCALPER_HOURS_UTC = previous; }
+}
 let passed = 0;
 function check(name: string, test: () => void) {
   try { test(); passed++; console.log("OK " + name); }
@@ -100,6 +117,22 @@ check("M15 opposite to M1 cannot buy", () => {
 check("Missing recent M5 prevents synthetic M15 fabrication", () => {
   const input = fixture(); input.m5.splice(-5, 1);
   rejected(input, /incompleto/);
+});
+check("Daily XAUUSD pause does not block evaluation after 22:00 UTC reopen", () => {
+  const input = withClosureGap(fixture(), Date.UTC(2026, 8, 9, 10, 0), Date.UTC(2026, 8, 9, 22, 0), 60 * MINUTE);
+  withLiveSession(() => {
+    const s = evaluateScalper(input);
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.doesNotMatch(s.reasoning + s.evaluations.map(e => e.reason).join(" "), /Storico recente M1\/M5\/M15 incompleto/);
+  });
+});
+check("Monday reopen after weekend does not block evaluation", () => {
+  const input = withClosureGap(fixture(), Date.UTC(2026, 8, 9, 10, 0), Date.UTC(2026, 8, 13, 22, 0), 49 * 60 * MINUTE);
+  withLiveSession(() => {
+    const s = evaluateScalper(input);
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.doesNotMatch(s.reasoning + s.evaluations.map(e => e.reason).join(" "), /Storico recente M1\/M5\/M15 incompleto/);
+  });
 });
 check("Duplicate and malformed candles rejected", () => {
   const duplicate = fixture(); duplicate.m5.push(duplicate.m5.at(-1)!); rejected(duplicate, /non valide/);

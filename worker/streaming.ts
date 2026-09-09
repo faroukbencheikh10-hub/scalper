@@ -986,7 +986,43 @@ async function main() {
   const listener = new QuoteListener(onPrice);
   connection.addSynchronizationListener(listener);
   await connection.connect();
-  await connection.waitSynchronized();
+  let synchronizationMessage = "Attendo sincronizzazione broker.";
+  await markWorker("waiting_broker", { ...workerDetail(), reason: synchronizationMessage });
+  void sendTelegram(
+    `\u{1f7e1} SCALPER ${symbol()} · attesa sincronizzazione broker iniziata.`
+    + `\nRitento ogni 30 secondi senza fermare il worker.`,
+  );
+  const waitingHeartbeatTimer = setInterval(() => {
+    if (heartbeatBusy) return;
+    heartbeatBusy = true;
+    void markWorker("waiting_broker", { ...workerDetail(), reason: synchronizationMessage })
+      .catch((error) => console.error(error))
+      .finally(() => {
+        heartbeatBusy = false;
+      });
+  }, heartbeatMs);
+  try {
+    for (;;) {
+      try {
+        await connection.waitSynchronized();
+        break;
+      } catch (error) {
+        synchronizationMessage = error instanceof Error ? error.message : String(error);
+        console.warn("[scalper-worker] waitSynchronized retry", synchronizationMessage);
+        await Promise.all([
+          setSetting("stream_last_error", `${new Date().toISOString()} ${synchronizationMessage}`),
+          markWorker("waiting_broker", { ...workerDetail(), reason: synchronizationMessage }),
+        ]).catch((settingError) => console.error(settingError));
+        await sleep(30_000);
+      }
+    }
+  } finally {
+    clearInterval(waitingHeartbeatTimer);
+  }
+  await markWorker(stopped ? "paused" : "streaming", workerDetail());
+  void sendTelegram(
+    `\u{1f7e2} SCALPER ${symbol()} · sincronizzazione broker riuscita${stopped ? ", sistema in pausa." : ", worker di nuovo streaming."}`,
+  );
   const purged = await dbQuery(
     `UPDATE scalper_signals
         SET outcome='ERROR',closed_at=now(),mt5_error='purged at startup'
