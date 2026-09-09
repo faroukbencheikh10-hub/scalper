@@ -1,7 +1,8 @@
 import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, setSetting, systemStopActive } from "../src/lib/server/db";
 import { autoExecEnabled } from "../src/lib/server/executor";
-import { fetchCandles, symbol } from "../src/lib/server/metaApi";
+import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
+import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
 import type { Candle, Quote } from "../src/lib/types";
@@ -90,6 +91,69 @@ class QuoteListener extends SynchronizationListener {
   }
 }
 
+type ManagedPosition = {
+  id: string;
+  symbol: string;
+  openPrice: number;
+  volume?: number;
+  clientId?: string;
+  type?: string;
+  time?: string | Date;
+};
+
+type ManagedOrder = {
+  id: string;
+  symbol: string;
+};
+
+type FlattenConnection = StreamingConnectionLike & {
+  terminalState: StreamingConnectionLike["terminalState"] & { orders?: ManagedOrder[] };
+  cancelOrder: (orderId: string) => Promise<Record<string, unknown>>;
+};
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function assertTradeAccepted(result: Record<string, unknown>, label: string) {
+  const numericCode = Number(result.numericCode);
+  const stringCode = typeof result.stringCode === "string"
+    ? result.stringCode
+    : typeof result.description === "string"
+      ? result.description
+      : "";
+  if (!stringCode && !Number.isFinite(numericCode)) return;
+  if ([10008, 10009, 10010].includes(numericCode)) return;
+  if (["TRADE_RETCODE_PLACED", "TRADE_RETCODE_DONE", "TRADE_RETCODE_DONE_PARTIAL"].includes(stringCode)) return;
+  throw new Error(`${label} rifiutata da MetaApi: ${stringCode || numericCode || "codice sconosciuto"}`);
+}
+
+async function retryTrade(label: string, action: () => Promise<Record<string, unknown>>) {
+  let lastError: unknown = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await action();
+      assertTradeAccepted(result, label);
+      return result;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) await sleep(250 * 2 ** (attempt - 1));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(`${label} fallita`);
+}
+
+function noTradeDecision(reasoning: string, quote: Quote | null) {
+  return {
+    at: new Date().toISOString(),
+    mode: "session_guard",
+    direction: "NO_TRADE",
+    setup: null,
+    reasoning,
+    quote,
+  };
+}
+
 async function main() {
   await ensureSchema();
   const token = required("METAAPI_TOKEN");
@@ -101,11 +165,12 @@ async function main() {
   const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 250, 100, 30_000);
   const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
   const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
+  const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
   const account = await api.metatraderAccountApi.getAccount(accountId);
   const connection = account.getStreamingConnection();
-  const tradingConnection = connection as unknown as StreamingConnectionLike;
+  const tradingConnection = connection as unknown as FlattenConnection;
 
   let subscribed = false;
   let ready = false;
@@ -121,10 +186,181 @@ async function main() {
   let heartbeatBusy = false;
   let quotePersistBusy = false;
   let decisionPersistBusy = false;
+  let flattenBusy = false;
   let signalLockUntil = 0;
+  let lastEmptyFlattenMarker: string | null = null;
 
   const marketDataSubscriptions = [{ type: "quotes" as const }];
   const marketDataUnsubscriptions = [{ type: "quotes" as const }];
+
+  const workerDetail = () => ({
+    symbol: symbol(),
+    mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
+    autoExec: autoExecEnabled(),
+    m1: m1.length,
+    m5: m5.length,
+    hoursUtc: sessionConfig.hoursUtc,
+    flattenBeforeEndMin: sessionConfig.flattenBeforeEndMin,
+    fridayCloseUtc: sessionConfig.fridayCloseUtc,
+  });
+
+  const findSignalForPosition = async (position: ManagedPosition) => {
+    let result = await dbQuery(
+      `SELECT id,direction,entry,stop_loss,mt5_open_price,created_at
+         FROM scalper_signals
+        WHERE mt5_position_id=$1
+        ORDER BY created_at DESC LIMIT 1`,
+      [position.id],
+    );
+    if (result.rows[0] || !position.clientId?.startsWith("SC_XAUUSD_")) return result.rows[0] ?? null;
+
+    const suffix = position.clientId.slice("SC_XAUUSD_".length);
+    result = await dbQuery(
+      `SELECT id,direction,entry,stop_loss,mt5_open_price,created_at
+         FROM scalper_signals
+        WHERE replace(id::text,'-','') LIKE $1
+        ORDER BY created_at DESC LIMIT 1`,
+      [`%${suffix}`],
+    );
+    if (result.rows[0]) {
+      await dbQuery(
+        `UPDATE scalper_signals
+            SET mt5_position_id=COALESCE(mt5_position_id,$2),mt5_open_price=COALESCE(mt5_open_price,$3)
+          WHERE id=$1`,
+        [result.rows[0].id, position.id, position.openPrice],
+      );
+    }
+    return result.rows[0] ?? null;
+  };
+
+  const recordClosedPosition = async (position: ManagedPosition, reason: string) => {
+    let history: Awaited<ReturnType<typeof deals>> = [];
+    let out: Awaited<ReturnType<typeof deals>>[number] | undefined;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      history = await deals(position.id);
+      out = history
+        .filter((deal) => deal.entryType && deal.entryType !== "DEAL_ENTRY_IN")
+        .sort((a, b) => Date.parse(a.time ?? "") - Date.parse(b.time ?? ""))
+        .at(-1);
+      if (out && Number.isFinite(Number(out.price))) break;
+      if (attempt < 3) await sleep(300 * 2 ** (attempt - 1));
+    }
+    if (!out || !Number.isFinite(Number(out.price))) {
+      throw new Error(`Storico chiusura non disponibile per posizione ${position.id}`);
+    }
+
+    const inn = history
+      .filter((deal) => deal.entryType === "DEAL_ENTRY_IN")
+      .sort((a, b) => Date.parse(a.time ?? "") - Date.parse(b.time ?? ""))[0];
+    const close = Number(out.price);
+    const profit = Number(out.profit ?? 0);
+    const signal = await findSignalForPosition(position);
+
+    if (signal) {
+      const open = Number(signal.mt5_open_price ?? inn?.price ?? position.openPrice ?? signal.entry);
+      const risk = Math.abs(open - Number(signal.stop_loss));
+      const signed = Number(signal.entry) < Number(signal.stop_loss) ? open - close : close - open;
+      const resultR = risk > 0 ? Number((signed / risk).toFixed(2)) : 0;
+      await dbQuery(
+        `UPDATE scalper_signals
+            SET mt5_position_id=COALESCE(mt5_position_id,$2),mt5_open_price=COALESCE(mt5_open_price,$3),
+                mt5_close_price=$4,mt5_profit=$5,outcome=$6,result_r=$7,closed_at=COALESCE($8::timestamptz,now())
+          WHERE id=$1`,
+        [signal.id, position.id, open, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null],
+      );
+      await dbQuery(
+        `UPDATE trades SET reason=$2,payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason',$2)
+          WHERE source='scalper' AND mt5_position_id=$1`,
+        [position.id, reason],
+      );
+      return;
+    }
+
+    const direction = String(position.type ?? "").includes("SELL") ? "SELL" : String(position.type ?? "").includes("BUY") ? "BUY" : null;
+    const openedAt = position.time instanceof Date ? position.time.toISOString() : typeof position.time === "string" ? position.time : null;
+    const externalParams = [symbol(), position.id, direction, position.openPrice ?? inn?.price ?? null, close, profit, reason, openedAt, out.time ?? null, JSON.stringify({ volume: position.volume ?? null })];
+    const updated = await dbQuery(
+      `UPDATE trades SET direction=$3,open_price=$4,close_price=$5,profit=$6,reason=$7,opened_at=$8,
+              closed_at=COALESCE($9::timestamptz,now()),payload=$10::jsonb
+        WHERE source='flatten_external' AND symbol=$1 AND mt5_position_id=$2`,
+      externalParams,
+    );
+    if (updated.rowCount === 0) {
+      await dbQuery(
+        `INSERT INTO trades(source,signal_id,symbol,mt5_position_id,direction,open_price,close_price,profit,result_r,reason,opened_at,closed_at,payload)
+         VALUES('flatten_external',NULL,$1,$2,$3,$4,$5,$6,NULL,$7,$8,COALESCE($9::timestamptz,now()),$10::jsonb)`,
+        externalParams,
+      );
+    }
+  };
+
+  const flattenSymbol = async (reason: "end_of_session" | "system_stop", marker: string) => {
+    if (flattenBusy) return;
+    flattenBusy = true;
+    const at = new Date().toISOString();
+    const closed: string[] = [];
+    const canceled: string[] = [];
+    const failures: string[] = [];
+    try {
+      const positions = [...(tradingConnection.terminalState.positions ?? [])]
+        .filter((position) => position.symbol === symbol()) as ManagedPosition[];
+      const orders = [...(tradingConnection.terminalState.orders ?? [])]
+        .filter((order) => order.symbol === symbol());
+
+      if (positions.length === 0 && orders.length === 0) {
+        if (lastEmptyFlattenMarker !== marker) {
+          lastEmptyFlattenMarker = marker;
+          await setSetting("stream_last_flatten", JSON.stringify({ at, closed, canceled, reason }));
+        }
+        return;
+      }
+
+      for (const position of positions) {
+        try {
+          await retryTrade(`Chiusura posizione ${position.id}`, () => tradingConnection.closePosition(position.id));
+          closed.push(position.id);
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      for (const order of orders) {
+        try {
+          await retryTrade(`Cancellazione ordine ${order.id}`, () => tradingConnection.cancelOrder(order.id));
+          canceled.push(order.id);
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      for (const position of positions.filter((item) => closed.includes(item.id))) {
+        try {
+          await recordClosedPosition(position, reason);
+        } catch (error) {
+          failures.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+
+      await setSetting("stream_last_flatten", JSON.stringify({ at, closed, canceled, reason, failures }));
+      if (failures.length > 0) {
+        const message = `Flatten ${reason} incompleto: ${failures.join(" | ")}`;
+        await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
+        throw new Error(message);
+      }
+      lastEmptyFlattenMarker = marker;
+      signalLockUntil = 0;
+    } finally {
+      flattenBusy = false;
+    }
+  };
+
+  const sessionGuard = (quote: Quote | null) => {
+    const status = getSessionStatus(new Date(), sessionConfig);
+    if (status.weekendClosed) return { allowed: false, status, reasoning: "Mercato chiuso (weekend)" };
+    if (status.inFlattenWindow) return { allowed: false, status, reasoning: `Chiusura sessione tra ${status.minutesUntilEnd ?? 0} min` };
+    if (!status.inside) return { allowed: false, status, reasoning: `Fuori fascia scalper ${sessionConfig.hoursUtc} UTC` };
+    return { allowed: true, status, reasoning: null as string | null };
+  };
 
   const onPrice = async (price: Record<string, unknown>) => {
     if (!ready || stopped || !subscribed) return;
@@ -137,10 +373,17 @@ async function main() {
 
     upsertTick(m1, 1, quote.mid, quote.quotedAt ?? Date.now(), m1Max);
     upsertTick(m5, 5, quote.mid, quote.quotedAt ?? Date.now(), m5Max);
-    if (m1.length < 35 || m5.length < 30) return;
-    if (decisionBusy || Date.now() < signalLockUntil) return;
 
-    const existing = (tradingConnection.terminalState.positions ?? []).find((p) => p.symbol === symbol());
+    const gate = sessionGuard(quote);
+    if (!gate.allowed) {
+      latestDecision = noTradeDecision(gate.reasoning!, quote);
+      return;
+    }
+
+    if (m1.length < 35 || m5.length < 30) return;
+    if (decisionBusy || Date.now() < signalLockUntil || flattenBusy) return;
+
+    const existing = (tradingConnection.terminalState.positions ?? []).find((position) => position.symbol === symbol());
     if (existing) return;
 
     const signal = evaluateScalper({ quote, m1, m5 });
@@ -162,6 +405,12 @@ async function main() {
 
     decisionBusy = true;
     try {
+      const preReservationGate = sessionGuard(quote);
+      if (!preReservationGate.allowed) {
+        latestDecision = noTradeDecision(preReservationGate.reasoning!, quote);
+        return;
+      }
+
       const reservation = await reserveStreamingSignal({
         direction: signal.direction,
         setup: signal.setup,
@@ -186,6 +435,16 @@ async function main() {
       }
 
       const signalId = reservation.signalId;
+      const finalGate = sessionGuard(quote);
+      if (!finalGate.allowed) {
+        await dbQuery(
+          `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
+          [signalId, finalGate.reasoning],
+        );
+        latestDecision = noTradeDecision(finalGate.reasoning!, quote);
+        return;
+      }
+
       const execution = await executeStreaming(
         signalId,
         signal.direction,
@@ -236,18 +495,14 @@ async function main() {
     await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);
     subscribed = true;
     ready = true;
-    await markWorker("streaming", {
-      symbol: symbol(),
-      mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
-      m1: m1.length,
-      m5: m5.length,
-    });
+    await markWorker("streaming", workerDetail());
   };
 
   if (!stopped) {
     await subscribe();
   } else {
-    await markWorker("paused", { reason: "STOP TUTTO" });
+    await flattenSymbol("system_stop", "startup-system-stop").catch(() => undefined);
+    await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });
   }
 
   const controlTimer = setInterval(() => {
@@ -259,6 +514,7 @@ async function main() {
         if (nextStopped && !stopped) {
           stopped = true;
           ready = false;
+          await flattenSymbol("system_stop", `system-stop-${Date.now()}`).catch(() => undefined);
           if (subscribed) {
             await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
             subscribed = false;
@@ -267,7 +523,7 @@ async function main() {
           m5 = [];
           latestQuote = null;
           await setSetting("stream_last_quote", "");
-          await markWorker("paused", { reason: "STOP TUTTO" });
+          await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });
         } else if (!nextStopped && stopped) {
           stopped = false;
           await subscribe();
@@ -282,8 +538,37 @@ async function main() {
     })();
   }, controlPollMs);
 
+  const sessionTimer = setInterval(() => {
+    const status = getSessionStatus(new Date(), sessionConfig);
+    const positions = (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol());
+    const orders = (tradingConnection.terminalState.orders ?? []).filter((order) => order.symbol === symbol());
+    const hasExposure = positions.length > 0 || orders.length > 0;
+
+    if (stopped) {
+      if (hasExposure) void flattenSymbol("system_stop", "system-stop-active").catch(() => undefined);
+      return;
+    }
+
+    if (status.weekendClosed) {
+      latestDecision = noTradeDecision("Mercato chiuso (weekend)", latestQuote);
+      if (hasExposure) void flattenSymbol("end_of_session", `weekend-${new Date().toISOString().slice(0, 10)}`).catch(() => undefined);
+      return;
+    }
+
+    if (status.inFlattenWindow) {
+      latestDecision = noTradeDecision(`Chiusura sessione tra ${status.minutesUntilEnd ?? 0} min`, latestQuote);
+      void flattenSymbol("end_of_session", status.sessionEndAt ?? `session-${new Date().toISOString().slice(0, 10)}`).catch(() => undefined);
+      return;
+    }
+
+    if (!status.inside) {
+      latestDecision = noTradeDecision(`Fuori fascia scalper ${sessionConfig.hoursUtc} UTC`, latestQuote);
+      if (hasExposure) void flattenSymbol("end_of_session", `outside-${new Date().toISOString().slice(0, 10)}`).catch(() => undefined);
+    }
+  }, 1000);
+
   const syncTimer = setInterval(() => {
-    if (syncBusy || stopped || !subscribed) return;
+    if (syncBusy || flattenBusy || stopped || !subscribed) return;
     syncBusy = true;
     void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
       .then((result) => {
@@ -324,13 +609,7 @@ async function main() {
   const heartbeatTimer = setInterval(() => {
     if (heartbeatBusy) return;
     heartbeatBusy = true;
-    void markWorker(stopped ? "paused" : subscribed ? "streaming" : "connected", {
-      symbol: symbol(),
-      mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
-      autoExec: autoExecEnabled(),
-      m1: m1.length,
-      m5: m5.length,
-    })
+    void markWorker(stopped ? "paused" : subscribed ? "streaming" : "connected", workerDetail())
       .catch((error) => console.error(error))
       .finally(() => {
         heartbeatBusy = false;
@@ -339,17 +618,18 @@ async function main() {
 
   const shutdown = async (reason: string) => {
     clearInterval(controlTimer);
+    clearInterval(sessionTimer);
     clearInterval(syncTimer);
     clearInterval(quotePersistTimer);
     clearInterval(decisionPersistTimer);
     clearInterval(heartbeatTimer);
     try {
       ready = false;
-      await markWorker("stopping", { reason });
+      await markWorker("stopping", { ...workerDetail(), reason });
       if (subscribed) await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
       connection.removeSynchronizationListener(listener);
       await connection.close();
-      await markWorker("stopped", { reason });
+      await markWorker("stopped", { ...workerDetail(), reason });
     } finally {
       process.exit(0);
     }
