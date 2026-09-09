@@ -196,8 +196,9 @@ async function main() {
   const lossLockMs = envInt("LOSS_LOCK_MINUTES", 30, 0, 1440) * 60_000;
   const consecLossPauseMs = envInt("CONSEC_LOSS_PAUSE_MINUTES", 120, 0, 1440) * 60_000;
   const consecLossCount = envInt("CONSEC_LOSS_COUNT", 3, 2, 10);
-  // Rischio massimo per ordine in percentuale del saldo: oltre la soglia si scende ai lotti minimi.
-  const riskMaxPct = envNum("RISK_MAX_PCT", 6);
+  // Rischio massimo per ordine in percentuale del saldo: 0 (default) disattiva il taglio e
+  // lascia sempre i lotti scelti in dashboard, il rischio resta solo informativo su log e Telegram.
+  const riskMaxPct = envNum("RISK_MAX_PCT", 0);
   const riskFallbackLots = envNum("RISK_FALLBACK_LOTS", 0.01);
   const sessionConfig = sessionConfigFromEnv();
 
@@ -715,7 +716,8 @@ async function main() {
       const account = accountSnapshot();
       const balance = Number(account?.balance);
       const slDistance = Math.abs(signal.entry! - signal.stopLoss!);
-      const riskCap = Number.isFinite(balance) && balance > 0 ? (balance * riskMaxPct) / 100 : null;
+      const balanceKnown = Number.isFinite(balance) && balance > 0;
+      const riskCap = riskMaxPct > 0 && balanceKnown ? (balance * riskMaxPct) / 100 : null;
       let orderLots = activeLots;
       let lotsCapped = false;
       if (riskCap !== null && lossAtStop(orderLots, slDistance) > riskCap) {
@@ -724,7 +726,7 @@ async function main() {
         orderLots = reduced;
       }
       const riskMoney = lossAtStop(orderLots, slDistance);
-      const riskPct = riskCap !== null ? (riskMoney / balance) * 100 : null;
+      const riskPct = balanceKnown ? (riskMoney / balance) * 100 : null;
       const riskPlan = {
         lots: orderLots,
         requestedLots: activeLots,
@@ -735,6 +737,7 @@ async function main() {
         risk: Number(riskMoney.toFixed(2)),
         riskPct: riskPct === null ? null : Number(riskPct.toFixed(2)),
         riskMaxPct,
+        riskCapActive: riskCap !== null,
         currency: account?.currency ?? null,
         overCap: riskCap !== null && riskMoney > riskCap,
         slPlan: signal.slPlan,

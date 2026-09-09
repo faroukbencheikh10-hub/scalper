@@ -93,6 +93,14 @@ function minReentrySec() {
   return envN("SCALPER_MIN_REENTRY_SEC", 120, 0);
 }
 
+/**
+ * Finestra entro cui due ordini con stesso setup e stessa direzione contano come un solo trade
+ * nel limite giornaliero: i doppioni ravvicinati non consumano il budget della sessione.
+ */
+function tradeDedupSec() {
+  return envN("TRADE_DEDUP_SECONDS", 30, 0);
+}
+
 function historyRetryMs() {
   return envN("SCALPER_HISTORY_RETRY_SEC", 30, 10) * 1000;
 }
@@ -187,11 +195,16 @@ async function limits() {
   const start = sessionWindowStart();
   const [daily, last] = await Promise.all([
     dbQuery(
-      `SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL AND created_at >= $1::timestamptz) trades,
-              COALESCE(SUM(mt5_profit) FILTER (WHERE closed_at >= $1::timestamptz),0) profit
-         FROM scalper_signals
-        WHERE created_at >= $1::timestamptz OR closed_at >= $1::timestamptz`,
-      [start.toISOString()],
+      `WITH orders AS (
+         SELECT created_at,
+                lag(created_at) OVER (PARTITION BY COALESCE(setup,''),direction ORDER BY created_at) AS prev_at
+           FROM scalper_signals
+          WHERE mt5_order_id IS NOT NULL AND created_at >= $1::timestamptz
+       )
+       SELECT (SELECT COUNT(*) FROM orders
+                WHERE prev_at IS NULL OR created_at - prev_at >= ($2::float8 * interval '1 second')) trades,
+              (SELECT COALESCE(SUM(mt5_profit),0) FROM scalper_signals WHERE closed_at >= $1::timestamptz) profit`,
+      [start.toISOString(), tradeDedupSec()],
     ),
     dbQuery(`SELECT outcome,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
   ]);
@@ -232,10 +245,18 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
     `WITH lock AS MATERIALIZED (
        SELECT pg_advisory_xact_lock(209260908)
      ),
-     daily AS (
-       SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL AND created_at >= $12::timestamptz)::int AS trades,
-              COALESCE(SUM(mt5_profit) FILTER (WHERE closed_at >= $12::timestamptz),0)::float8 AS profit
+     daily_orders AS (
+       SELECT created_at,
+              lag(created_at) OVER (PARTITION BY COALESCE(setup,''),direction ORDER BY created_at) AS prev_at
          FROM scalper_signals, lock
+        WHERE mt5_order_id IS NOT NULL AND created_at >= $12::timestamptz
+     ),
+     daily AS (
+       -- I doppioni (stesso setup e direzione entro $14 secondi da un altro ordine) contano una volta sola.
+       SELECT (SELECT COUNT(*) FROM daily_orders
+                WHERE prev_at IS NULL OR created_at - prev_at >= ($14::float8 * interval '1 second'))::int AS trades,
+              COALESCE(SUM(mt5_profit) FILTER (WHERE closed_at >= $12::timestamptz),0)::float8 AS profit
+         FROM scalper_signals
         WHERE created_at >= $12::timestamptz OR closed_at >= $12::timestamptz
      ),
      last_close AS (
@@ -308,6 +329,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       lossCooldown,
       start.toISOString(),
       minReentrySec(),
+      tradeDedupSec(),
     ],
   );
 

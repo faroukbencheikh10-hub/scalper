@@ -38,7 +38,9 @@ distanza TP = distanza SL × TP_RR
 
 ### Rischio per ordine
 
-Prima di ogni invio il worker calcola il rischio dell'ordine come `distanza SL × lotti × 100` (once per lotto). Se supera `RISK_MAX_PCT` del saldo, i lotti dell'ordine scendono a `RISK_FALLBACK_LOTS` (0.01): la size scelta in dashboard non viene sovrascritta, la riduzione vale solo per quell'ordine ed è segnalata come `lotsCapped`.
+Prima di ogni invio il worker calcola il rischio dell'ordine come `distanza SL × lotti × 100` (once per lotto). Il valore è **informativo**: con `RISK_MAX_PCT=0` (default) l'ordine parte sempre con i lotti scelti in dashboard, senza alcun taglio.
+
+Impostando `RISK_MAX_PCT` a un valore maggiore di zero il cap si riattiva: sopra quella percentuale del saldo i lotti dell'ordine scendono a `RISK_FALLBACK_LOTS` (0.01) solo per quell'ordine, senza sovrascrivere la size salvata in dashboard, e la riduzione è segnalata come `lotsCapped`.
 
 Il rischio calcolato compare nel log `order_plan`, in `stream_last_decision.risk`, sulla dashboard (righe *SL / TP ultimo ordine* e *Rischio ultimo ordine*) e nel messaggio Telegram di apertura. L'importo è nominale in valuta del conto: non viene applicata alcuna conversione FX fra il dollaro della quotazione XAUUSD e l'euro del conto.
 
@@ -83,7 +85,7 @@ Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi
 | `SL_ATR_MULT` | 1.3 | Quota ATR M1 della distanza di stop |
 | `SL_MIN_USD` / `SL_MAX_USD` | 3.0 / 8.0 | Distanza SL minima e massima; oltre il massimo il trade viene scartato |
 | `TP_RR` | 1.5 | Rapporto TP/SL |
-| `RISK_MAX_PCT` / `RISK_FALLBACK_LOTS` | 6 / 0.01 | Rischio massimo per ordine in % del saldo e lotti di ripiego |
+| `RISK_MAX_PCT` / `RISK_FALLBACK_LOTS` | 0 / 0.01 | Cap di rischio per ordine in % del saldo (0 = disattivato) e lotti di ripiego |
 | `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
 | `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
 | `SCALPER_MAX_OPEN_POSITIONS` | 1 | Posizioni XAUUSD aperte contemporaneamente |
@@ -122,6 +124,8 @@ Il cookie e' `secure`, quindi in sviluppo su `http://localhost` non viene accett
 ## Limiti per sessione
 
 `MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS` e i cooldown sono calcolati sulla **sessione corrente**, non sul giorno di calendario UTC: la sessione parte dall'orario di apertura di `SCALPER_HOURS_UTC` (con `22:00-20:30` va dalle 22:00 alle 22:00 del giorno dopo). Il conteggio dei trade usa `created_at`, il P/L usa `mt5_profit` dei segnali con `closed_at` dentro la sessione.
+
+Il conteggio esclude i **doppioni**: due ordini con lo stesso setup e la stessa direzione a meno di `TRADE_DEDUP_SECONDS` (30) l'uno dall'altro contano come un trade solo, così una raffica ravvicinata non consuma il budget della sessione. La deduplica vale sia nella prenotazione del segnale sia nel controllo dei limiti.
 
 `SCALPER_MIN_REENTRY_SEC` (default 120) impone una pausa minima fra la chiusura di una posizione reale e l'apertura successiva; il blocco compare in `stream_last_decision.execution.status` come `reentry_gap`.
 
