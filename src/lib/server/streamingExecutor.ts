@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { dbQuery, ensureSchema, systemStopActive } from "./db";
 import { autoExecEnabled, lots } from "./executor";
 import { deals, symbol } from "./metaApi";
@@ -50,8 +51,8 @@ function envN(name: string, fallback: number, min = 0) {
   return Number.isFinite(value) && value >= min ? value : fallback;
 }
 
-function clientId(signalId: string) {
-  return `SC_XAUUSD_${signalId.replace(/-/g, "").slice(-10)}`;
+function shortClientId() {
+  return `SC_${randomBytes(4).toString("hex")}`;
 }
 
 async function limits() {
@@ -290,45 +291,62 @@ export async function executeStreaming(
     if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
   }
 
+  const orderClientId = shortClientId();
+  const orderLots = lots();
+  await dbQuery(`UPDATE scalper_signals SET client_id=$2 WHERE id=$1`, [signalId, orderClientId]);
+  console.log("[scalper-worker] order_send", {
+    clientId: orderClientId,
+    direction,
+    lots: orderLots,
+    sl: stopLoss,
+    tp: takeProfit,
+  });
+
+  let result: Record<string, unknown>;
   try {
-    const orderOptions = { comment: "scalper streaming", clientId: clientId(signalId) };
-    const result = direction === "BUY"
-      ? await connection.createMarketBuyOrder(symbol(), lots(), stopLoss, takeProfit, orderOptions)
-      : await connection.createMarketSellOrder(symbol(), lots(), stopLoss, takeProfit, orderOptions);
-
-    const orderId = typeof result.orderId === "string" ? result.orderId : null;
-    const responsePositionId = typeof result.positionId === "string" ? result.positionId : null;
-    await dbQuery(`UPDATE scalper_signals SET mt5_order_id=$2 WHERE id=$1`, [signalId, orderId]);
-
-    if (responsePositionId) {
-      const position = (connection.terminalState.positions ?? []).find((p) => p.id === responsePositionId);
-      await dbQuery(
-        `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
-        [signalId, responsePositionId, position?.openPrice ?? null],
-      );
-      return { status: "opened" as const, orderId, positionId: responsePositionId, openPrice: position?.openPrice ?? null };
-    }
-
-    for (let i = 0; i < 20; i++) {
-      const position = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol() && (!p.clientId || p.clientId === clientId(signalId)));
-      if (position) {
-        await dbQuery(
-          `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
-          [signalId, position.id, position.openPrice],
-        );
-        return { status: "opened" as const, orderId, positionId: position.id, openPrice: position.openPrice };
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-
-    await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, "Ordine accettato ma posizione streaming non collegata entro 2s"]);
-    return { status: "pending_position_link" as const, orderId };
+    const orderOptions = { clientId: orderClientId };
+    result = direction === "BUY"
+      ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions)
+      : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await dbQuery(
       `UPDATE scalper_signals SET mt5_error=$2,outcome='ERROR',closed_at=now() WHERE id=$1`,
-      [signalId, message.slice(0, 1000)],
+      [signalId, message],
     );
-    return { status: "error" as const, error: message };
+    console.error("[scalper-worker] order_error", {
+      clientId: orderClientId,
+      direction,
+      error: message,
+    });
+    return { status: "error" as const, error: message, clientId: orderClientId };
   }
+
+  const orderId = typeof result.orderId === "string" ? result.orderId : null;
+  const responsePositionId = typeof result.positionId === "string" ? result.positionId : null;
+  await dbQuery(`UPDATE scalper_signals SET mt5_order_id=$2 WHERE id=$1`, [signalId, orderId]);
+
+  if (responsePositionId) {
+    const position = (connection.terminalState.positions ?? []).find((p) => p.id === responsePositionId);
+    await dbQuery(
+      `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
+      [signalId, responsePositionId, position?.openPrice ?? null],
+    );
+    return { status: "opened" as const, orderId, positionId: responsePositionId, openPrice: position?.openPrice ?? null, clientId: orderClientId };
+  }
+
+  for (let i = 0; i < 20; i++) {
+    const position = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol() && (!p.clientId || p.clientId === orderClientId));
+    if (position) {
+      await dbQuery(
+        `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,
+        [signalId, position.id, position.openPrice],
+      );
+      return { status: "opened" as const, orderId, positionId: position.id, openPrice: position.openPrice, clientId: orderClientId };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, "Ordine accettato ma posizione streaming non collegata entro 2s"]);
+  return { status: "pending_position_link" as const, orderId, clientId: orderClientId };
 }

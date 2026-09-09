@@ -156,6 +156,7 @@ function noTradeDecision(reasoning: string, quote: Quote | null) {
 
 async function main() {
   await ensureSchema();
+  await dbQuery(`ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS client_id text`);
   const token = required("METAAPI_TOKEN");
   const accountId = required("METAAPI_ACCOUNT_ID");
   const m1Max = envInt("SCALPER_M1_CANDLES", 500, 50, 1000);
@@ -188,6 +189,7 @@ async function main() {
   let decisionPersistBusy = false;
   let flattenBusy = false;
   let signalLockUntil = 0;
+  let orderErrorUntil = 0;
   let lastEmptyFlattenMarker: string | null = null;
 
   const marketDataSubscriptions = [{ type: "quotes" as const }];
@@ -212,15 +214,14 @@ async function main() {
         ORDER BY created_at DESC LIMIT 1`,
       [position.id],
     );
-    if (result.rows[0] || !position.clientId?.startsWith("SC_XAUUSD_")) return result.rows[0] ?? null;
+    if (result.rows[0] || !position.clientId) return result.rows[0] ?? null;
 
-    const suffix = position.clientId.slice("SC_XAUUSD_".length);
     result = await dbQuery(
       `SELECT id,direction,entry,stop_loss,mt5_open_price,created_at
          FROM scalper_signals
-        WHERE replace(id::text,'-','') LIKE $1
+        WHERE client_id=$1
         ORDER BY created_at DESC LIMIT 1`,
-      [`%${suffix}`],
+      [position.clientId],
     );
     if (result.rows[0]) {
       await dbQuery(
@@ -381,7 +382,7 @@ async function main() {
     }
 
     if (m1.length < 35 || m5.length < 30) return;
-    if (decisionBusy || Date.now() < signalLockUntil || flattenBusy) return;
+    if (decisionBusy || Date.now() < signalLockUntil || Date.now() < orderErrorUntil || flattenBusy) return;
 
     const existing = (tradingConnection.terminalState.positions ?? []).find((position) => position.symbol === symbol());
     if (existing) return;
@@ -462,6 +463,8 @@ async function main() {
         );
       } else if (execution.status === "opened" || execution.status === "pending_position_link") {
         signalLockUntil = Date.now() + 5000;
+      } else if (execution.status === "error") {
+        orderErrorUntil = Date.now() + 60_000;
       }
 
       latestDecision = {
@@ -486,6 +489,12 @@ async function main() {
   connection.addSynchronizationListener(listener);
   await connection.connect();
   await connection.waitSynchronized();
+  const purged = await dbQuery(
+    `UPDATE scalper_signals
+        SET outcome='ERROR',closed_at=now(),mt5_error='purged at startup'
+      WHERE outcome IS NULL AND mt5_position_id IS NULL`,
+  );
+  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount });
 
   const subscribe = async () => {
     ready = false;
