@@ -197,6 +197,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   {
     const bodyMin = envN("BREAKOUT_BODY_RATIO", 0.6);
     const closeMult = envN("BREAKOUT_CLOSE_ATR_MULT", 0.15);
+    const maxExtMult = envN("BREAKOUT_MAX_EXT_ATR", 1.5);
     const breakIdx = m1.length - 2;
     const windowStart = breakIdx - breakoutLookback;
     if (windowStart < 0) {
@@ -217,7 +218,12 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
         const emaOk = emaAt !== null && emaSlowAt !== null && (direction === "BUY" ? emaAt > emaSlowAt : emaAt < emaSlowAt);
         // Conferma sulla candela d'ingresso: il prezzo deve essere ancora oltre il livello rotto.
         const holds = direction === "BUY" ? last.close > high : last.close < low;
+        // Distanza fra la chiusura di rottura e il livello: oltre BREAKOUT_MAX_EXT_ATR * ATR
+        // il movimento e' gia' andato e non si insegue.
+        const extension = direction === "BUY" ? prev.close - high : low - prev.close;
+        const maxExtension = atr1 * maxExtMult;
         const missing: string[] = [];
+        if (extension > maxExtension) missing.push(`movimento già esteso: chiusura ${extension.toFixed(2)}$ oltre il livello, massimo ${maxExtension.toFixed(2)}$`);
         if (breakoutBody < bodyMin) missing.push(`corpo ${(breakoutBody * 100).toFixed(0)}% sotto il ${(bodyMin * 100).toFixed(0)}% del range`);
         if (!emaOk) missing.push(`EMA9/EMA20 M1 non allineate ${direction}`);
         if (!holds) missing.push(`prezzo rientrato nel canale (${last.close.toFixed(2)}$)`);

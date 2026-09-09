@@ -52,7 +52,7 @@ Il rischio calcolato compare nel log `order_plan`, in `stream_last_decision.risk
 
 ### momentum_breakout
 
-Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range, chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1, EMA9 > EMA20 (long) o viceversa, spread e ATR validi. La candela di rottura è l'ultima M1 chiusa: l'ingresso cade sulla candela successiva, con SL sotto/sopra la candela di rottura. Il prezzo deve essere ancora oltre il livello al momento dell'ingresso.
+Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range, chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1 ma **non oltre** `BREAKOUT_MAX_EXT_ATR` × ATR M1 (motivo di scarto "movimento già esteso": il movimento è già andato e non si insegue), EMA9 > EMA20 (long) o viceversa, spread e ATR validi. La candela di rottura è l'ultima M1 chiusa: l'ingresso cade sulla candela successiva, con SL sotto/sopra la candela di rottura. Il prezzo deve essere ancora oltre il livello al momento dell'ingresso.
 
 ### breakout_retest
 
@@ -76,6 +76,7 @@ Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi
 | `BREAKOUT_LOOKBACK` | 12 | Canale M1 rotto dal momentum breakout |
 | `BREAKOUT_BODY_RATIO` | 0.60 | Corpo minimo della candela di rottura |
 | `BREAKOUT_CLOSE_ATR_MULT` | 0.15 | Distanza minima della chiusura oltre il livello, in ATR M1 |
+| `BREAKOUT_MAX_EXT_ATR` | 1.5 | Distanza massima della chiusura oltre il livello: sopra, movimento già esteso |
 | `SHOCK_ATR_MULT` | 2.2 | Soglia della candela shock (minimo assoluto 5.50 $) |
 | `RETEST_MAX_BARS` | 4 | Candele entro cui il retest deve completarsi |
 | `RETEST_ZONE_ATR` / `RETEST_BODY_RATIO` | 0.50 / 0.50 | Ampiezza della zona di retest e corpo minimo del riavvio |
@@ -127,7 +128,10 @@ Il cookie e' `secure`, quindi in sviluppo su `http://localhost` non viene accett
 
 Il conteggio esclude i **doppioni**: due ordini con lo stesso setup e la stessa direzione a meno di `TRADE_DEDUP_SECONDS` (30) l'uno dall'altro contano come un trade solo, così una raffica ravvicinata non consuma il budget della sessione. La deduplica vale sia nella prenotazione del segnale sia nel controllo dei limiti.
 
-`SCALPER_MIN_REENTRY_SEC` (default 120) impone una pausa minima fra la chiusura di una posizione reale e l'apertura successiva; il blocco compare in `stream_last_decision.execution.status` come `reentry_gap`.
+`SCALPER_MIN_REENTRY_SEC` (default 120) impone una pausa minima fra la chiusura di una posizione reale e l'apertura successiva, **qualunque sia l'esito** (WIN, LOSS o BREAKEVEN). La pausa è applicata in due punti:
+
+- nel worker, appena una posizione sparisce dal terminal state MetaApi: il conto alla rovescia parte subito, senza attendere che la chiusura venga scritta a database (lo storico deal può essere in throttling o backoff);
+- nella prenotazione del segnale, sull'ultima `closed_at` registrata: il blocco compare in `stream_last_decision.execution.status` come `reentry_gap`.
 
 Dopo una chiusura in perdita il worker blocca la **stessa direzione** per `LOSS_LOCK_MINUTES` (default 30) a partire dall'orario di chiusura, e dopo `CONSEC_LOSS_COUNT` (3) perdite consecutive nella sessione mette in pausa **tutti** gli ingressi per `CONSEC_LOSS_PAUSE_MINUTES` (120). Entrambi i blocchi scadono da soli e vengono ricalcolati all'avvio, a ogni chiusura e ogni `SCALPER_LOSS_LOCK_REFRESH_MS`.
 

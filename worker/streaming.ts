@@ -203,6 +203,8 @@ async function main() {
   // Solo per l'heartbeat: i limiti veri vivono in reserveStreamingSignal, qui servono a mostrarli.
   const maxTradesPerDay = envInt("MAX_TRADES_PER_DAY", 12, 1, 1000);
   const tradeDedupSeconds = envNum("TRADE_DEDUP_SECONDS", 30);
+  // Pausa minima fra qualsiasi chiusura (WIN, LOSS o BREAKEVEN) e l'ingresso successivo.
+  const reentryMs = envInt("SCALPER_MIN_REENTRY_SEC", 120, 0, 3600) * 1000;
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -246,6 +248,10 @@ async function main() {
   // Entrambi i blocchi scadono da soli: il fermo per l'intera sessione resta solo nei limiti giornalieri.
   const lossLockUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   let lossPauseUntil = 0;
+  // Posizioni viste sul terminal state: quando una sparisce parte la pausa re-entry,
+  // qualunque sia l'esito e senza aspettare che la chiusura venga scritta a database.
+  const knownPositionIds = new Set<string>();
+  let lastPositionCloseAt = 0;
 
   const closedAtMs = (value: unknown) => {
     const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ""));
@@ -591,6 +597,15 @@ async function main() {
 
     const openPositions = (tradingConnection.terminalState.positions ?? [])
       .filter((position) => position.symbol === symbol()) as ManagedPosition[];
+
+    const openIds = new Set(openPositions.map((position) => position.id));
+    for (const id of [...knownPositionIds]) {
+      if (openIds.has(id)) continue;
+      knownPositionIds.delete(id);
+      lastPositionCloseAt = Date.now();
+    }
+    for (const id of openIds) knownPositionIds.add(id);
+
     if (openPositions.length >= maxOpenPositions) {
       latestDecision = noTradeDecision(`Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`, quote);
       return;
@@ -629,6 +644,13 @@ async function main() {
     }
 
     const guardNow = Date.now();
+    const sinceLastClose = guardNow - lastPositionCloseAt;
+    if (lastPositionCloseAt > 0 && sinceLastClose < reentryMs) {
+      const reason = `Pausa re-entry dopo la chiusura: altri ${Math.ceil((reentryMs - sinceLastClose) / 1000)} s prima di un nuovo ingresso.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      logTick(signal, quote, reason);
+      return;
+    }
     if (lossPauseUntil > guardNow) {
       const reason = `Pausa dopo ${consecLossCount} perdite consecutive: nessun ingresso fino alle ${hhmmUtc(lossPauseUntil)} UTC.`;
       latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });

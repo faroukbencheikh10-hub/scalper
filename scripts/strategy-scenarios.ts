@@ -90,13 +90,30 @@ function show(name: string, m1: Candle[], m5: Candle[], q: Quote, expect: Expect
   show("B · M5 neutro + M1 lento", m1, flatM5(2000), quote(m1.at(-1)!.close), { direction: "NO_TRADE" });
 }
 
-// C) Momentum breakout puro
+// C) Momentum breakout puro, con estensione oltre il livello dentro BREAKOUT_MAX_EXT_ATR
 {
   const m1 = oscillating(44, 1990, 0.05);
   const top = Math.max(...m1.slice(-14).map((c) => c.high));
-  m1.push(candle(top - 0.2, top + 2.4, top - 0.3, top + 2.3));
-  m1.push(candle(top + 2.3, top + 2.5, top + 2.1, top + 2.15));
+  m1.push(candle(top - 0.2, top + 1.3, top - 0.3, top + 1.2));
+  m1.push(candle(top + 1.2, top + 1.4, top + 1, top + 1.05));
   show("C · Momentum breakout M1", m1, flatM5(1990), quote(m1.at(-1)!.close), { direction: "BUY", setup: "momentum_breakout" });
+}
+
+// N) Breakout gia' scappato: chiusura troppo oltre il livello rotto -> scartato
+{
+  const m1 = oscillating(44, 1990, 0.05);
+  const top = Math.max(...m1.slice(-14).map((c) => c.high));
+  m1.push(candle(top - 0.2, top + 2.9, top - 0.3, top + 2.8));
+  m1.push(candle(top + 2.8, top + 3, top + 2.6, top + 2.65));
+  show("N · Breakout troppo esteso (deve scartare)", m1, flatM5(1990), quote(m1.at(-1)!.close), {
+    direction: "NO_TRADE",
+    check: (s) => {
+      const breakout = s.evaluations.find((item) => item.setup === "momentum_breakout");
+      if (!breakout) return "momentum_breakout non valutato";
+      if (breakout.status !== "rejected") return `momentum_breakout ${breakout.status} invece di rejected`;
+      return breakout.reason.includes("movimento già esteso") ? null : `motivo inatteso: ${breakout.reason}`;
+    },
+  });
 }
 
 // D) Range sporco: ampiezza compressa, EMA piatte, nessuna accelerazione
