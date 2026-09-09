@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { ensureSchema, getSetting, setSetting, setSystemStop, systemStopActive } from "@/lib/server/db";
 import { clampLots, lotsMax, lotsMin, resolveLots } from "@/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY, LOT_CHOICES } from "@/lib/lots";
+import { dashboardGuard } from "@/lib/server/dashboardAuth";
 
 export const dynamic = "force-dynamic";
 
-export async function GET() {
+export async function GET(req: NextRequest) {
+  const denied = await dashboardGuard(req);
+  if (denied) return denied;
   try {
     await ensureSchema();
     return NextResponse.json({
@@ -23,6 +26,8 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
+  const denied = await dashboardGuard(req);
+  if (denied) return denied;
   try {
     await ensureSchema();
     const body = await req.json().catch(() => ({}));

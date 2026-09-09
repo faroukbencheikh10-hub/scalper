@@ -22,8 +22,11 @@ export async function runScalper() {
   const s=evaluateScalper({quote,m1,m5});
   if(s.direction==="NO_TRADE") return {ok:true,direction:"NO_TRADE",reasoning:s.reasoning,quote};
   if(!autoExecEnabled()) return {ok:true,direction:s.direction,preview:true,setup:s.setup,entry:s.entry,stopLoss:s.stopLoss,takeProfit:s.takeProfit,riskReward:s.riskReward,reasoning:s.reasoning,execution:{status:"disabled"},quote};
-  const saved=await dbQuery(`INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
-    VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,created_at`,[s.direction,s.setup,s.entry,s.stopLoss,s.takeProfit,s.riskReward,s.reasoning]);
+  // Analisi manuale: chiusa subito come SKIPPED, cosi' il worker non la vede
+  // come segnale aperto e non la esegue mai.
+  const saved=await dbQuery(`INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,outcome,closed_at,mt5_error)
+    VALUES($1,$2,$3,$4,$5,$6,$7,'SKIPPED',now(),'manual analysis: nessuna esecuzione da Vercel') RETURNING id,created_at`,
+    [s.direction,`manual:${s.setup ?? "none"}`,s.entry,s.stopLoss,s.takeProfit,s.riskReward,`[manual] ${s.reasoning}`]);
   const id=saved.rows[0].id as string;
-  return {ok:true,direction:s.direction,signalId:id,setup:s.setup,entry:s.entry,stopLoss:s.stopLoss,takeProfit:s.takeProfit,riskReward:s.riskReward,reasoning:s.reasoning,execution:{status:"worker_only"},quote};
+  return {ok:true,direction:s.direction,signalId:id,setup:s.setup,entry:s.entry,stopLoss:s.stopLoss,takeProfit:s.takeProfit,riskReward:s.riskReward,reasoning:s.reasoning,manual:true,execution:{status:"worker_only"},quote};
 }

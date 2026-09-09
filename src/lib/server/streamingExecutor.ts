@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { dbQuery, ensureSchema, getSetting, setSetting, systemStopActive } from "./db";
 import { autoExecEnabled, clampLots, lots } from "./tradingConfig";
 import { requiredMargin } from "@/lib/lots";
+import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
 
 type StreamPosition = {
@@ -64,6 +65,16 @@ type ReserveSignalInput = {
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
 
+export type StreamClosure = {
+  signalId: string;
+  positionId: string;
+  outcome: "WIN" | "LOSS" | "BREAKEVEN";
+  profit: number;
+  openPrice: number;
+  closePrice: number;
+  resultR: number;
+};
+
 const historyAttemptAt = new Map<string, number>();
 let historyBackoffUntil = 0;
 let historyBackoffLoaded = false;
@@ -76,6 +87,10 @@ function envN(name: string, fallback: number, min = 0) {
 
 function maxOpenPositions() {
   return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 3, 1))));
+}
+
+function minReentrySec() {
+  return envN("SCALPER_MIN_REENTRY_SEC", 120, 0);
 }
 
 function historyRetryMs() {
@@ -169,14 +184,13 @@ function shortClientId() {
 }
 
 async function limits() {
-  const start = new Date();
-  start.setUTCHours(0, 0, 0, 0);
+  const start = sessionWindowStart();
   const [daily, last] = await Promise.all([
     dbQuery(
-      `SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL) trades,
-              COALESCE(SUM(mt5_profit),0) profit
+      `SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL AND created_at >= $1::timestamptz) trades,
+              COALESCE(SUM(mt5_profit) FILTER (WHERE closed_at >= $1::timestamptz),0) profit
          FROM scalper_signals
-        WHERE created_at >= $1`,
+        WHERE created_at >= $1::timestamptz OR closed_at >= $1::timestamptz`,
       [start.toISOString()],
     ),
     dbQuery(`SELECT outcome,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
@@ -208,8 +222,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
     return { ok: false as const, status: "blocked" as const, reason: "max_open_positions" };
   }
 
-  const start = new Date();
-  start.setUTCHours(0, 0, 0, 0);
+  const start = sessionWindowStart();
   const maxTrades = envN("MAX_TRADES_PER_DAY", 12, 1);
   const maxDailyLoss = envN("MAX_DAILY_LOSS", 150, 0);
   const threeLossCooldown = envN("SCALPER_THREE_LOSS_COOLDOWN_MIN", 30, 1);
@@ -220,10 +233,15 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
        SELECT pg_advisory_xact_lock(209260908)
      ),
      daily AS (
-       SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL)::int AS trades,
-              COALESCE(SUM(mt5_profit),0)::float8 AS profit
+       SELECT COUNT(*) FILTER (WHERE mt5_order_id IS NOT NULL AND created_at >= $12::timestamptz)::int AS trades,
+              COALESCE(SUM(mt5_profit) FILTER (WHERE closed_at >= $12::timestamptz),0)::float8 AS profit
          FROM scalper_signals, lock
-        WHERE created_at >= $12::timestamptz
+        WHERE created_at >= $12::timestamptz OR closed_at >= $12::timestamptz
+     ),
+     last_close AS (
+       SELECT MAX(closed_at) AS at
+         FROM scalper_signals
+        WHERE closed_at IS NOT NULL AND mt5_position_id IS NOT NULL
      ),
      recent AS MATERIALIZED (
        SELECT outcome,closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
@@ -261,9 +279,12 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
               AND recent_summary.latest_closed_at IS NOT NULL
               AND EXTRACT(EPOCH FROM (now() - recent_summary.latest_closed_at)) < $11::float8 * 60
            THEN 'loss_cooldown'
+         WHEN last_close.at IS NOT NULL
+              AND EXTRACT(EPOCH FROM (now() - last_close.at)) < $13::float8
+           THEN 'reentry_gap'
          ELSE NULL
        END AS reason
-       FROM daily,recent_summary,control
+       FROM daily,recent_summary,control,last_close
      ),
      inserted AS (
        INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning)
@@ -286,12 +307,16 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       threeLossCooldown,
       lossCooldown,
       start.toISOString(),
+      minReentrySec(),
     ],
   );
 
   const row = result.rows[0];
   const reason = row?.reason ? String(row.reason) : null;
   if (reason === "system_stopped") return { ok: false as const, status: "system_stopped" as const };
+  if (reason === "reentry_gap") {
+    return { ok: false as const, status: "reentry_gap" as const, reason, minReentrySec: minReentrySec() };
+  }
   if (reason) return { ok: false as const, status: "blocked" as const, reason };
   if (!row?.id) return { ok: false as const, status: "blocked" as const, reason: "reservation_failed" };
   return { ok: true as const, signalId: String(row.id) };
@@ -300,7 +325,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
 export async function syncStreamingExecutor(connection: StreamingConnectionLike, options: SyncOptions = {}) {
   if (!options.schemaReady) await ensureSchema();
   const stopped = options.systemStopped ?? await systemStopActive();
-  if (stopped) return { checked: 0, closed: 0, stopped: true };
+  if (stopped) return { checked: 0, closed: 0, closures: [] as StreamClosure[], stopped: true };
 
   const rows = await dbQuery(
     `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
@@ -309,6 +334,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       ORDER BY created_at ASC`,
   );
   const positions = connection.terminalState.positions ?? [];
+  const closures: StreamClosure[] = [];
   let closed = 0;
 
   for (const signal of rows.rows) {
@@ -352,10 +378,19 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       ],
     );
     historyAttemptAt.delete(positionId);
+    closures.push({
+      signalId: String(signal.id),
+      positionId,
+      outcome: profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN",
+      profit,
+      openPrice: open,
+      closePrice: close,
+      resultR,
+    });
     closed++;
   }
 
-  return { checked: rows.rows.length, closed, stopped: false };
+  return { checked: rows.rows.length, closed, closures, stopped: false };
 }
 
 export async function executeStreaming(

@@ -2,6 +2,7 @@ import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
 import { autoExecEnabled, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY } from "../src/lib/lots";
+import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
@@ -227,6 +228,19 @@ async function main() {
     };
   };
 
+  const balanceLine = () => {
+    const account = accountSnapshot();
+    if (!account) return "saldo n/d";
+    return `saldo ${money(account.balance)} ${account.currency ?? "USD"} · libero ${money(account.freeMargin)}`;
+  };
+
+  let lastNotifiedBlock: string | null = null;
+  const notifyBlock = (reason: string) => {
+    if (lastNotifiedBlock === reason) return;
+    lastNotifiedBlock = reason;
+    void sendTelegram(`\u26d4 SCALPER ${symbol()} · ingresso bloccato: ${reason}\n${balanceLine()}`);
+  };
+
   const workerDetail = () => ({
     symbol: symbol(),
     mode: `MetaApi WebSocket event-driven intrabar + max ${maxOpenPositions} same-direction positions`,
@@ -323,6 +337,12 @@ async function main() {
           WHERE source='scalper' AND mt5_position_id=$1`,
         [position.id, reason],
       );
+      const outcome = profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN";
+      void sendTelegram(
+        `${profit > 0 ? "\u2705" : profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${outcome} (${reason})`
+        + `\nprofitto ${money(profit)} · ${money(open)} \u2192 ${money(close)} · ${resultR >= 0 ? "+" : ""}${resultR}R`
+        + `\n${balanceLine()}`,
+      );
       return;
     }
 
@@ -393,6 +413,14 @@ async function main() {
       }
 
       await setSetting("stream_last_flatten", JSON.stringify({ at, closed, canceled, reason, failures }));
+      if (reason === "end_of_session") {
+        void sendTelegram(
+          `\u{1f514} SCALPER ${symbol()} · flatten fine sessione`
+          + `\nposizioni chiuse ${closed.length} · ordini cancellati ${canceled.length}`
+          + `${failures.length > 0 ? `\nerrori: ${failures.join(" | ")}` : ""}`
+          + `\n${balanceLine()}`,
+        );
+      }
       if (failures.length > 0) {
         const message = `Flatten ${reason} incompleto: ${failures.join(" | ")}`;
         await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`);
@@ -490,6 +518,10 @@ async function main() {
       });
 
       if (!reservation.ok) {
+        const blockedReason = "reason" in reservation ? String(reservation.reason ?? "") : "";
+        if (["max_trades_per_day", "max_daily_loss", "three_loss_cooldown", "loss_cooldown"].includes(blockedReason)) {
+          notifyBlock(blockedReason);
+        }
         latestDecision = {
           at: new Date().toISOString(),
           mode: "event_driven_intrabar_fast_preflight",
@@ -539,8 +571,18 @@ async function main() {
         );
       } else if (execution.status === "opened" || execution.status === "pending_position_link") {
         signalLockUntil = Date.now() + 5000;
+        lastNotifiedBlock = null;
+        void sendTelegram(
+          `\u{1f7e2} SCALPER ${symbol()} · apertura ${signal.direction}`
+          + `\nlotti ${activeLots} · entry ${money(signal.entry)} · SL ${money(signal.stopLoss)} · TP ${money(signal.takeProfit)}`
+          + `\nsetup ${signal.setup ?? "—"} · ${balanceLine()}`,
+        );
       } else if (execution.status === "error") {
         orderErrorUntil = Date.now() + 60_000;
+        void sendTelegram(
+          `\u26a0\ufe0f SCALPER ${symbol()} · errore ordine ${signal.direction}`
+          + `\n${"error" in execution ? String(execution.error) : "errore sconosciuto"}`,
+        );
       }
 
       latestDecision = {
@@ -583,6 +625,12 @@ async function main() {
     await markWorker("streaming", workerDetail());
   };
 
+  void sendTelegram(
+    `\u{1f680} SCALPER ${symbol()} · worker avviato`
+    + `\nlotti attivi ${activeLots} · autoExec ${autoExecEnabled() ? "ON" : "OFF"} · max ${maxOpenPositions} posizioni`
+    + `\n${balanceLine()}${stopped ? "\nSTOP TUTTO attivo" : ""}`,
+  );
+
   if (!stopped) {
     await subscribe();
   } else {
@@ -599,6 +647,8 @@ async function main() {
         if (nextStopped && !stopped) {
           stopped = true;
           ready = false;
+          lastNotifiedBlock = null;
+          void sendTelegram(`\u{1f6d1} SCALPER ${symbol()} · STOP TUTTO dalla dashboard: flatten posizioni e blocco nuove aperture.\n${balanceLine()}`);
           await flattenSymbol("system_stop", `system-stop-${Date.now()}`).catch(() => undefined);
           if (subscribed) {
             await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
@@ -611,6 +661,8 @@ async function main() {
           await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });
         } else if (!nextStopped && stopped) {
           stopped = false;
+          lastNotifiedBlock = null;
+          void sendTelegram(`\u{1f7e2} SCALPER ${symbol()} · sistema riattivato dalla dashboard · lotti ${activeLots}.\n${balanceLine()}`);
           await subscribe();
         } else {
           stopped = nextStopped;
@@ -658,6 +710,13 @@ async function main() {
     void syncStreamingExecutor(tradingConnection, { schemaReady: true, systemStopped: stopped })
       .then((result) => {
         if (result.closed > 0) signalLockUntil = 0;
+        for (const closure of result.closures ?? []) {
+          void sendTelegram(
+            `${closure.profit > 0 ? "\u2705" : closure.profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${closure.outcome} (SL/TP)`
+            + `\nprofitto ${money(closure.profit)} · ${money(closure.openPrice)} \u2192 ${money(closure.closePrice)} · ${closure.resultR >= 0 ? "+" : ""}${closure.resultR}R`
+            + `\n${balanceLine()}`,
+          );
+        }
       })
       .catch((error) => setSetting("stream_last_error", `${new Date().toISOString()} ${error instanceof Error ? error.message : String(error)}`))
       .finally(() => {

@@ -159,6 +159,19 @@ export function getSessionStatus(now = new Date(), config = sessionConfigFromEnv
   };
 }
 
+/**
+ * Inizio della sessione operativa corrente: ultima occorrenza dell'orario di
+ * apertura di SCALPER_HOURS_UTC. Con "22:00-20:30" la sessione va dalle 22:00
+ * alle 22:00 del giorno dopo. Senza fascia valida ricade sul giorno UTC.
+ */
+export function sessionWindowStart(now = new Date(), config = sessionConfigFromEnv()) {
+  const hours = parseSessionHours(config.hoursUtc);
+  const day = utcDayStart(now);
+  if (!hours) return day;
+  const candidate = atUtcMinutes(day, hours.start);
+  return candidate <= now ? candidate : new Date(candidate.getTime() - DAY_MS);
+}
+
 export function sessionAllowsEntry(now = new Date(), config = sessionConfigFromEnv()) {
   const status = getSessionStatus(now, config);
   return status.inside && !status.inFlattenWindow && !status.weekendClosed;
