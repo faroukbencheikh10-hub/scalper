@@ -25,6 +25,7 @@ export async function ensureSchema() {
       take_profit numeric,
       risk_reward numeric,
       reasoning text NOT NULL DEFAULT '',
+      quality_score integer,
       outcome text,
       result_r numeric,
       mt5_order_id text,
@@ -36,6 +37,7 @@ export async function ensureSchema() {
       created_at timestamptz NOT NULL DEFAULT now(),
       closed_at timestamptz
     );
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS quality_score integer;
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
     CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)
       WHERE outcome IS NULL AND direction IN ('BUY','SELL');
@@ -43,6 +45,26 @@ export async function ensureSchema() {
       WHERE outcome IS NOT NULL;
     CREATE INDEX IF NOT EXISTS scalper_signals_executed_today_idx ON scalper_signals(created_at DESC)
       WHERE mt5_order_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS scalper_signals_quality_score_idx ON scalper_signals(quality_score,closed_at DESC)
+      WHERE quality_score IS NOT NULL;
+
+    CREATE OR REPLACE FUNCTION capture_scalper_shadow_score() RETURNS trigger AS $$
+    DECLARE score_match text[];
+    BEGIN
+      score_match := regexp_match(COALESCE(NEW.reasoning,''), '\\[shadow-score:([0-9]{1,3})\\]');
+      IF score_match IS NULL THEN
+        NEW.quality_score := NULL;
+      ELSE
+        NEW.quality_score := LEAST(100,GREATEST(0,score_match[1]::int));
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    DROP TRIGGER IF EXISTS scalper_shadow_score_capture ON scalper_signals;
+    CREATE TRIGGER scalper_shadow_score_capture
+      BEFORE INSERT OR UPDATE OF reasoning ON scalper_signals
+      FOR EACH ROW EXECUTE FUNCTION capture_scalper_shadow_score();
 
     CREATE TABLE IF NOT EXISTS scalper_settings (
       key text PRIMARY KEY,
@@ -93,7 +115,7 @@ export async function ensureSchema() {
           result_r=NEW.result_r,
           opened_at=NEW.created_at,
           closed_at=COALESCE(NEW.closed_at,now()),
-          payload=jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome)
+          payload=jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score)
         WHERE source='scalper' AND mt5_position_id=NEW.mt5_position_id;
         IF NOT FOUND THEN
           INSERT INTO trades(
@@ -102,7 +124,7 @@ export async function ensureSchema() {
           ) VALUES (
             'scalper',NEW.id::text,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.mt5_open_price,
             NEW.mt5_close_price,NEW.mt5_profit,NEW.result_r,'normal',NEW.created_at,
-            COALESCE(NEW.closed_at,now()),jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome)
+            COALESCE(NEW.closed_at,now()),jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score)
           );
         END IF;
       END IF;
@@ -122,7 +144,7 @@ export async function ensureSchema() {
     SELECT
       'scalper',s.id::text,'XAUUSD',s.mt5_position_id,s.direction,s.mt5_open_price,s.mt5_close_price,
       s.mt5_profit,s.result_r,'normal',s.created_at,COALESCE(s.closed_at,now()),
-      jsonb_build_object('setup',s.setup,'outcome',s.outcome)
+      jsonb_build_object('setup',s.setup,'outcome',s.outcome,'qualityScore',s.quality_score)
     FROM scalper_signals s
     WHERE s.outcome IN ('WIN','LOSS','BREAKEVEN') AND s.mt5_position_id IS NOT NULL
       AND NOT EXISTS (
