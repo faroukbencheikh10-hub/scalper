@@ -52,7 +52,7 @@ export async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS trades (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       source text NOT NULL DEFAULT 'scalper',
-      signal_id uuid,
+      scalper_signal_id text,
       symbol text,
       mt5_position_id text,
       direction text,
@@ -66,7 +66,7 @@ export async function ensureSchema() {
       payload jsonb
     );
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS source text DEFAULT 'scalper';
-    ALTER TABLE trades ADD COLUMN IF NOT EXISTS signal_id uuid;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS scalper_signal_id text;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS symbol text;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS mt5_position_id text;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS direction text;
@@ -84,7 +84,7 @@ export async function ensureSchema() {
     BEGIN
       IF NEW.outcome IN ('WIN','LOSS','BREAKEVEN') AND NEW.mt5_position_id IS NOT NULL THEN
         UPDATE trades SET
-          signal_id=NEW.id,
+          scalper_signal_id=NEW.id::text,
           symbol='XAUUSD',
           direction=NEW.direction,
           open_price=NEW.mt5_open_price,
@@ -97,10 +97,10 @@ export async function ensureSchema() {
         WHERE source='scalper' AND mt5_position_id=NEW.mt5_position_id;
         IF NOT FOUND THEN
           INSERT INTO trades(
-            source,signal_id,symbol,mt5_position_id,direction,open_price,close_price,
+            source,scalper_signal_id,symbol,mt5_position_id,direction,open_price,close_price,
             profit,result_r,reason,opened_at,closed_at,payload
           ) VALUES (
-            'scalper',NEW.id,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.mt5_open_price,
+            'scalper',NEW.id::text,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.mt5_open_price,
             NEW.mt5_close_price,NEW.mt5_profit,NEW.result_r,'normal',NEW.created_at,
             COALESCE(NEW.closed_at,now()),jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome)
           );
@@ -116,11 +116,11 @@ export async function ensureSchema() {
       FOR EACH ROW EXECUTE FUNCTION sync_scalper_signal_trade();
 
     INSERT INTO trades(
-      source,signal_id,symbol,mt5_position_id,direction,open_price,close_price,
+      source,scalper_signal_id,symbol,mt5_position_id,direction,open_price,close_price,
       profit,result_r,reason,opened_at,closed_at,payload
     )
     SELECT
-      'scalper',s.id,'XAUUSD',s.mt5_position_id,s.direction,s.mt5_open_price,s.mt5_close_price,
+      'scalper',s.id::text,'XAUUSD',s.mt5_position_id,s.direction,s.mt5_open_price,s.mt5_close_price,
       s.mt5_profit,s.result_r,'normal',s.created_at,COALESCE(s.closed_at,now()),
       jsonb_build_object('setup',s.setup,'outcome',s.outcome)
     FROM scalper_signals s
