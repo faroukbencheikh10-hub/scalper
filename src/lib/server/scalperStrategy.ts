@@ -47,36 +47,8 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const fast1 = emaClose(m1, 9), slow1 = emaClose(m1, 20);
   if ([fast5, slow5, fast1, slow1].some(v => v === null)) return no("EMA non disponibili.");
   const lastM5Close = m5[m5.length - 1].close;
-
-  // La direzione M5 deve essere confermata anche dalla struttura veloce M1.
-  // Questo evita che un vecchio trend M5 rialzista blocchi automaticamente tutti i SELL locali, e viceversa.
-  const trendUp = lastM5Close > fast5! && fast5! > slow5! && fast1! > slow1!;
-  const trendDown = lastM5Close < fast5! && fast5! < slow5! && fast1! < slow1!;
-
-  // Filtro anti-accumulo: se il prezzo resta compresso e cambia direzione ripetutamente,
-  // niente nuovi ingressi finché non esce davvero dalla fascia recente.
-  const rangeBars = m1.slice(Math.max(0, m1.length - 12), m1.length - 2);
-  const rangeHigh = Math.max(...rangeBars.map(c => c.high));
-  const rangeLow = Math.min(...rangeBars.map(c => c.low));
-  const rangeWidth = rangeHigh - rangeLow;
-  const emaGap = Math.abs(fast1! - slow1!);
-  let flips = 0;
-  let previousSign = 0;
-  for (const candle of m1.slice(-9, -1)) {
-    const sign = Math.sign(candle.close - candle.open);
-    if (sign !== 0 && previousSign !== 0 && sign !== previousSign) flips++;
-    if (sign !== 0) previousSign = sign;
-  }
-  const compressed = rangeWidth <= atr1 * envN("SCALPER_RANGE_WIDTH_ATR", 2.8)
-    && emaGap <= atr1 * envN("SCALPER_EMA_COMPRESSION_ATR", 0.35);
-  const choppy = flips >= Math.floor(envN("SCALPER_RANGE_FLIPS", 4))
-    && rangeWidth <= atr1 * envN("SCALPER_CHOP_WIDTH_ATR", 3.5);
-  const breakoutBuffer = atr1 * envN("SCALPER_BREAKOUT_BUFFER_ATR", 0.12);
-  const breakoutUp = bullish(last) && last.close > rangeHigh + breakoutBuffer;
-  const breakoutDown = bearish(last) && last.close < rangeLow - breakoutBuffer;
-  if ((compressed || choppy) && !breakoutUp && !breakoutDown) {
-    return no(`Accumulo M1: range ${rangeWidth.toFixed(2)}$, gap EMA ${emaGap.toFixed(2)}$, inversioni ${flips}. Attendo uscita dalla fascia.`);
-  }
+  const trendUp = lastM5Close > fast5! && fast5! > slow5!;
+  const trendDown = lastM5Close < fast5! && fast5! < slow5!;
 
   let direction: "BUY" | "SELL" | null = null;
   let setup: "micro_pullback" | "liquidity_sweep" | null = null;
@@ -97,14 +69,12 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     if (sweepBuy) { direction = "BUY"; setup = "liquidity_sweep"; structureStop = prev.low - 0.25; }
     else if (sweepSell) { direction = "SELL"; setup = "liquidity_sweep"; structureStop = prev.high + 0.25; }
   }
-  if (!direction || !setup || structureStop == null) return no(`Nessun trigger scalper M1. Contesto M5/M1 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}.`);
+  if (!direction || !setup || structureStop == null) return no(`Nessun trigger scalper M1. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}.`);
 
   const entry = direction === "BUY" ? quote.ask : quote.bid;
   const rawRisk = Math.abs(entry - structureStop);
-  const minRisk = envN("SCALPER_MIN_RISK", 1.5), maxRisk = envN("SCALPER_MAX_RISK", 3);
-  const atrFloor = atr1 * envN("SCALPER_STOP_ATR_FLOOR", 0.65);
-  const structureCap = atr1 * envN("SCALPER_STRUCTURE_STOP_ATR_CAP", 1.5);
-  const risk = clamp(Math.max(Math.min(rawRisk, structureCap), atrFloor), minRisk, maxRisk);
+  const minRisk = envN("SCALPER_MIN_RISK", 2), maxRisk = envN("SCALPER_MAX_RISK", 5);
+  const risk = clamp(Math.max(rawRisk, atr1 * 0.9), minRisk, maxRisk);
   const stopLoss = direction === "BUY" ? entry - risk : entry + risk;
   const rr = envN("SCALPER_RR", 1.45);
   const takeProfit = direction === "BUY" ? entry + risk * rr : entry - risk * rr;
@@ -112,6 +82,6 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   return {
     direction, setup,
     entry: Number(entry.toFixed(2)), stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), riskReward: Number(rr.toFixed(2)),
-    reasoning: `${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5/M1 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$, range ${rangeWidth.toFixed(2)}$. Time-stop ${timeStopLabel()}.`
+    reasoning: `${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Time-stop ${timeStopLabel()}.`
   };
 }
