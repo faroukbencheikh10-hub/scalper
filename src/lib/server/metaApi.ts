@@ -1,4 +1,5 @@
 import type { Candle, Quote } from "@/lib/types";
+import { getSetting, setSetting } from "./db";
 
 const TIMEOUT_MS = 12_000;
 let confirmedRegion: string | null = null;
@@ -23,6 +24,29 @@ function marketBase(region: string) { return `https://mt-market-data-client-api-
 function mismatch(err: unknown) {
   const m = err instanceof Error ? err.message : String(err);
   return m.includes("ENOTFOUND") || m.includes("fetch failed") || (m.includes("404") && m.includes("not found"));
+}
+function historyRateLimit(err: unknown) {
+  const m = err instanceof Error ? err.message : String(err);
+  return m.includes("429") || m.includes("TooManyRequestsError") || m.includes("cpu credits per 6h");
+}
+function historyBackoffMinutes() {
+  const value = Number(process.env.SCALPER_HISTORY_BACKOFF_MIN);
+  return Number.isFinite(value) && value >= 1 ? value : 15;
+}
+async function activeHistoryBackoff() {
+  const raw = await getSetting("metaapi_history_backoff_until");
+  if (!raw) return null;
+  const until = Date.parse(raw);
+  return Number.isFinite(until) && until > Date.now() ? raw : null;
+}
+async function persistHistoryBackoff() {
+  const until = new Date(Date.now() + historyBackoffMinutes() * 60_000).toISOString();
+  const at = new Date().toISOString();
+  await Promise.all([
+    setSetting("metaapi_history_backoff_until", until),
+    setSetting("stream_last_error", `${at} MetaApi storico in pausa fino a ${until}: 429 getDealsByPosition`),
+  ]);
+  return until;
 }
 async function request(url: string, init?: RequestInit) {
   const controller = new AbortController();
@@ -94,10 +118,20 @@ export async function positions(): Promise<Position[]> {
   });
 }
 export async function deals(positionId: string): Promise<Deal[]> {
-  return withRegion(async region => {
-    const d = await request(`${clientBase(region)}/users/current/accounts/${accountId()}/history-deals/position/${encodeURIComponent(positionId)}`);
-    return Array.isArray(d) ? d as Deal[] : [];
-  });
+  const pausedUntil = await activeHistoryBackoff();
+  if (pausedUntil) throw new Error(`MetaApi history backoff active until ${pausedUntil}`);
+  try {
+    return await withRegion(async region => {
+      const d = await request(`${clientBase(region)}/users/current/accounts/${accountId()}/history-deals/position/${encodeURIComponent(positionId)}`);
+      return Array.isArray(d) ? d as Deal[] : [];
+    });
+  } catch (error) {
+    if (historyRateLimit(error)) {
+      const until = await persistHistoryBackoff();
+      throw new Error(`MetaApi history backoff active until ${until}`);
+    }
+    throw error;
+  }
 }
 function ok(r: TradeResponse) {
   return [10008,10009,10010].includes(Number(r.numericCode)) || ["TRADE_RETCODE_PLACED","TRADE_RETCODE_DONE","TRADE_RETCODE_DONE_PARTIAL"].includes(r.stringCode ?? "");
