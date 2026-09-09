@@ -9,6 +9,7 @@ type StreamPosition = {
   openPrice: number;
   volume?: number;
   clientId?: string;
+  type?: string;
 };
 
 type StreamTerminalState = {
@@ -42,6 +43,7 @@ type ReserveSignalInput = {
   takeProfit: number;
   riskReward: number;
   reasoning: string;
+  openPositionCount: number;
 };
 
 const timeStopRequested = new Set<string>();
@@ -49,6 +51,17 @@ const timeStopRequested = new Set<string>();
 function envN(name: string, fallback: number, min = 0) {
   const value = Number(process.env[name]);
   return Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+function maxOpenPositions() {
+  return Math.min(3, Math.max(1, Math.floor(envN("SCALPER_MAX_OPEN_POSITIONS", 3, 1))));
+}
+
+function positionDirection(position: StreamPosition): "BUY" | "SELL" | null {
+  const type = String(position.type ?? "").toUpperCase();
+  if (type.includes("BUY")) return "BUY";
+  if (type.includes("SELL")) return "SELL";
+  return null;
 }
 
 function shortClientId() {
@@ -90,6 +103,11 @@ async function limits() {
 }
 
 export async function reserveStreamingSignal(input: ReserveSignalInput) {
+  const positionLimit = maxOpenPositions();
+  if (input.openPositionCount >= positionLimit) {
+    return { ok: false as const, status: "blocked" as const, reason: "max_open_positions" };
+  }
+
   const start = new Date();
   start.setUTCHours(0, 0, 0, 0);
   const maxTrades = envN("MAX_TRADES_PER_DAY", 12, 1);
@@ -123,14 +141,16 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      control AS (
        SELECT COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
               (SELECT id::text FROM scalper_signals
-                WHERE outcome IS NULL AND direction IN ('BUY','SELL')
-                ORDER BY created_at DESC LIMIT 1) AS active_signal_id
+                WHERE created_at >= date_trunc('minute', now())
+                  AND direction IN ('BUY','SELL')
+                  AND COALESCE(outcome,'') NOT IN ('ERROR','SKIPPED')
+                ORDER BY created_at DESC LIMIT 1) AS same_minute_signal_id
          FROM lock
      ),
      decision AS (
        SELECT CASE
          WHEN control.stopped THEN 'system_stopped'
-         WHEN control.active_signal_id IS NOT NULL THEN 'blocked_existing_signal'
+         WHEN control.same_minute_signal_id IS NOT NULL THEN 'same_minute_signal'
          WHEN daily.trades >= $8::int THEN 'max_trades_per_day'
          WHEN daily.profit <= -$9::float8 THEN 'max_daily_loss'
          WHEN recent_summary.recent_losses >= 3
@@ -150,7 +170,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
        SELECT $1,$2,$3,$4,$5,$6,$7 FROM decision WHERE reason IS NULL
        RETURNING id::text AS id
      )
-     SELECT decision.reason, inserted.id, control.active_signal_id
+     SELECT decision.reason, inserted.id, control.same_minute_signal_id
        FROM decision CROSS JOIN control
        LEFT JOIN inserted ON true`,
     [
@@ -172,13 +192,6 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
   const row = result.rows[0];
   const reason = row?.reason ? String(row.reason) : null;
   if (reason === "system_stopped") return { ok: false as const, status: "system_stopped" as const };
-  if (reason === "blocked_existing_signal") {
-    return {
-      ok: false as const,
-      status: "blocked_existing_signal" as const,
-      signalId: row?.active_signal_id ? String(row.active_signal_id) : null,
-    };
-  }
   if (reason) return { ok: false as const, status: "blocked" as const, reason };
   if (!row?.id) return { ok: false as const, status: "blocked" as const, reason: "reservation_failed" };
   return { ok: true as const, signalId: String(row.id) };
@@ -268,29 +281,35 @@ export async function executeStreaming(
     if (sync.stopped) return { status: "system_stopped" as const };
   }
 
-  const existing = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol());
-  if (existing) return { status: "blocked_existing_position" as const, positionId: existing.id };
+  const openPositions = (connection.terminalState.positions ?? []).filter((p) => p.symbol === symbol());
+  const positionLimit = maxOpenPositions();
+  if (openPositions.length >= positionLimit) {
+    return { status: "blocked_position_limit" as const, openPositions: openPositions.length, limit: positionLimit };
+  }
+
+  if (openPositions.length > 0) {
+    const directions = openPositions.map(positionDirection);
+    if (directions.some((value) => value === null)) {
+      return { status: "blocked_unknown_position_direction" as const };
+    }
+    if (directions.some((value) => value !== direction)) {
+      return { status: "blocked_opposite_position" as const, direction };
+    }
+  }
 
   if (!options.preflightDone) {
     const [lim, control] = await Promise.all([
       limits(),
       dbQuery(
-        `SELECT
-           COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped,
-           (SELECT id FROM scalper_signals
-              WHERE outcome IS NULL AND direction IN ('BUY','SELL') AND id<>$1
-              ORDER BY created_at DESC LIMIT 1) AS active_signal_id`,
-        [signalId],
+        `SELECT COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped`,
       ),
     ]);
 
     if (control.rows[0]?.stopped === true) return { status: "system_stopped" as const };
-    if (control.rows[0]?.active_signal_id) {
-      return { status: "blocked_existing_signal" as const, signalId: String(control.rows[0].active_signal_id) };
-    }
     if (!lim.ok) return { status: "blocked" as const, reason: lim.reason };
   }
 
+  const positionIdsBeforeOrder = new Set(openPositions.map((position) => position.id));
   const orderClientId = shortClientId();
   const orderLots = lots();
   await dbQuery(`UPDATE scalper_signals SET client_id=$2 WHERE id=$1`, [signalId, orderClientId]);
@@ -300,6 +319,8 @@ export async function executeStreaming(
     lots: orderLots,
     sl: stopLoss,
     tp: takeProfit,
+    openPositions: openPositions.length,
+    positionLimit,
   });
 
   let result: Record<string, unknown>;
@@ -336,7 +357,11 @@ export async function executeStreaming(
   }
 
   for (let i = 0; i < 20; i++) {
-    const position = (connection.terminalState.positions ?? []).find((p) => p.symbol === symbol() && (!p.clientId || p.clientId === orderClientId));
+    const position = (connection.terminalState.positions ?? []).find((p) =>
+      p.symbol === symbol()
+      && !positionIdsBeforeOrder.has(p.id)
+      && (!p.clientId || p.clientId === orderClientId),
+    );
     if (position) {
       await dbQuery(
         `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3 WHERE id=$1`,

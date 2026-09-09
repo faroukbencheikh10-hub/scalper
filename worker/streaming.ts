@@ -115,6 +115,13 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function positionDirection(position: ManagedPosition): "BUY" | "SELL" | null {
+  const type = String(position.type ?? "").toUpperCase();
+  if (type.includes("BUY")) return "BUY";
+  if (type.includes("SELL")) return "SELL";
+  return null;
+}
+
 function assertTradeAccepted(result: Record<string, unknown>, label: string) {
   const numericCode = Number(result.numericCode);
   const stringCode = typeof result.stringCode === "string"
@@ -166,6 +173,7 @@ async function main() {
   const syncMs = envInt("SCALPER_STREAM_SYNC_MS", 250, 100, 30_000);
   const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
   const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
+  const maxOpenPositions = envInt("SCALPER_MAX_OPEN_POSITIONS", 3, 1, 3);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -197,8 +205,10 @@ async function main() {
 
   const workerDetail = () => ({
     symbol: symbol(),
-    mode: "MetaApi WebSocket event-driven intrabar + single DB preflight",
+    mode: "MetaApi WebSocket event-driven intrabar + max 3 same-direction positions",
     autoExec: autoExecEnabled(),
+    openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
+    maxOpenPositions,
     m1: m1.length,
     m5: m5.length,
     hoursUtc: sessionConfig.hoursUtc,
@@ -384,8 +394,12 @@ async function main() {
     if (m1.length < 35 || m5.length < 30) return;
     if (decisionBusy || Date.now() < signalLockUntil || Date.now() < orderErrorUntil || flattenBusy) return;
 
-    const existing = (tradingConnection.terminalState.positions ?? []).find((position) => position.symbol === symbol());
-    if (existing) return;
+    const openPositions = (tradingConnection.terminalState.positions ?? [])
+      .filter((position) => position.symbol === symbol()) as ManagedPosition[];
+    if (openPositions.length >= maxOpenPositions) {
+      latestDecision = noTradeDecision(`Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`, quote);
+      return;
+    }
 
     const signal = evaluateScalper({ quote, m1, m5 });
     latestDecision = {
@@ -398,6 +412,18 @@ async function main() {
     };
 
     if (signal.direction === "NO_TRADE") return;
+
+    if (openPositions.length > 0) {
+      const directions = openPositions.map(positionDirection);
+      if (directions.some((direction) => direction === null)) {
+        latestDecision = noTradeDecision("Direzione di una posizione XAUUSD aperta non leggibile: nuovo ingresso bloccato per sicurezza.", quote);
+        return;
+      }
+      if (directions.some((direction) => direction !== signal.direction)) {
+        latestDecision = noTradeDecision(`Posizioni XAUUSD già aperte in direzione opposta a ${signal.direction}.`, quote);
+        return;
+      }
+    }
 
     if (!autoExecEnabled()) {
       latestPreview = { at: new Date().toISOString(), ...signal };
@@ -420,6 +446,7 @@ async function main() {
         takeProfit: signal.takeProfit!,
         riskReward: signal.riskReward!,
         reasoning: signal.reasoning,
+        openPositionCount: openPositions.length,
       });
 
       if (!reservation.ok) {
@@ -455,7 +482,15 @@ async function main() {
         { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true },
       );
 
-      if (["blocked", "blocked_existing_position", "blocked_existing_signal", "system_stopped"].includes(execution.status)) {
+      if ([
+        "blocked",
+        "blocked_existing_position",
+        "blocked_existing_signal",
+        "blocked_position_limit",
+        "blocked_opposite_position",
+        "blocked_unknown_position_direction",
+        "system_stopped",
+      ].includes(execution.status)) {
         const reason = "reason" in execution ? String(execution.reason ?? "") : "";
         await dbQuery(
           `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
