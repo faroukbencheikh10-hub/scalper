@@ -8,7 +8,8 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "worker": "tsx worker/streaming.ts",
-    "watchdog": "tsx worker/watchdog.ts"
+    "watchdog": "tsx worker/watchdog.ts",
+    "scenarios": "tsx scripts/strategy-scenarios.ts"
   },
   "dependencies": {
     "metaapi.cloud-sdk": "^29.3.3",

@@ -17,11 +17,30 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 - M5: contesto immediato, non piu' un muro (vedi gate sotto).
 - Setup, in ordine di priorita' a ogni tick: `liquidity_sweep` → `momentum_breakout` → `breakout_retest` → `micro_pullback` → NO_TRADE. Vince il primo valido; un solo ordine per tick.
 - Storico iniziale: 500 M1 e 300 M5, configurabile fino a 1000.
-- Stop dinamico 2–5 USD, TP con lo stesso R:R (1.45R di default) per tutti i setup.
+- Stop dimensionato sull'ATR M1 (vedi sotto), TP sempre proporzionale allo stop.
 - **Una sola posizione XAUUSD aperta alla volta** (`SCALPER_MAX_OPEN_POSITIONS=1`).
 - Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive; pausa re-entry 120 s.
 - **Blocchi dopo una perdita a scadenza**: la direzione appena chiusa in perdita resta ferma `LOSS_LOCK_MINUTES`; dopo `CONSEC_LOSS_COUNT` perdite consecutive nella sessione si ferma tutto per `CONSEC_LOSS_PAUSE_MINUTES`. Il fermo per l'intera sessione resta solo nei limiti giornalieri (`MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS`).
 - Spread massimo, ATR minimo/massimo e SL controllato restano **invariati**.
+
+### SL e TP
+
+Lo stop non viene più preso dal rumore: la distanza è il **massimo** fra tre valori, e non viene mai stretta per rientrare in un limite.
+
+```
+distanza SL = max( struttura del setup , SL_ATR_MULT × ATR M1 , SL_MIN_USD )
+distanza TP = distanza SL × TP_RR
+```
+
+- Se la distanza richiesta supera `SL_MAX_USD` il trade viene **scartato** con motivo "SL troppo ampio" (il setup scelto compare come `rejected` nel log del tick), invece di essere strizzato su un livello che il rumore raggiunge subito.
+- Non esiste più alcun TP fisso in dollari né il vecchio clamp `SCALPER_MIN_RISK`/`SCALPER_MAX_RISK`, e `SCALPER_RR` non viene più letto: il rapporto è `TP_RR`.
+- Il piano finisce in `stream_last_decision` e nel log `[scalper-worker] order_plan`: struttura, quota ATR, distanza applicata, distanza TP e R:R.
+
+### Rischio per ordine
+
+Prima di ogni invio il worker calcola il rischio dell'ordine come `distanza SL × lotti × 100` (once per lotto). Se supera `RISK_MAX_PCT` del saldo, i lotti dell'ordine scendono a `RISK_FALLBACK_LOTS` (0.01): la size scelta in dashboard non viene sovrascritta, la riduzione vale solo per quell'ordine ed è segnalata come `lotsCapped`.
+
+Il rischio calcolato compare nel log `order_plan`, in `stream_last_decision.risk`, sulla dashboard (righe *SL / TP ultimo ordine* e *Rischio ultimo ordine*) e nel messaggio Telegram di apertura. L'importo è nominale in valuta del conto: non viene applicata alcuna conversione FX fra il dollaro della quotazione XAUUSD e l'euro del conto.
 
 ### Gate M5 e direzionalità M1
 
@@ -61,6 +80,10 @@ Dopo ogni ordine inviato: stessa direzione bloccata per `DUP_COOLDOWN_S` secondi
 | `RANGE_ATR_MULT` | 1.5 | Ampiezza massima (in ATR M1) del range sporco |
 | `RANGE_LOOKBACK` | 12 | Candele su cui si misura l'ampiezza |
 | `EMA_SLOPE_BARS` / `EMA_FLAT_SLOPE_ATR` | 5 / 0.12 | Soglia di pendenza per considerare piatte le EMA M1 |
+| `SL_ATR_MULT` | 1.3 | Quota ATR M1 della distanza di stop |
+| `SL_MIN_USD` / `SL_MAX_USD` | 3.0 / 8.0 | Distanza SL minima e massima; oltre il massimo il trade viene scartato |
+| `TP_RR` | 1.5 | Rapporto TP/SL |
+| `RISK_MAX_PCT` / `RISK_FALLBACK_LOTS` | 6 / 0.01 | Rischio massimo per ordine in % del saldo e lotti di ripiego |
 | `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
 | `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
 | `SCALPER_MAX_OPEN_POSITIONS` | 1 | Posizioni XAUUSD aperte contemporaneamente |
@@ -144,6 +167,10 @@ Lo stato è persistente nel database. Quando STOP TUTTO è attivo:
 - la dashboard mostra STOP.
 
 Le posizioni già aperte non vengono liquidate dal kill switch e mantengono SL/TP già presenti sul broker.
+
+## Scenari sintetici
+
+`npm run scenarios` esegue `scripts/strategy-scenarios.ts`: costruisce serie M1/M5 sintetiche e verifica priorità dei setup, gate M5, anti-accumulo, breakout retest e dimensionamento SL/TP (compresi i casi "SL strutturale sotto ATR" e "SL oltre il massimo"). Non tocca MetaApi né il database.
 
 ## Avvio web
 

@@ -1,6 +1,6 @@
 import type { Candle, Quote, ScalperSetup, ScalperSignal, SetupEvaluation } from "@/lib/types";
 import { setupLabel } from "@/lib/setups";
-import { atr, clamp, emaClose, emaCloseSeries } from "./indicators";
+import { atr, emaClose, emaCloseSeries } from "./indicators";
 
 function envN(name: string, fallback: number) {
   const v = Number(process.env[name]);
@@ -12,7 +12,7 @@ function envI(name: string, fallback: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.floor(v)));
 }
 function no(reasoning: string, evaluations: SetupEvaluation[] = []): ScalperSignal {
-  return { direction: "NO_TRADE", entry: null, stopLoss: null, takeProfit: null, riskReward: null, setup: null, reasoning, evaluations };
+  return { direction: "NO_TRADE", entry: null, stopLoss: null, takeProfit: null, riskReward: null, setup: null, slPlan: null, reasoning, evaluations };
 }
 /** Blocco dei filtri di protezione a monte: nessun setup viene nemmeno valutato. */
 function blockedByFilter(reason: string): SetupEvaluation[] {
@@ -328,12 +328,36 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
 
   const { direction, setup, structureStop } = chosen;
   const entry = direction === "BUY" ? quote.ask : quote.bid;
-  const rawRisk = Math.abs(entry - structureStop);
-  const minRisk = envN("SCALPER_MIN_RISK", 2), maxRisk = envN("SCALPER_MAX_RISK", 5);
-  const risk = clamp(Math.max(rawRisk, atr1 * 0.9), minRisk, maxRisk);
+
+  // --- Stop dimensionato sull'ATR, mai stretto per rientrare nel massimo. ---
+  // La distanza e' il massimo fra struttura del setup, SL_ATR_MULT * ATR M1 e SL_MIN_USD:
+  // se il risultato supera SL_MAX_USD il trade viene scartato invece di essere stretto sul rumore.
+  const structuralRisk = Math.abs(entry - structureStop);
+  const slAtrMult = envN("SL_ATR_MULT", 1.3);
+  const slMinUsd = envN("SL_MIN_USD", 3);
+  const slMaxUsd = envN("SL_MAX_USD", 8);
+  const atrRisk = atr1 * slAtrMult;
+  const risk = Math.max(structuralRisk, atrRisk, slMinUsd);
+  const rr = envN("TP_RR", 1.5);
+  if (risk > slMaxUsd) {
+    const detail = `SL troppo ampio: servono ${risk.toFixed(2)}$ (struttura ${structuralRisk.toFixed(2)}$, ATR ${atrRisk.toFixed(2)}$, minimo ${slMinUsd.toFixed(2)}$)`
+      + ` sopra il massimo ${slMaxUsd.toFixed(2)}$`;
+    const chosenIndex = evaluations.findIndex((item) => item.setup === setup && item.status === "triggered");
+    if (chosenIndex >= 0) {
+      evaluations[chosenIndex] = { ...evaluations[chosenIndex], status: "rejected", reason: `${evaluations[chosenIndex].reason} — ${detail}` };
+    }
+    return no(`${detail}. Setup ${setup} ${direction} scartato.`, evaluations);
+  }
   const stopLoss = direction === "BUY" ? entry - risk : entry + risk;
-  const rr = envN("SCALPER_RR", 1.45);
   const takeProfit = direction === "BUY" ? entry + risk * rr : entry - risk * rr;
+  const slPlan = {
+    structural: Number(structuralRisk.toFixed(2)),
+    atr: Number(atrRisk.toFixed(2)),
+    applied: Number(risk.toFixed(2)),
+    minUsd: slMinUsd,
+    maxUsd: slMaxUsd,
+    rr,
+  };
 
   // Shadow score 0-100: viene registrato ma NON blocca mai un trade.
   const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
@@ -351,9 +375,9 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const atrScore = atr1 >= 1.2 && atr1 <= 3.5 ? 10 : atr1 >= 1.0 && atr1 <= 4.5 ? 8 : 5;
   const spreadRatio = maxSpread > 0 ? quote.spread / maxSpread : 1;
   const spreadScore = spreadRatio <= 0.35 ? 10 : spreadRatio <= 0.6 ? 8 : spreadRatio <= 0.8 ? 6 : 4;
-  const structureScore = rawRisk >= minRisk && rawRisk <= maxRisk
+  const structureScore = structuralRisk >= atrRisk
     ? 10
-    : rawRisk >= atr1 * 0.9 && rawRisk <= maxRisk * 1.25 ? 8 : 5;
+    : structuralRisk >= atrRisk * 0.6 ? 8 : 5;
   const candleScore = lastBody >= 0.65 ? 10 : lastBody >= 0.45 ? 8 : lastBody >= 0.3 ? 6 : 4;
   const qualityScore = Math.min(100, Math.max(0,
     trendScore + triggerScore + accumulationScore + atrScore + spreadScore + structureScore + candleScore,
@@ -361,9 +385,11 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   const scoreBreakdown = `trend ${trendScore}, trigger ${triggerScore}, accumulo ${accumulationScore}, ATR ${atrScore}, spread ${spreadScore}, SL ${structureScore}, candela ${candleScore}`;
 
   return {
-    direction, setup,
+    direction, setup, slPlan,
     entry: Number(entry.toFixed(2)), stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), riskReward: Number(rr.toFixed(2)),
     evaluations,
-    reasoning: `${setupLabel(setup)} M1 ${direction}. Contesto M5 ${m5Label}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
+    reasoning: `${setupLabel(setup)} M1 ${direction}. Contesto M5 ${m5Label}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$.`
+      + ` SL ${risk.toFixed(2)}$ (struttura ${structuralRisk.toFixed(2)}$, ATR x${slAtrMult} ${atrRisk.toFixed(2)}$), TP ${(risk * rr).toFixed(2)}$ a ${rr}R.`
+      + ` Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
   };
 }

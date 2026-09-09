@@ -27,6 +27,19 @@ export type SetupEvaluation = {
   reason: string;
 };
 
+/** Come e' stata costruita la distanza di stop del segnale. */
+export type ScalperSlPlan = {
+  /** Distanza SL richiesta dalla struttura del setup. */
+  structural: number;
+  /** Distanza SL richiesta dall'ATR M1 (SL_ATR_MULT * ATR). */
+  atr: number;
+  /** Distanza SL effettivamente applicata. */
+  applied: number;
+  minUsd: number;
+  maxUsd: number;
+  rr: number;
+};
+
 export type ScalperSignal = {
   direction: Direction;
   entry: number | null;
@@ -34,6 +47,7 @@ export type ScalperSignal = {
   takeProfit: number | null;
   riskReward: number | null;
   setup: ScalperSetup | null;
+  slPlan: ScalperSlPlan | null;
   reasoning: string;
   /** Elenco completo dei setup valutati nel tick, con il motivo dello scarto. */
   evaluations: SetupEvaluation[];

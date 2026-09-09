@@ -7,7 +7,8 @@ import { setupLabel } from "@/lib/setups";
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
-type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[] };
+type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
+type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[]; risk?: RiskPlan | null };
 type StreamError = { message: string; at: string | null };
 type Flatten = { at?: string; closed?: string[]; canceled?: string[]; reason?: string; failures?: string[] };
 type Signal = { direction?: string; setup?: string | null; reasoning?: string; mt5_position_id?: string | null; entry?: number | string | null; stop_loss?: number | string | null };
@@ -148,6 +149,13 @@ export default function Home() {
     ? lossLocked.map((item) => `${item} fino ${formatHourMinute(lossLockUntil[item], "UTC")} UTC`).join(" · ")
     : "nessuno";
   const lossPauseText = lossPauseUntil ? `fino ${formatHourMinute(lossPauseUntil, "UTC")} UTC` : "no";
+  const risk = decision?.risk ?? null;
+  const riskText = risk && Number.isFinite(risk.risk)
+    ? `${money(Number(risk.risk))} ${risk.currency ?? "EUR"}${Number.isFinite(risk.riskPct) ? ` · ${money(Number(risk.riskPct))}% del saldo` : ""}${risk.lotsCapped ? ` · lotti ridotti a ${risk.lots}` : ""}`
+    : "—";
+  const slTpText = risk && Number.isFinite(risk.slDistance)
+    ? `SL ${money(Number(risk.slDistance))}$ · TP ${money(Number(risk.tpDistance))}$${Number.isFinite(risk.riskReward) ? ` (${risk.riskReward}R)` : ""}`
+    : "—";
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
   const lastResult = results?.last;
@@ -257,6 +265,8 @@ export default function Home() {
             <div><dt>Margine libero</dt><dd>{money(Number(account?.freeMargin ?? Number.NaN))}</dd></div>
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
+            <div><dt>SL / TP ultimo ordine</dt><dd className="mt5-value">{slTpText}</dd></div>
+            <div><dt>Rischio ultimo ordine</dt><dd className={`mt5-value${risk?.overCap ? " negative" : ""}`}>{riskText}</dd></div>
             <div><dt>Re-entry bloccato</dt><dd className="mt5-value">{lossLockText}</dd></div>
             <div><dt>Pausa perdite</dt><dd className="mt5-value">{lossPauseText}</dd></div>
             <div><dt>Posizione</dt><dd className="mt5-value">{data?.systemStopped ? "flatten + STOP" : last?.mt5_position_id ? "aperta" : "nessuna"}</dd></div>

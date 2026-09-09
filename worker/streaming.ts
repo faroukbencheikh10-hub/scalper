@@ -1,7 +1,7 @@
 import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
-import { autoExecEnabled, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
-import { EXEC_LOTS_SETTING_KEY } from "../src/lib/lots";
+import { autoExecEnabled, clampLots, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
+import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
@@ -14,6 +14,11 @@ function required(name: string) {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} non impostata`);
   return value;
+}
+
+function envNum(name: string, fallback: number) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
 }
 
 function envInt(name: string, fallback: number, min: number, max: number) {
@@ -191,6 +196,9 @@ async function main() {
   const lossLockMs = envInt("LOSS_LOCK_MINUTES", 30, 0, 1440) * 60_000;
   const consecLossPauseMs = envInt("CONSEC_LOSS_PAUSE_MINUTES", 120, 0, 1440) * 60_000;
   const consecLossCount = envInt("CONSEC_LOSS_COUNT", 3, 2, 10);
+  // Rischio massimo per ordine in percentuale del saldo: oltre la soglia si scende ai lotti minimi.
+  const riskMaxPct = envNum("RISK_MAX_PCT", 6);
+  const riskFallbackLots = envNum("RISK_FALLBACK_LOTS", 0.01);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -702,13 +710,52 @@ async function main() {
         return;
       }
 
+      // Rischio dell'ordine: distanza SL * lotti * 100 once. Sopra RISK_MAX_PCT del saldo
+      // si scende ai lotti minimi invece di inviare l'ordine con la size scelta in dashboard.
+      const account = accountSnapshot();
+      const balance = Number(account?.balance);
+      const slDistance = Math.abs(signal.entry! - signal.stopLoss!);
+      const riskCap = Number.isFinite(balance) && balance > 0 ? (balance * riskMaxPct) / 100 : null;
+      let orderLots = activeLots;
+      let lotsCapped = false;
+      if (riskCap !== null && lossAtStop(orderLots, slDistance) > riskCap) {
+        const reduced = clampLots(riskFallbackLots);
+        lotsCapped = reduced !== orderLots;
+        orderLots = reduced;
+      }
+      const riskMoney = lossAtStop(orderLots, slDistance);
+      const riskPct = riskCap !== null ? (riskMoney / balance) * 100 : null;
+      const riskPlan = {
+        lots: orderLots,
+        requestedLots: activeLots,
+        lotsCapped,
+        slDistance: Number(slDistance.toFixed(2)),
+        tpDistance: Number(Math.abs(signal.takeProfit! - signal.entry!).toFixed(2)),
+        riskReward: signal.riskReward,
+        risk: Number(riskMoney.toFixed(2)),
+        riskPct: riskPct === null ? null : Number(riskPct.toFixed(2)),
+        riskMaxPct,
+        currency: account?.currency ?? null,
+        overCap: riskCap !== null && riskMoney > riskCap,
+        slPlan: signal.slPlan,
+      };
+      console.log("[scalper-worker] order_plan", JSON.stringify({
+        signalId,
+        setup: signal.setup,
+        direction: signal.direction,
+        entry: signal.entry,
+        stopLoss: signal.stopLoss,
+        takeProfit: signal.takeProfit,
+        ...riskPlan,
+      }));
+
       const execution = await executeStreaming(
         signalId,
         signal.direction,
         signal.stopLoss!,
         signal.takeProfit!,
         tradingConnection,
-        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: activeLots, price: quote.mid },
+        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: quote.mid },
       );
 
       if ([
@@ -736,7 +783,10 @@ async function main() {
         lastNotifiedBlock = null;
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${signal.direction}`
-          + `\nlotti ${activeLots} · entry ${money(signal.entry)} · SL ${money(signal.stopLoss)} · TP ${money(signal.takeProfit)}`
+          + `\nlotti ${orderLots}${lotsCapped ? ` (ridotti da ${activeLots} per il cap rischio)` : ""}`
+          + ` · entry ${money(signal.entry)} · SL ${money(signal.stopLoss)} · TP ${money(signal.takeProfit)}`
+          + `\nSL ${money(riskPlan.slDistance)}$ · TP ${money(riskPlan.tpDistance)}$ a ${signal.riskReward}R`
+          + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `\nsetup ${setupLabel(signal.setup)} (${signal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error") {
@@ -756,6 +806,7 @@ async function main() {
         reasoning: signal.reasoning,
         quote,
         evaluations: signal.evaluations,
+        risk: riskPlan,
         execution,
       };
     } catch (error) {
