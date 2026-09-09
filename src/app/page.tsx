@@ -2,15 +2,17 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { SystemControl } from "@/components/system-control";
+import { setupLabel } from "@/lib/setups";
 
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
-type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string };
+type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
+type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[] };
 type StreamError = { message: string; at: string | null };
 type Flatten = { at?: string; closed?: string[]; canceled?: string[]; reason?: string; failures?: string[] };
-type Signal = { direction?: string; reasoning?: string; mt5_position_id?: string | null; entry?: number | string | null; stop_loss?: number | string | null };
+type Signal = { direction?: string; setup?: string | null; reasoning?: string; mt5_position_id?: string | null; entry?: number | string | null; stop_loss?: number | string | null };
 type Account = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
-type ResultItem = { outcome?: string; mt5_profit?: number | string | null; result_r?: number | string | null };
+type ResultItem = { outcome?: string; setup?: string | null; mt5_profit?: number | string | null; result_r?: number | string | null };
 
 type DashboardState = {
   ok: boolean;
@@ -93,6 +95,11 @@ function money(value: number | undefined) {
   return Number.isFinite(value) ? value!.toFixed(2) : "—";
 }
 
+function shorten(value: string | undefined | null, max = 180) {
+  if (!value) return "";
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
 function currentState(data: DashboardState | null, now: number): OperationalState {
   if (!data) return "OFFLINE";
   if (data.systemStopped) return "STOP";
@@ -132,6 +139,8 @@ export default function Home() {
   const decision = data?.stream?.lastDecision;
   const last = data?.signals?.[0];
   const direction = decision?.direction ?? last?.direction ?? "NO_TRADE";
+  const decisionSetup = decision?.setup ?? null;
+  const evaluations = decision?.evaluations ?? [];
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
   const lastResult = results?.last;
@@ -181,7 +190,7 @@ export default function Home() {
           <div className="status-kicker" style={{ color: style.color }}><span className="status-dot" aria-hidden="true" style={{ animation: status === "LIVE" ? undefined : "none" }} />{status === "WAITING" ? "IN ATTESA / SESSION GUARD" : status}</div>
           <h1>{status === "LIVE" ? "Scalper LIVE" : status === "WAITING" ? "Entrate in attesa" : status === "STOP" ? "Scalper in STOP" : "Worker offline"}</h1>
           <p>{statusDescription}</p>
-          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong> — {decision.reasoning || "nessun dettaglio"}</> : null}</p>
+          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong>{decisionSetup ? <> · setup <strong>{setupLabel(decisionSetup)}</strong></> : null} — {shorten(decision.reasoning) || "nessun dettaglio"}</> : null}</p>
         </div>
         <div className="state-badge" style={{ color: style.color, background: style.background, borderColor: style.border }}>{status === "LIVE" ? "● LIVE" : style.label}</div>
       </section>
@@ -229,6 +238,7 @@ export default function Home() {
           <div className="card-heading"><div><span className="card-index">02</span><h3>Ultima decisione</h3></div><span className="signal-glyph">↗</span></div>
           <div className="dir signal-direction" data-direction={direction}>{direction}</div>
           <p>{decision?.reasoning ?? "In attesa della prima decisione."}</p>
+          <p className="heartbeat">Setup usato <span>{setupLabel(decisionSetup)}</span></p>
           <p className="heartbeat">Decisione <span>{formatTime(decision?.at)}</span></p>
         </article>
 
@@ -239,6 +249,7 @@ export default function Home() {
             <div><dt>Lotti</dt><dd>{Number.isFinite(data?.lots) ? Number(data?.lots).toFixed(2) : "—"}</dd></div>
             <div><dt>Margine libero</dt><dd>{money(Number(account?.freeMargin ?? Number.NaN))}</dd></div>
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
+            <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
             <div><dt>Posizione</dt><dd className="mt5-value">{data?.systemStopped ? "flatten + STOP" : last?.mt5_position_id ? "aperta" : "nessuna"}</dd></div>
           </dl>
         </article>
@@ -248,7 +259,7 @@ export default function Home() {
           <dl className="rules">
             <div><dt>Trade chiusi</dt><dd>{results?.total ?? 0}</dd></div><div><dt>WIN</dt><dd className="positive">{results?.wins ?? 0}</dd></div><div><dt>LOSS</dt><dd className="negative">{results?.losses ?? 0}</dd></div><div><dt>Win rate</dt><dd>{Number(results?.winRate ?? 0).toFixed(1)}%</dd></div><div><dt>Profitto totale</dt><dd className={totalProfit > 0 ? "positive" : totalProfit < 0 ? "negative" : ""}>{totalProfit >= 0 ? "+" : ""}{totalProfit.toFixed(2)}</dd></div>
           </dl>
-          <p className="heartbeat">Breakeven <span>{results?.breakeven ?? 0}</span> · R totale <span>{totalR >= 0 ? "+" : ""}{totalR.toFixed(2)}R</span> · Ultimo <span>{lastResult ? `${lastResult.outcome} · ${lastProfit >= 0 ? "+" : ""}${lastProfit.toFixed(2)} · ${lastR >= 0 ? "+" : ""}${lastR.toFixed(2)}R` : "—"}</span></p>
+          <p className="heartbeat">Breakeven <span>{results?.breakeven ?? 0}</span> · R totale <span>{totalR >= 0 ? "+" : ""}{totalR.toFixed(2)}R</span> · Ultimo <span>{lastResult ? `${lastResult.outcome} · ${setupLabel(lastResult.setup)} · ${lastProfit >= 0 ? "+" : ""}${lastProfit.toFixed(2)} · ${lastR >= 0 ? "+" : ""}${lastR.toFixed(2)}R` : "—"}</span></p>
         </article>
 
         <article className="rules-card">
@@ -262,6 +273,26 @@ export default function Home() {
           </dl>
           <p className="heartbeat">Chiusura posizioni alle <span>{nextFlatten ? `${formatHourMinute(nextFlatten, "UTC")} UTC (${formatHourMinute(nextFlatten, "Europe/Paris")} Paris)` : "—"}</span></p>
           <p className="heartbeat">Ultimo flatten <span>{flatten?.at ? `${formatTime(flatten.at)} · ${flatten.reason ?? "—"} · chiuse ${(flatten.closed ?? []).length} · pendenti cancellati ${(flatten.canceled ?? []).length}${(flatten.failures ?? []).length ? ` · errori ${flatten.failures!.length}` : ""}` : "mai"}</span></p>
+        </article>
+
+        <article className="rules-card">
+          <div className="card-heading rules-heading"><div><span className="card-index">06</span><h3>Setup valutati</h3></div><span className="rainbow-label">ULTIMO TICK</span></div>
+          {evaluations.length > 0 ? (
+            <dl className="rules setups">
+              {evaluations.map((item, index) => (
+                <div key={`${item.setup ?? "setup"}-${index}`}>
+                  <dt>{setupLabel(item.setup)}{item.direction ? ` · ${item.direction}` : ""}</dt>
+                  <dd>
+                    <span className="setup-status" data-status={item.status === "triggered" ? "triggered" : "rejected"}>
+                      {item.status === "triggered" ? "TRIGGER" : "SCARTATO"}
+                    </span>
+                    {item.reason || "—"}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          ) : <p>In attesa del primo tick con valutazione dei setup.</p>}
+          <p className="heartbeat">Valutazione <span>{formatTime(decision?.at)}</span></p>
         </article>
       </section>
 

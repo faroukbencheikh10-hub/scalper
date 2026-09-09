@@ -18,6 +18,25 @@ export function emaClose(candles: Candle[], period: number): number | null {
   return value;
 }
 
+/**
+ * Serie EMA sulle chiusure: l'elemento i e' l'EMA calcolata fino alla candela i.
+ * I primi period-1 elementi sono null (warm-up). L'ultimo valore coincide con emaClose().
+ */
+export function emaCloseSeries(candles: Candle[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  if (candles.length < period) return out;
+  const k = 2 / (period + 1);
+  let value = 0;
+  for (let i = 0; i < period; i++) value += candles[i].close;
+  value /= period;
+  out[period - 1] = value;
+  for (let i = period; i < candles.length; i++) {
+    value = candles[i].close * k + value * (1 - k);
+    out[i] = value;
+  }
+  return out;
+}
+
 export function atr(candles: Candle[], period = 14, ordered = false): number | null {
   if (candles.length < period + 1) return null;
   const bars = ordered ? candles : [...candles].sort((a, b) => Date.parse(a.datetime) - Date.parse(b.datetime));

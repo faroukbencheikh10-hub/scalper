@@ -409,6 +409,13 @@ article p { position: relative; z-index: 1; margin: 10px 0 0; color: #aeb9d2; fo
 .rules > div:nth-child(3) dd { color: #7ff6bd; }
 .rules > div:nth-child(4) dd { color: #72ddff; }
 .rules > div:nth-child(5) dd { color: #d9a0ff; }
+/* Elenco dei setup valutati nell'ultimo tick: una colonna per setup, testo del motivo su piu' righe. */
+.rules.setups { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+.rules.setups > div dt { color: #9aa7c7; font: 750 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.rules.setups > div dd { color: #c3cce4; font: 500 12px/1.5 Inter, system-ui, sans-serif; }
+.rules.setups .setup-status { display: block; margin-bottom: 6px; font: 800 10px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; }
+.rules.setups .setup-status[data-status="triggered"] { color: var(--green); }
+.rules.setups .setup-status[data-status="rejected"] { color: #ffb27a; }
 .action { margin-top: 20px; }
 .action p { color: var(--muted); font-size: 13px; }
 ::selection { background: rgba(117, 89, 255, .7); color: white; }

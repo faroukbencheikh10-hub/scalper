@@ -6,8 +6,9 @@ import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { evaluateScalper } from "../src/lib/server/scalperStrategy";
+import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
-import type { Candle, Quote } from "../src/lib/types";
+import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../src/lib/types";
 
 function required(name: string) {
   const value = process.env[name]?.trim();
@@ -152,14 +153,19 @@ async function retryTrade(label: string, action: () => Promise<Record<string, un
   throw lastError instanceof Error ? lastError : new Error(`${label} fallita`);
 }
 
-function noTradeDecision(reasoning: string, quote: Quote | null) {
+function noTradeDecision(
+  reasoning: string,
+  quote: Quote | null,
+  extra: { mode?: string; setup?: string | null; evaluations?: SetupEvaluation[] } = {},
+) {
   return {
     at: new Date().toISOString(),
-    mode: "session_guard",
+    mode: extra.mode ?? "session_guard",
     direction: "NO_TRADE",
-    setup: null,
+    setup: extra.setup ?? null,
     reasoning,
     quote,
+    evaluations: extra.evaluations ?? [],
   };
 }
 
@@ -176,6 +182,10 @@ async function main() {
   const quotePersistMs = envInt("SCALPER_STREAM_QUOTE_PERSIST_MS", 500, 100, 10_000);
   const decisionPersistMs = envInt("SCALPER_STREAM_DECISION_PERSIST_MS", 500, 100, 10_000);
   const maxOpenPositions = envInt("SCALPER_MAX_OPEN_POSITIONS", 3, 1, 3);
+  // Anti-duplicazione ingressi: si somma alla pausa re-entry SCALPER_MIN_REENTRY_SEC (invariata).
+  const dupCooldownMs = envInt("DUP_COOLDOWN_S", 90, 0, 3600) * 1000;
+  const dupSetupBars = envInt("DUP_SETUP_BARS", 3, 0, 30);
+  const tickLogMs = envInt("SCALPER_TICK_LOG_MS", 1000, 0, 60_000);
   const sessionConfig = sessionConfigFromEnv();
 
   const api = new MetaApi(token);
@@ -210,6 +220,12 @@ async function main() {
   let signalLockUntil = 0;
   let orderErrorUntil = 0;
   let lastEmptyFlattenMarker: string | null = null;
+  // Dopo ogni ordine inviato: stessa direzione bloccata per DUP_COOLDOWN_S,
+  // stesso setup bloccato per DUP_SETUP_BARS candele M1 (bucket di apertura incluso).
+  const dupDirectionUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
+  const dupSetupUntilBucket = new Map<string, number>();
+  let lastTickLogKey = "";
+  let lastTickLogAt = 0;
 
   const marketDataSubscriptions = [{ type: "quotes" as const }];
   const marketDataUnsubscriptions = [{ type: "quotes" as const }];
@@ -433,6 +449,28 @@ async function main() {
     }
   };
 
+  // Log per tick: quali setup sono stati valutati e perche' sono stati scartati.
+  // Ripetuto solo quando il motivo cambia oppure ogni SCALPER_TICK_LOG_MS, per non inondare stdout.
+  const logTick = (signal: ScalperSignal, quote: Quote, blocked?: string) => {
+    const evaluations = signal.evaluations ?? [];
+    const key = `${signal.direction}|${signal.setup ?? "-"}|${blocked ?? ""}|`
+      + evaluations.map((item) => `${item.setup}:${item.status}:${item.reason}`).join(";");
+    const now = Date.now();
+    if (key === lastTickLogKey && now - lastTickLogAt < tickLogMs) return;
+    lastTickLogKey = key;
+    lastTickLogAt = now;
+    console.log("[scalper-worker] tick", JSON.stringify({
+      at: new Date(now).toISOString(),
+      symbol: symbol(),
+      mid: quote.mid,
+      spread: quote.spread,
+      direction: signal.direction,
+      setup: signal.setup,
+      blocked: blocked ?? null,
+      setups: evaluations.map((item) => ({ setup: item.setup, status: item.status, direction: item.direction ?? null, reason: item.reason })),
+    }));
+  };
+
   const sessionGuard = (quote: Quote | null) => {
     const status = getSessionStatus(new Date(), sessionConfig);
     if (status.weekendClosed) return { allowed: false, status, reasoning: "Mercato chiuso (weekend)" };
@@ -477,27 +515,56 @@ async function main() {
       setup: signal.setup,
       reasoning: signal.reasoning,
       quote,
+      evaluations: signal.evaluations,
     };
 
-    if (signal.direction === "NO_TRADE") return;
+    if (signal.direction === "NO_TRADE") {
+      logTick(signal, quote);
+      return;
+    }
 
     if (openPositions.length > 0) {
       const directions = openPositions.map(positionDirection);
       if (directions.some((direction) => direction === null)) {
-        latestDecision = noTradeDecision("Direzione di una posizione XAUUSD aperta non leggibile: nuovo ingresso bloccato per sicurezza.", quote);
+        const reason = "Direzione di una posizione XAUUSD aperta non leggibile: nuovo ingresso bloccato per sicurezza.";
+        latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+        logTick(signal, quote, reason);
         return;
       }
       if (directions.some((direction) => direction !== signal.direction)) {
-        latestDecision = noTradeDecision(`Posizioni XAUUSD già aperte in direzione opposta a ${signal.direction}.`, quote);
+        const reason = `Posizioni XAUUSD già aperte in direzione opposta a ${signal.direction}.`;
+        latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+        logTick(signal, quote, reason);
         return;
       }
     }
+
+    // Anti-duplicazione: stessa direzione entro DUP_COOLDOWN_S o stesso setup entro DUP_SETUP_BARS candele M1.
+    const nowMs = Date.now();
+    const directionUntil = dupDirectionUntil[signal.direction];
+    if (nowMs < directionUntil) {
+      const reason = `Cooldown anti-duplicazione ${signal.direction}: altri ${Math.ceil((directionUntil - nowMs) / 1000)} s dopo l'ultimo ordine.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      logTick(signal, quote, reason);
+      return;
+    }
+    const setupUntilBucket = signal.setup ? dupSetupUntilBucket.get(signal.setup) ?? 0 : 0;
+    if (bucketStart(nowMs, 1) < setupUntilBucket) {
+      const barsLeft = Math.ceil((setupUntilBucket - bucketStart(nowMs, 1)) / 60_000);
+      const reason = `Cooldown anti-duplicazione setup ${signal.setup}: altre ${barsLeft} candele M1 dopo l'ultimo ordine.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      logTick(signal, quote, reason);
+      return;
+    }
+
+    logTick(signal, quote);
 
     if (!autoExecEnabled()) {
       latestPreview = { at: new Date().toISOString(), ...signal };
       return;
     }
 
+    // decisionBusy serializza i tick: da qui in poi parte al massimo un ordine per tick di analisi.
     decisionBusy = true;
     try {
       const preReservationGate = sessionGuard(quote);
@@ -529,6 +596,7 @@ async function main() {
           setup: signal.setup,
           reasoning: signal.reasoning,
           quote,
+          evaluations: signal.evaluations,
           execution: reservation,
         };
         return;
@@ -541,7 +609,7 @@ async function main() {
           `UPDATE scalper_signals SET outcome='SKIPPED',closed_at=now(),mt5_error=$2 WHERE id=$1`,
           [signalId, finalGate.reasoning],
         );
-        latestDecision = noTradeDecision(finalGate.reasoning!, quote);
+        latestDecision = noTradeDecision(finalGate.reasoning!, quote, { setup: signal.setup, evaluations: signal.evaluations });
         return;
       }
 
@@ -570,12 +638,17 @@ async function main() {
           [signalId, `Streaming execution: ${execution.status}${reason ? ` (${reason})` : ""}`],
         );
       } else if (execution.status === "opened" || execution.status === "pending_position_link") {
-        signalLockUntil = Date.now() + 5000;
+        const sentAt = Date.now();
+        signalLockUntil = sentAt + 5000;
+        // Ordine inviato: blocca la stessa direzione per DUP_COOLDOWN_S e lo stesso setup
+        // per DUP_SETUP_BARS candele M1, a partire dalla candela dell'ordine.
+        dupDirectionUntil[signal.direction] = sentAt + dupCooldownMs;
+        if (signal.setup) dupSetupUntilBucket.set(signal.setup, bucketStart(sentAt, 1) + dupSetupBars * 60_000);
         lastNotifiedBlock = null;
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${signal.direction}`
           + `\nlotti ${activeLots} · entry ${money(signal.entry)} · SL ${money(signal.stopLoss)} · TP ${money(signal.takeProfit)}`
-          + `\nsetup ${signal.setup ?? "—"} · ${balanceLine()}`,
+          + `\nsetup ${setupLabel(signal.setup)} (${signal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error") {
         orderErrorUntil = Date.now() + 60_000;
@@ -593,6 +666,7 @@ async function main() {
         setup: signal.setup,
         reasoning: signal.reasoning,
         quote,
+        evaluations: signal.evaluations,
         execution,
       };
     } catch (error) {

@@ -15,13 +15,70 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 
 - M1: trigger operativo, valutato alla chiusura reale della candela.
 - M5: contesto immediato.
-- Setup: micro-pullback o liquidity sweep.
+- Setup: micro-pullback, liquidity sweep o momentum breakout.
 - Storico iniziale: 500 M1 e 300 M5, configurabile fino a 1000.
 - Stop dinamico 2–5 USD.
-- TP predefinito 1.45R.
+- TP predefinito 1.45R (stesso R:R per tutti e tre i setup).
 - Una sola posizione XAUUSD alla volta.
 - Cooldown dopo loss; pausa più lunga dopo 3 loss consecutive.
-- Filtro spread, ATR M1 e filtro shock.
+- Filtro spread, ATR M1 e filtro shock **invariati**: la logica di ingresso non li tocca.
+
+### Contesto M5 e direzionalità M1
+
+Il gate M5 vale per tutti i setup:
+
+- **M5 contrario** alla direzione dell'M1: blocco sempre.
+- **M5 allineato**: passa come prima.
+- **M5 neutro**: non blocca più di per sé. Il micro-pullback passa solo con M1 chiaramente direzionale — EMA9/EMA20 M1 allineate da almeno `M1_ALIGN_BARS` candele, prezzo dal lato giusto di entrambe e accelerazione reale (ultime `ACCEL_BARS` candele nella stessa direzione, range medio ≥ `ACCEL_ATR_MULT` × ATR M1 e corpi ≥ `ACCEL_BODY_RATIO` del range). Il momentum breakout richiede la sola parte strutturale (EMA allineate + prezzo dal lato giusto), perché porta già le proprie conferme di forza; il liquidity sweep mantiene il comportamento storico.
+
+### Momentum breakout M1
+
+Rottura del massimo/minimo delle ultime `BREAKOUT_LOOKBACK` candele M1 (10–15 consigliato) con:
+
+- candela di rottura a corpo ≥ `BREAKOUT_BODY_RATIO` del range;
+- ampiezza della candela di rottura sopra la media delle `BREAKOUT_VOL_BARS` precedenti (proxy di volume: MetaApi non fornisce il volume nel buffer di candele del worker, quindi si usa l'ampiezza);
+- EMA9 > EMA20 (long) o EMA9 < EMA20 (short) sull'M1;
+- chiusura oltre il livello di almeno `BREAKOUT_CLOSE_ATR_MULT` × ATR M1;
+- prezzo ancora oltre il livello sulla candela d'ingresso.
+
+La candela di rottura è l'ultima M1 **chiusa**: l'ingresso avviene sulla candela successiva, lo stop struttura va sotto (long) o sopra (short) la candela di rottura e il TP usa lo stesso R:R degli altri setup.
+
+### Anti-accumulo
+
+Blocca soltanto il range vero: ampiezza delle ultime `RANGE_LOOKBACK` candele M1 sotto `RANGE_ATR_MULT` × ATR M1 **e** EMA9/EMA20 M1 piatte (variazione ≤ `EMA_FLAT_SLOPE_ATR` × ATR su `EMA_SLOPE_BARS` candele). Una compressione breve seguita da espansione non blocca: basta una candela fra le ultime `RANGE_EXPANSION_BARS` con range ≥ `RANGE_EXPANSION_ATR` × ATR M1.
+
+### Anti-duplicazione
+
+Dopo ogni ordine inviato il worker blocca:
+
+- nuovi ingressi nella **stessa direzione** per `DUP_COOLDOWN_S` secondi;
+- nuovi ingressi sullo **stesso setup** per `DUP_SETUP_BARS` candele M1 (inclusa quella dell'ordine).
+
+Restano attive la pausa re-entry `SCALPER_MIN_REENTRY_SEC` (120 s) e tutti i limiti di sessione. Ogni tick di analisi può generare al massimo un ordine.
+
+### Variabili della logica di ingresso
+
+| Variabile | Default | Significato |
+| --- | --- | --- |
+| `M1_ALIGN_BARS` | 3 | Candele con EMA9/EMA20 M1 allineate per considerare l'M1 direzionale |
+| `ACCEL_ATR_MULT` | 1.2 | Range medio delle ultime candele in multipli di ATR M1 |
+| `ACCEL_BARS` | 3 | Candele usate per l'accelerazione |
+| `ACCEL_BODY_RATIO` | 0.60 | Corpo minimo delle candele di accelerazione |
+| `BREAKOUT_LOOKBACK` | 12 | Canale M1 rotto dal momentum breakout |
+| `BREAKOUT_BODY_RATIO` | 0.60 | Corpo minimo della candela di rottura |
+| `BREAKOUT_CLOSE_ATR_MULT` | 0.15 | Distanza minima della chiusura oltre il livello, in ATR M1 |
+| `BREAKOUT_VOL_BARS` / `BREAKOUT_VOL_MULT` | 20 / 1.0 | Media di confronto per l'ampiezza della candela di rottura |
+| `RANGE_ATR_MULT` | 1.5 | Ampiezza massima (in ATR M1) del range vero |
+| `RANGE_LOOKBACK` | 12 | Candele su cui si misura l'ampiezza |
+| `EMA_SLOPE_BARS` / `EMA_FLAT_SLOPE_ATR` | 5 / 0.12 | Soglia di pendenza per considerare piatte le EMA M1 |
+| `RANGE_EXPANSION_BARS` / `RANGE_EXPANSION_ATR` | 3 / 1.2 | Espansione che sblocca una compressione breve |
+| `DUP_COOLDOWN_S` | 90 | Blocco della stessa direzione dopo un ordine |
+| `DUP_SETUP_BARS` | 3 | Candele M1 di blocco dello stesso setup |
+| `SCALPER_TICK_LOG_MS` | 1000 | Throttle del log per tick dei setup valutati |
+
+### Log dei setup valutati
+
+A ogni tick il worker scrive su stdout (`[scalper-worker] tick`) e in `scalper_settings.stream_last_decision` l'elenco dei tre setup con esito e motivo dello scarto, invece del solo "Nessun trigger scalper M1". La dashboard mostra il setup usato nell'ultima decisione e la card **Setup valutati** con lo stato di ognuno.
 
 ## Streaming
 

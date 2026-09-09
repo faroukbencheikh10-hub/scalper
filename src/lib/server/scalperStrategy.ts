@@ -1,12 +1,22 @@
-import type { Candle, Quote, ScalperSignal } from "@/lib/types";
-import { atr, clamp, emaClose } from "./indicators";
+import type { Candle, Quote, ScalperSetup, ScalperSignal, SetupEvaluation } from "@/lib/types";
+import { setupLabel } from "@/lib/setups";
+import { atr, clamp, emaClose, emaCloseSeries } from "./indicators";
 
 function envN(name: string, fallback: number) {
   const v = Number(process.env[name]);
   return Number.isFinite(v) ? v : fallback;
 }
-function no(reasoning: string): ScalperSignal {
-  return { direction: "NO_TRADE", entry: null, stopLoss: null, takeProfit: null, riskReward: null, setup: null, reasoning };
+function envI(name: string, fallback: number, min: number, max: number) {
+  const v = Number(process.env[name]);
+  if (!Number.isFinite(v)) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(v)));
+}
+function no(reasoning: string, evaluations: SetupEvaluation[] = []): ScalperSignal {
+  return { direction: "NO_TRADE", entry: null, stopLoss: null, takeProfit: null, riskReward: null, setup: null, reasoning, evaluations };
+}
+/** Blocco dei filtri di protezione a monte: nessun setup viene nemmeno valutato. */
+function blockedByFilter(reason: string): SetupEvaluation[] {
+  return [{ setup: "filtri", status: "rejected", reason }];
 }
 function hoursAllowed(now = new Date()) {
   const raw = process.env.SCALPER_HOURS_UTC?.trim() || "06:30-20:30";
@@ -20,77 +30,244 @@ function hoursAllowed(now = new Date()) {
 }
 function bullish(c: Candle) { return c.close > c.open; }
 function bearish(c: Candle) { return c.close < c.open; }
+function range(c: Candle) { return Math.max(0.01, c.high - c.low); }
+function bodyRatio(c: Candle) { return Math.abs(c.close - c.open) / range(c); }
 
 export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[] }): ScalperSignal {
   const { quote, m1, m5 } = input;
-  if (!hoursAllowed()) return no(`Fuori fascia scalper ${process.env.SCALPER_HOURS_UTC || "06:30-20:30"} UTC.`);
-  if (m1.length < 35 || m5.length < 30) return no("Storico M1/M5 insufficiente.");
+  if (!hoursAllowed()) {
+    const reason = `Fuori fascia scalper ${process.env.SCALPER_HOURS_UTC || "06:30-20:30"} UTC.`;
+    return no(reason, blockedByFilter(reason));
+  }
+  if (m1.length < 35 || m5.length < 30) return no("Storico M1/M5 insufficiente.", blockedByFilter("Storico M1/M5 insufficiente."));
 
+  // --- Filtri di protezione invariati: spread, ATR minimo/massimo, candela shock. ---
   const maxSpread = envN("SCALPER_MAX_SPREAD", 1.2);
-  if (quote.spread > maxSpread) return no(`Spread ${quote.spread.toFixed(2)}$ sopra massimo ${maxSpread.toFixed(2)}$.`);
+  if (quote.spread > maxSpread) {
+    const reason = `Spread ${quote.spread.toFixed(2)}$ sopra massimo ${maxSpread.toFixed(2)}$.`;
+    return no(reason, blockedByFilter(reason));
+  }
 
   const atr1 = atr(m1, 14, true);
-  if (!atr1) return no("ATR M1 non disponibile.");
+  if (!atr1) return no("ATR M1 non disponibile.", blockedByFilter("ATR M1 non disponibile."));
   const minAtr = envN("SCALPER_MIN_ATR_M1", 0.8), maxAtr = envN("SCALPER_MAX_ATR_M1", 6);
-  if (atr1 < minAtr) return no(`Volatilità M1 troppo bassa: ATR ${atr1.toFixed(2)}$.`);
-  if (atr1 > maxAtr) return no(`Volatilità M1 troppo alta: ATR ${atr1.toFixed(2)}$.`);
+  if (atr1 < minAtr) {
+    const reason = `Volatilità M1 troppo bassa: ATR ${atr1.toFixed(2)}$.`;
+    return no(reason, blockedByFilter(reason));
+  }
+  if (atr1 > maxAtr) {
+    const reason = `Volatilità M1 troppo alta: ATR ${atr1.toFixed(2)}$.`;
+    return no(reason, blockedByFilter(reason));
+  }
 
   const last = m1[m1.length - 1], prev = m1[m1.length - 2];
-  if (last.high - last.low > Math.max(atr1 * 2.2, 5.5)) return no(`Candela M1 shock ${(last.high - last.low).toFixed(2)}$: niente inseguimento.`);
+  if (last.high - last.low > Math.max(atr1 * 2.2, 5.5)) {
+    const reason = `Candela M1 shock ${(last.high - last.low).toFixed(2)}$: niente inseguimento.`;
+    return no(reason, blockedByFilter(reason));
+  }
 
   const fast5 = emaClose(m5, 9), slow5 = emaClose(m5, 21);
-  const fast1 = emaClose(m1, 9), slow1 = emaClose(m1, 20);
-  if ([fast5, slow5, fast1, slow1].some(v => v === null)) return no("EMA non disponibili.");
+  const fast1Series = emaCloseSeries(m1, 9), slow1Series = emaCloseSeries(m1, 20);
+  const fast1 = fast1Series[m1.length - 1], slow1 = slow1Series[m1.length - 1];
+  if ([fast5, slow5, fast1, slow1].some(v => v === null)) return no("EMA non disponibili.", blockedByFilter("EMA non disponibili."));
   const lastM5Close = m5[m5.length - 1].close;
   const trendUp = lastM5Close > fast5! && fast5! > slow5!;
   const trendDown = lastM5Close < fast5! && fast5! < slow5!;
+  const m5Label = trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro";
 
-  // Solo filtro anti-accumulo M1: non modifica direzione, setup, SL o TP originali.
-  // Blocca le zone con candele sovrapposte/alternate e riparte solo dopo una rottura chiara della fascia recente.
-  const rangeBars = m1.slice(Math.max(0, m1.length - 12), m1.length - 2);
+  // --- Direzionalità M1: sostituisce il trend M5 quando l'M5 e' neutro. ---
+  // Struttura: EMA9/EMA20 allineate da almeno M1_ALIGN_BARS candele e prezzo dal lato giusto di entrambe.
+  // Accelerazione: ultime ACCEL_BARS candele nella stessa direzione, range medio >= ACCEL_ATR_MULT * ATR
+  // e corpi >= ACCEL_BODY_RATIO del range.
+  const alignBars = envI("M1_ALIGN_BARS", 3, 1, 20);
+  const alignFast = fast1Series.slice(m1.length - alignBars);
+  const alignSlow = slow1Series.slice(m1.length - alignBars);
+  const alignReady = alignFast.length === alignBars && alignFast.every(v => v !== null) && alignSlow.every(v => v !== null);
+  const alignedUp = alignReady && alignFast.every((v, i) => v! > alignSlow[i]!);
+  const alignedDown = alignReady && alignFast.every((v, i) => v! < alignSlow[i]!);
+  const priceAbove = last.close > fast1! && last.close > slow1!;
+  const priceBelow = last.close < fast1! && last.close < slow1!;
+
+  const accelBars = envI("ACCEL_BARS", 3, 2, 10);
+  const accelAtrMult = envN("ACCEL_ATR_MULT", 1.2);
+  const accelBodyMin = envN("ACCEL_BODY_RATIO", 0.6);
+  const accelSlice = m1.slice(m1.length - accelBars);
+  const accelRangeAvg = accelSlice.reduce((sum, c) => sum + (c.high - c.low), 0) / accelSlice.length;
+  const accelFast = accelRangeAvg >= atr1 * accelAtrMult;
+  const accelBodies = accelSlice.every(c => bodyRatio(c) >= accelBodyMin);
+  const accelUp = accelFast && accelBodies && accelSlice.every(bullish);
+  const accelDown = accelFast && accelBodies && accelSlice.every(bearish);
+
+  /**
+   * Gate M5 comune a tutti i setup.
+   * - M5 contrario alla direzione: blocco sempre.
+   * - M5 allineato: passa.
+   * - M5 neutro: passa solo se l'M1 e' chiaramente direzionale, al livello richiesto dal setup
+   *   ("accelerata" = struttura + accelerazione, "struttura" = solo EMA allineate + prezzo dal lato giusto,
+   *   "libera" = nessun requisito extra, comportamento storico del liquidity sweep).
+   * Restituisce null se il gate passa, altrimenti il motivo del blocco.
+   */
+  const m5Gate = (direction: "BUY" | "SELL", level: "accelerata" | "struttura" | "libera"): string | null => {
+    if (direction === "BUY" && trendDown) return "trend M5 ribassista contrario al long";
+    if (direction === "SELL" && trendUp) return "trend M5 rialzista contrario allo short";
+    const aligned = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
+    if (aligned || level === "libera") return null;
+    const structure = direction === "BUY" ? alignedUp && priceAbove : alignedDown && priceBelow;
+    if (!structure) {
+      const emaOk = direction === "BUY" ? alignedUp : alignedDown;
+      return `M5 neutro e M1 non direzionale (${emaOk ? "prezzo non dal lato giusto delle EMA M1" : `EMA9/EMA20 M1 non allineate da ${alignBars} candele`})`;
+    }
+    if (level === "struttura") return null;
+    const accel = direction === "BUY" ? accelUp : accelDown;
+    if (!accel) {
+      const missing = !accelFast
+        ? `range medio ${accelRangeAvg.toFixed(2)}$ < ${(atr1 * accelAtrMult).toFixed(2)}$`
+        : !accelBodies ? `corpi sotto il ${(accelBodyMin * 100).toFixed(0)}% del range` : "candele non tutte nella stessa direzione";
+      return `M5 neutro senza accelerazione M1 su ${accelBars} candele (${missing})`;
+    }
+    return null;
+  };
+
+  // --- Anti-accumulo: blocca solo il range vero. ---
+  // Range vero = ampiezza delle ultime RANGE_LOOKBACK candele sotto RANGE_ATR_MULT * ATR M1
+  // con EMA9 ed EMA20 M1 piatte. Una compressione breve seguita da espansione non blocca.
+  const rangeLookback = envI("RANGE_LOOKBACK", 12, 4, 60);
+  const rangeBars = m1.slice(m1.length - rangeLookback);
   const rangeHigh = Math.max(...rangeBars.map(c => c.high));
   const rangeLow = Math.min(...rangeBars.map(c => c.low));
   const rangeWidth = rangeHigh - rangeLow;
-  const emaGap = Math.abs(fast1! - slow1!);
-  let flips = 0;
-  let previousSign = 0;
-  for (const candle of m1.slice(-9, -1)) {
-    const sign = Math.sign(candle.close - candle.open);
-    if (sign !== 0 && previousSign !== 0 && sign !== previousSign) flips++;
-    if (sign !== 0) previousSign = sign;
-  }
-  const compressed = rangeWidth <= atr1 * envN("SCALPER_RANGE_WIDTH_ATR", 2.8)
-    && emaGap <= atr1 * envN("SCALPER_EMA_COMPRESSION_ATR", 0.35);
-  const choppy = flips >= Math.floor(envN("SCALPER_RANGE_FLIPS", 4))
-    && rangeWidth <= atr1 * envN("SCALPER_CHOP_WIDTH_ATR", 3.5);
-  const breakoutBuffer = atr1 * envN("SCALPER_BREAKOUT_BUFFER_ATR", 0.12);
-  const breakoutUp = bullish(last) && last.close > rangeHigh + breakoutBuffer;
-  const breakoutDown = bearish(last) && last.close < rangeLow - breakoutBuffer;
-  if ((compressed || choppy) && !breakoutUp && !breakoutDown) {
-    return no(`Accumulo M1: range ${rangeWidth.toFixed(2)}$, gap EMA ${emaGap.toFixed(2)}$, inversioni ${flips}. Attendo uscita chiara dalla fascia.`);
+  const rangeAtrMult = envN("RANGE_ATR_MULT", 1.5);
+  const slopeBars = envI("EMA_SLOPE_BARS", 5, 2, 30);
+  const flatSlopeAtr = envN("EMA_FLAT_SLOPE_ATR", 0.12);
+  const slopeOf = (series: (number | null)[]) => {
+    const head = series[m1.length - 1], tail = series[m1.length - 1 - slopeBars];
+    return head === null || head === undefined || tail === null || tail === undefined ? null : Math.abs(head - tail);
+  };
+  const fastSlope = slopeOf(fast1Series), slowSlope = slopeOf(slow1Series);
+  const emaFlat = fastSlope !== null && slowSlope !== null
+    && fastSlope <= atr1 * flatSlopeAtr && slowSlope <= atr1 * flatSlopeAtr;
+  const expansionBars = envI("RANGE_EXPANSION_BARS", 3, 1, 10);
+  const expansionMult = envN("RANGE_EXPANSION_ATR", 1.2);
+  const expansion = m1.slice(m1.length - expansionBars).some(c => (c.high - c.low) >= atr1 * expansionMult);
+  const rangeCompressed = rangeWidth < atr1 * rangeAtrMult && emaFlat;
+  if (rangeCompressed && !expansion) {
+    const reason = `Range M1 vero: ampiezza ${rangeWidth.toFixed(2)}$ su ${rangeLookback} candele sotto ${(atr1 * rangeAtrMult).toFixed(2)}$`
+      + ` con EMA9/EMA20 piatte (pendenza ${fastSlope!.toFixed(2)}$/${slowSlope!.toFixed(2)}$ su ${slopeBars} candele). Attendo espansione.`;
+    return no(reason, blockedByFilter(reason));
   }
 
-  let direction: "BUY" | "SELL" | null = null;
-  let setup: "micro_pullback" | "liquidity_sweep" | null = null;
-  let structureStop: number | null = null;
+  // --- Valutazione dei setup: tutti e tre vengono sempre valutati e tracciati. ---
+  type Candidate = { setup: ScalperSetup; direction: "BUY" | "SELL"; structureStop: number };
+  const evaluations: SetupEvaluation[] = [];
+  const candidates: Candidate[] = [];
+  const record = (setup: ScalperSetup, status: "triggered" | "rejected", reason: string, direction?: "BUY" | "SELL") => {
+    evaluations.push(direction ? { setup, status, direction, reason } : { setup, status, reason });
+  };
 
-  const pullbackBuy = trendUp && prev.low <= fast1! && last.close > fast1! && bullish(last) && last.close > prev.close;
-  const pullbackSell = trendDown && prev.high >= fast1! && last.close < fast1! && bearish(last) && last.close < prev.close;
-  if (pullbackBuy) { direction = "BUY"; setup = "micro_pullback"; structureStop = Math.min(prev.low, last.low) - 0.25; }
-  else if (pullbackSell) { direction = "SELL"; setup = "micro_pullback"; structureStop = Math.max(prev.high, last.high) + 0.25; }
-  else {
+  // 1) Micro-pullback sull'EMA9 M1.
+  {
+    const buy = prev.low <= fast1! && last.close > fast1! && bullish(last) && last.close > prev.close;
+    const sell = prev.high >= fast1! && last.close < fast1! && bearish(last) && last.close < prev.close;
+    if (!buy && !sell) {
+      record("micro_pullback", "rejected", `nessun rientro su EMA9 M1 ${fast1!.toFixed(2)}$ con candela di ripartenza`);
+    } else {
+      const direction = buy ? "BUY" : "SELL";
+      const blocked = m5Gate(direction, "accelerata");
+      if (blocked) record("micro_pullback", "rejected", blocked, direction);
+      else {
+        const structureStop = direction === "BUY" ? Math.min(prev.low, last.low) - 0.25 : Math.max(prev.high, last.high) + 0.25;
+        candidates.push({ setup: "micro_pullback", direction, structureStop });
+        record("micro_pullback", "triggered", `rientro su EMA9 M1 e ripartenza ${direction} (M5 ${m5Label})`, direction);
+      }
+    }
+  }
+
+  // 2) Sweep di liquidità sui minimi/massimi recenti (finestra storica invariata).
+  {
     let low = Infinity, high = -Infinity;
     for (let i = Math.max(0, m1.length - 10); i < Math.max(0, m1.length - 2); i++) {
       low = Math.min(low, m1[i].low);
       high = Math.max(high, m1[i].high);
     }
-    const sweepBuy = prev.low < low && prev.close > low && last.close > prev.high && bullish(last) && !trendDown;
-    const sweepSell = prev.high > high && prev.close < high && last.close < prev.low && bearish(last) && !trendUp;
-    if (sweepBuy) { direction = "BUY"; setup = "liquidity_sweep"; structureStop = prev.low - 0.25; }
-    else if (sweepSell) { direction = "SELL"; setup = "liquidity_sweep"; structureStop = prev.high + 0.25; }
+    const buy = prev.low < low && prev.close > low && last.close > prev.high && bullish(last);
+    const sell = prev.high > high && prev.close < high && last.close < prev.low && bearish(last);
+    if (!buy && !sell) {
+      record("liquidity_sweep", "rejected", `nessuno sweep dei minimi ${low.toFixed(2)}$ / massimi ${high.toFixed(2)}$ con rientro`);
+    } else {
+      const direction = buy ? "BUY" : "SELL";
+      const blocked = m5Gate(direction, "libera");
+      if (blocked) record("liquidity_sweep", "rejected", blocked, direction);
+      else {
+        const structureStop = direction === "BUY" ? prev.low - 0.25 : prev.high + 0.25;
+        candidates.push({ setup: "liquidity_sweep", direction, structureStop });
+        record("liquidity_sweep", "triggered", `sweep ${direction === "BUY" ? "dei minimi" : "dei massimi"} con rientro (M5 ${m5Label})`, direction);
+      }
+    }
   }
-  if (!direction || !setup || structureStop == null) return no(`Nessun trigger scalper M1. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}.`);
 
+  // 3) Momentum breakout M1: rottura del canale delle ultime BREAKOUT_LOOKBACK candele.
+  // La candela di rottura e' l'ultima M1 chiusa (prev): l'ingresso avviene quindi sulla candela successiva,
+  // cioe' quella in corso, e lo stop struttura va sotto/sopra la candela di rottura.
+  const breakoutBody = bodyRatio(prev);
+  {
+    const lookback = envI("BREAKOUT_LOOKBACK", 12, 5, 60);
+    const volBars = envI("BREAKOUT_VOL_BARS", 20, 5, 60);
+    const bodyMin = envN("BREAKOUT_BODY_RATIO", 0.6);
+    const closeMult = envN("BREAKOUT_CLOSE_ATR_MULT", 0.15);
+    const volMult = envN("BREAKOUT_VOL_MULT", 1);
+    const breakIdx = m1.length - 2;
+    const windowStart = breakIdx - lookback, volStart = breakIdx - volBars;
+    if (windowStart < 0 || volStart < 0) {
+      record("momentum_breakout", "rejected", `storico M1 insufficiente (servono ${Math.max(lookback, volBars) + 2} candele)`);
+    } else {
+      const window = m1.slice(windowStart, breakIdx);
+      const high = Math.max(...window.map(c => c.high));
+      const low = Math.min(...window.map(c => c.low));
+      const buffer = atr1 * closeMult;
+      const brokeUp = bullish(prev) && prev.close >= high + buffer;
+      const brokeDown = bearish(prev) && prev.close <= low - buffer;
+      if (!brokeUp && !brokeDown) {
+        record("momentum_breakout", "rejected",
+          `chiusura ${prev.close.toFixed(2)}$ dentro il canale ${lookback} candele ${low.toFixed(2)}$-${high.toFixed(2)}$ (serve oltre ${buffer.toFixed(2)}$)`);
+      } else {
+        const direction = brokeUp ? "BUY" : "SELL";
+        // Senza volume nei dati MetaApi/tick si usa l'ampiezza della candela come proxy di volume:
+        // deve superare la media delle BREAKOUT_VOL_BARS candele precedenti.
+        const avgRange = m1.slice(volStart, breakIdx).reduce((sum, c) => sum + (c.high - c.low), 0) / volBars;
+        const breakRange = prev.high - prev.low;
+        const emaAt = fast1Series[breakIdx], emaSlowAt = slow1Series[breakIdx];
+        const emaOk = emaAt !== null && emaSlowAt !== null && (direction === "BUY" ? emaAt > emaSlowAt : emaAt < emaSlowAt);
+        // Conferma sulla candela d'ingresso: il prezzo deve essere ancora oltre il livello rotto.
+        const holds = direction === "BUY" ? last.close > high : last.close < low;
+        const missing: string[] = [];
+        if (breakoutBody < bodyMin) missing.push(`corpo ${(breakoutBody * 100).toFixed(0)}% sotto il ${(bodyMin * 100).toFixed(0)}% del range`);
+        if (breakRange < avgRange * volMult) missing.push(`ampiezza ${breakRange.toFixed(2)}$ sotto la media ${volBars} candele ${(avgRange * volMult).toFixed(2)}$`);
+        if (!emaOk) missing.push(`EMA9/EMA20 M1 non allineate ${direction}`);
+        if (!holds) missing.push(`prezzo rientrato nel canale (${last.close.toFixed(2)}$)`);
+        const blocked = m5Gate(direction, "struttura");
+        if (blocked) missing.push(blocked);
+        if (missing.length > 0) record("momentum_breakout", "rejected", missing.join("; "), direction);
+        else {
+          const structureStop = direction === "BUY" ? prev.low - 0.25 : prev.high + 0.25;
+          candidates.push({ setup: "momentum_breakout", direction, structureStop });
+          record("momentum_breakout", "triggered",
+            `rottura ${direction === "BUY" ? `del massimo ${high.toFixed(2)}$` : `del minimo ${low.toFixed(2)}$`} su ${lookback} candele con corpo ${(breakoutBody * 100).toFixed(0)}% (M5 ${m5Label})`,
+            direction);
+        }
+      }
+    }
+  }
+
+  const chosen = candidates[0];
+  if (!chosen) {
+    return no(
+      `Nessun trigger scalper M1. Contesto M5 ${m5Label}; ATR M1 ${atr1.toFixed(2)}$. `
+      + evaluations.map(e => `${e.setup}${e.direction ? ` ${e.direction}` : ""}: ${e.reason}`).join(" | "),
+      evaluations,
+    );
+  }
+
+  const { direction, setup, structureStop } = chosen;
   const entry = direction === "BUY" ? quote.ask : quote.bid;
   const rawRisk = Math.abs(entry - structureStop);
   const minRisk = envN("SCALPER_MIN_RISK", 2), maxRisk = envN("SCALPER_MAX_RISK", 5);
@@ -102,20 +279,21 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   // Shadow score 0-100: viene registrato ma NON blocca mai un trade.
   const alignedTrend = (direction === "BUY" && trendUp) || (direction === "SELL" && trendDown);
   const trendScore = alignedTrend ? 20 : 12;
-  const lastRange = Math.max(0.01, last.high - last.low);
-  const bodyRatio = Math.abs(last.close - last.open) / lastRange;
+  const lastBody = bodyRatio(last);
   const moveAtr = Math.abs(last.close - prev.close) / atr1;
   const triggerScore = setup === "liquidity_sweep"
-    ? Math.min(25, 20 + Math.round(Math.min(1, bodyRatio) * 5))
-    : Math.min(25, 15 + Math.round(Math.min(0.5, moveAtr) * 20));
-  const accumulationScore = compressed || choppy ? 10 : 15;
+    ? Math.min(25, 20 + Math.round(Math.min(1, lastBody) * 5))
+    : setup === "momentum_breakout"
+      ? Math.min(25, 18 + Math.round(Math.min(1, breakoutBody) * 7))
+      : Math.min(25, 15 + Math.round(Math.min(0.5, moveAtr) * 20));
+  const accumulationScore = rangeCompressed ? 10 : 15;
   const atrScore = atr1 >= 1.2 && atr1 <= 3.5 ? 10 : atr1 >= 1.0 && atr1 <= 4.5 ? 8 : 5;
   const spreadRatio = maxSpread > 0 ? quote.spread / maxSpread : 1;
   const spreadScore = spreadRatio <= 0.35 ? 10 : spreadRatio <= 0.6 ? 8 : spreadRatio <= 0.8 ? 6 : 4;
   const structureScore = rawRisk >= minRisk && rawRisk <= maxRisk
     ? 10
     : rawRisk >= atr1 * 0.9 && rawRisk <= maxRisk * 1.25 ? 8 : 5;
-  const candleScore = bodyRatio >= 0.65 ? 10 : bodyRatio >= 0.45 ? 8 : bodyRatio >= 0.3 ? 6 : 4;
+  const candleScore = lastBody >= 0.65 ? 10 : lastBody >= 0.45 ? 8 : lastBody >= 0.3 ? 6 : 4;
   const qualityScore = Math.min(100, Math.max(0,
     trendScore + triggerScore + accumulationScore + atrScore + spreadScore + structureScore + candleScore,
   ));
@@ -124,6 +302,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
   return {
     direction, setup,
     entry: Number(entry.toFixed(2)), stopLoss: Number(stopLoss.toFixed(2)), takeProfit: Number(takeProfit.toFixed(2)), riskReward: Number(rr.toFixed(2)),
-    reasoning: `${setup === "micro_pullback" ? "Micro-pullback" : "Sweep di liquidità"} M1 ${direction}. Contesto M5 ${trendUp ? "rialzista" : trendDown ? "ribassista" : "neutro"}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
+    evaluations,
+    reasoning: `${setupLabel(setup)} M1 ${direction}. Contesto M5 ${m5Label}; ATR M1 ${atr1.toFixed(2)}$, spread ${quote.spread.toFixed(2)}$. Shadow score ${qualityScore}/100 (${scoreBreakdown}). [shadow-score:${qualityScore}]`
   };
 }
