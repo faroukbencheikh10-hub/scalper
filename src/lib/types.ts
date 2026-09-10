@@ -24,7 +24,7 @@ export type SetupEvaluation = {
    * Setup valutato, "m15_gate" per il contesto M15/M5 della mtf, "context_gate" per il contesto
    * M5/M15 di m1_short e m1_range o "filtri" per i blocchi di protezione a monte.
    */
-  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate" | "context_gate" | "session_liquidity";
+  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate" | "context_gate" | "market_liquidity";
   status: "triggered" | "rejected";
   direction?: "BUY" | "SELL";
   reason: string;

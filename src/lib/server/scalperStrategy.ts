@@ -108,7 +108,7 @@ export function plannedEntryValid(signal: ScalperSignal, quote: Quote) {
 type EvaluateInput = {
   quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number;
   /**
-   * Esclusione esterna dalla valutazione (es. sessionLiquidity.ts in liquidita' LOW), oltre a
+   * Esclusione esterna dalla valutazione (es. marketLiquidity.ts in liquidita' LOW), oltre a
    * SHORT_ENABLED/RANGE_ENABLED: nessuna modifica ai criteri d'ingresso dei setup, solo un gate
    * aggiuntivo su SE vengono valutati, esattamente allo stesso punto dei due toggle esistenti.
    */
