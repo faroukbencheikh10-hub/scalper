@@ -166,15 +166,20 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
   const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
   const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
   if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) return rejectAfterGate("Candela M1 shock: attendo un nuovo setup, nessun inseguimento.");
-  const preceding = m1.slice(-3, -1);
-  const triggerLevel = d === "BUY" ? maxHigh(preceding) : minLow(preceding);
-  if (signed(d, trigger.close - trigger.open) <= 0 || body(trigger) < env("MTF_M1_BODY_MIN", 0.45, 0.1, 0.95)
-    || signed(d, trigger.close - triggerLevel) < atr1 * 0.03) return rejectAfterGate("M15 " + d + ": attendo chiusura M1 di ripartenza oltre la microstruttura.");
+  // Ingresso su tick: il livello e' l'estremo dell'ultima M1 CHIUSA e conta appena il prezzo live
+  // lo supera di ENTRY_BUFFER_USD nella direzione del setup. La candela in formazione non entra in
+  // nessun calcolo: range, EMA e ATR usano solo candele chiuse, del tick serve solo il prezzo.
+  const buffer = entryBuffer();
+  const triggerLevel = d === "BUY" ? trigger.high : trigger.low;
   const entry = d === "BUY" ? quote.ask : quote.bid;
   const exitQuote = d === "BUY" ? quote.bid : quote.ask;
-  const drift = signed(d, entry - trigger.close);
-  if (drift > atr1 * env("MTF_MAX_CHASE_ATR", 0.45, 0.05, 2)
-    || signed(d, exitQuote - triggerLevel) < -atr1 * 0.1) return rejectAfterGate("Conferma M1 persa o ingresso già troppo esteso.");
+  if (signed(d, exitQuote - triggerLevel) < buffer) {
+    return rejectAfterGate("M15 " + d + ": prezzo " + exitQuote.toFixed(2) + " non oltre il livello M1 "
+      + triggerLevel.toFixed(2) + " con buffer " + buffer.toFixed(2) + "$.");
+  }
+  if (signed(d, entry - triggerLevel) > atr1 * env("MTF_MAX_CHASE_ATR", 0.45, 0.05, 2)) {
+    return rejectAfterGate("Ingresso " + entry.toFixed(2) + " già troppo esteso oltre il livello M1 " + triggerLevel.toFixed(2) + ".");
+  }
 
   // A directional M5 impulse followed by an actual retracement defines one persistent setup.
   const lookback = Math.floor(env("MTF_M5_SETUP_BARS", 6, 2, 12));
@@ -200,7 +205,9 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     const emaTouch = pullback.some((bar, j) => touches(bar, fast5[i + 1 + pbOffset + j]!));
     if (!retest && !emaTouch) continue;
     const setup = retest ? "breakout_retest" : "micro_pullback";
-    const key = [STRATEGY_VERSION, d, impulse.datetime, firstPullback.datetime].join(":");
+    // level_used: livello e candela chiusa che lo definisce entrano nella chiave, quindi dopo un
+    // ingresso lo stesso livello non riarma nulla finche' non chiude una nuova M1.
+    const key = [STRATEGY_VERSION, d, impulse.datetime, firstPullback.datetime, triggerLevel.toFixed(2), trigger.datetime].join(":");
     const stopBuffer = Math.max(spread, atr1 * 0.15);
     const structureStop = d === "BUY" ? Math.min(minLow(pullback), minLow(m1.slice(-3))) - stopBuffer
       : Math.max(maxHigh(pullback), maxHigh(m1.slice(-3))) + stopBuffer;
@@ -233,7 +240,8 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     return { direction: d, setup, setupKey: key, entry, stopLoss: sl, takeProfit: tp,
       riskReward: Number(rr.toFixed(2)), slPlan: { structural: Number(structural.toFixed(2)), atr: Number(atrRisk.toFixed(2)),
         applied: Number(appliedRisk.toFixed(2)), minUsd, maxUsd, rr: Number(rr.toFixed(2)), estimatedCostPrice: cost, minNetR }, evaluations,
-      reasoning: STRATEGY_VERSION + ": " + gateNote + " M5 " + setup + "; conferma M1 " + trigger.datetime + "."
+      reasoning: STRATEGY_VERSION + ": " + gateNote + " M5 " + setup + "; trigger su tick oltre "
+        + triggerLevel.toFixed(2) + " (M1 chiusa " + trigger.datetime + ", buffer " + buffer.toFixed(2) + "$)."
         + " SL strutturale " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R), netto stimato " + netR.toFixed(2) + "R."
         + " Setup " + key + ". [shadow-score:" + score + "]" };
   }
@@ -241,6 +249,11 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
 }
 
 export const SHORT_STRATEGY_VERSION = "m1-short-v1";
+
+/** Margine oltre il livello che il prezzo live deve superare perche' il trigger sia valido. */
+function entryBuffer() {
+  return env("ENTRY_BUFFER_USD", 0.1, 0, 5);
+}
 
 function shortEnabled() {
   const raw = process.env.SHORT_ENABLED?.trim().toLowerCase();
@@ -297,22 +310,27 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
     return rejectShort("m1_short: candela M1 shock, nessun inseguimento.");
   }
 
-  const window = m1.slice(-1 - bars, -1);
+  // Range, EMA e ATR solo su candele chiuse: la candela in formazione non entra mai nel calcolo.
+  const window = m1.slice(-bars);
   const high = maxHigh(window), low = minLow(window);
   const ema20 = emaCloseSeries(m1, 20).at(-1)!;
+  const buffer = entryBuffer();
   const slAtr = atr1 * env("SHORT_SL_ATR", 2, 0.2, 10);
   const slMin = env("SHORT_SL_MIN_USD", 3, 0.1, 50), slMax = env("SHORT_SL_MAX_USD", 8, 0.1, 100);
   const tpAtr = atr1 * env("SHORT_TP_ATR", 0.6, 0.05, 10);
   const tpMin = env("SHORT_TP_MIN_USD", 1.5, 0.1, 50), tpMax = env("SHORT_TP_MAX_USD", 3, 0.1, 100);
   const plannedRisk = Math.max(slAtr, slMin), plannedReward = Math.min(Math.max(tpAtr, tpMin), tpMax);
-  const detail = "range " + bars + " M1 " + low.toFixed(2) + "-" + high.toFixed(2)
-    + ", chiusura " + trigger.close.toFixed(2) + ", EMA20 M1 " + ema20.toFixed(2)
+  const detail = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
+    + ", prezzo " + quote.bid.toFixed(2) + "/" + quote.ask.toFixed(2) + ", buffer " + buffer.toFixed(2) + "$"
+    + ", EMA20 M1 " + ema20.toFixed(2)
     + ", ATR M1 " + atr1.toFixed(2) + "$, SL " + plannedRisk.toFixed(2) + "$, TP " + plannedReward.toFixed(2) + "$";
 
-  const brokeUp = trigger.close > high, brokeDown = trigger.close < low;
-  if (!brokeUp && !brokeDown) return rejectShort("m1_short: chiusura M1 dentro il range (" + detail + ").");
+  // Trigger su tick: il prezzo live deve superare il range di ENTRY_BUFFER_USD, non serve la chiusura.
+  const brokeUp = quote.bid >= high + buffer, brokeDown = quote.ask <= low - buffer;
+  if (!brokeUp && !brokeDown) return rejectShort("m1_short: prezzo dentro il range delle ultime " + bars + " M1 chiuse (" + detail + ").");
   const direction: "BUY" | "SELL" = brokeUp ? "BUY" : "SELL";
-  if (direction === "BUY" ? trigger.close <= ema20 : trigger.close >= ema20) {
+  const reference = direction === "BUY" ? quote.bid : quote.ask;
+  if (direction === "BUY" ? reference <= ema20 : reference >= ema20) {
     return rejectShort("m1_short: rottura " + direction + " contro l'EMA20 M1 (" + detail + ").", direction);
   }
   if (slAtr > slMax) {
@@ -327,16 +345,19 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
     return rejectShort("m1_short: SL/TP non validi al prezzo corrente (" + detail + ").", direction);
   }
   const rr = reward / risk;
-  const score = Math.min(95, Math.round(55 + body(trigger) * 20 + Math.min(1, Math.abs(trigger.close - (direction === "BUY" ? high : low)) / atr1) * 15));
-  const reason = "m1_short " + direction + ": rottura di " + (direction === "BUY" ? high.toFixed(2) : low.toFixed(2)) + " (" + detail + ").";
+  const level = direction === "BUY" ? high : low;
+  const score = Math.min(95, Math.round(55 + body(trigger) * 20 + Math.min(1, Math.abs(reference - level) / atr1) * 15));
+  const reason = "m1_short " + direction + ": prezzo oltre " + level.toFixed(2) + " (" + detail + ").";
   return {
     direction, setup: "m1_short",
-    setupKey: [SHORT_STRATEGY_VERSION, direction, trigger.datetime].join(":"),
+    // level_used: livello e ultima M1 chiusa nella chiave, un solo tentativo finche' non chiude una nuova M1.
+    setupKey: [SHORT_STRATEGY_VERSION, direction, level.toFixed(2), trigger.datetime].join(":"),
     entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
     slPlan: { structural: Number(slAtr.toFixed(2)), atr: Number(slAtr.toFixed(2)), applied: Number(risk.toFixed(2)),
       minUsd: slMin, maxUsd: slMax, rr: Number(rr.toFixed(2)), tpMinUsd: tpMin, tpMaxUsd: tpMax },
     evaluations: [{ setup: "m1_gate", status: "triggered", direction, reason }],
-    reasoning: SHORT_STRATEGY_VERSION + ": " + reason + " SL " + risk.toFixed(2) + "$, TP " + reward.toFixed(2)
+    reasoning: SHORT_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
+      + ". SL " + risk.toFixed(2) + "$, TP " + reward.toFixed(2)
       + "$ (" + rr.toFixed(2) + "R), TP indipendente dallo SL. [shadow-score:" + score + "]",
   };
 }

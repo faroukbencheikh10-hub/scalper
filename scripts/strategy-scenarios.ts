@@ -36,7 +36,8 @@ function fixture() {
     bar(Date.parse(c.datetime) + j * MINUTE, c.open + (c.close - c.open) * j / 5,
       c.open + (c.close - c.open) * (j + 1) / 5, 0.35)));
   m1.push(bar(end, base + 2, base + 3.7, 0.1));
-  const bid = base + 3.72;
+  // Ingresso su tick: il prezzo live supera di oltre ENTRY_BUFFER_USD il massimo dell'ultima M1 chiusa.
+  const bid = base + 3.95;
   return { nowMs, m1, m5, quote: { bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: nowMs } };
 }
 type Input = ReturnType<typeof fixture>;
@@ -109,11 +110,32 @@ check("No entry chasing an extended M1 confirmation", () => {
 });
 check("Live price loses trigger level", () => {
   const input = fixture(); input.quote.bid -= 3; input.quote.ask -= 3; input.quote.mid -= 3;
-  rejected(input, /Conferma M1 persa/);
+  rejected(input, /non oltre il livello M1/);
 });
-check("Unclosed M1 cannot supply an entry", () => {
-  const input = fixture(); input.nowMs -= MINUTE; input.quote.quotedAt = input.nowMs;
-  rejected(input, /attendo chiusura M1/);
+check("Il livello va superato di ENTRY_BUFFER_USD, non solo toccato", () => {
+  const input = fixture();
+  const level = input.m1.at(-1)!.high;          // massimo dell'ultima M1 chiusa
+  input.quote.bid = level + 0.05;               // dentro il buffer: nessun trigger
+  input.quote.ask = input.quote.bid + 0.12;
+  input.quote.mid = input.quote.bid + 0.06;
+  rejected(input, /non oltre il livello M1/);
+  input.quote.bid = level + 0.11;               // oltre il buffer: trigger valido
+  input.quote.ask = input.quote.bid + 0.12;
+  input.quote.mid = input.quote.bid + 0.06;
+  assert.equal(evaluateScalper(input).direction, "BUY");
+});
+check("La candela M1 in formazione non entra in livelli, range, EMA o ATR", () => {
+  const input = fixture();
+  const base = evaluateScalper(input);
+  assert.equal(base.direction, "BUY", JSON.stringify(base));
+  // Candela ancora aperta, tutta sopra il livello: se venisse usata sposterebbe il trigger.
+  const level = input.m1.at(-1)!.high;
+  input.m1.push(bar(Date.UTC(2026, 8, 9, 10, 6), level + 5, level + 5.2, 0.1));
+  const after = evaluateScalper(input);
+  assert.equal(after.direction, base.direction, JSON.stringify(after));
+  assert.equal(after.setupKey, base.setupKey);
+  assert.equal(after.stopLoss, base.stopLoss);
+  assert.equal(after.takeProfit, base.takeProfit);
 });
 check("M15 range blocks an otherwise bullish M1", () => {
   const input = fixture();
@@ -158,7 +180,8 @@ check("M15 transition without M5 structure stays blocked", () => {
 });
 check("M15 opposite to M1 cannot buy", () => {
   const input = fixture(); input.m5 = mirror(input).m5;
-  rejected(input, /attendo chiusura M1/);
+  // Contesto SELL con prezzo sopra i massimi M1: il trigger short non scatta mai.
+  rejected(input, /non oltre il livello M1/);
 });
 check("Missing recent M5 prevents synthetic M15 fabrication", () => {
   const input = fixture(); input.m5.splice(-5, 1);
@@ -247,22 +270,27 @@ check("Pivot needs closed candles on both sides", () => {
 });
 // --- m1_short: secondo setup, valutato solo quando la mtf non produce un ordine ---
 // M5 piatte => contesto M15 in range vero => la mtf non entra mai in questi scenari.
-function shortInput(options: { drift?: number; flatBars?: number; breakout?: number } = {}) {
+// Il trigger e' il prezzo live: le candele costruiscono solo il range chiuso, la quote lo supera o no.
+function shortInput(options: { drift?: number; flatBars?: number; breakout?: number; shock?: number } = {}) {
   const base = fixture();
   const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
-  const drift = options.drift ?? 0, flatBars = options.flatBars ?? total - 1, breakout = options.breakout ?? 1.8;
-  const driftBars = total - 1 - flatBars;
+  const drift = options.drift ?? 0, flatBars = options.flatBars ?? total, breakout = options.breakout ?? 0.5;
+  const driftBars = total - flatBars;
   const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
   const m1: Candle[] = [];
   let level = 2200 - driftBars * drift;
-  for (let i = 0; i < total - 1; i++) {
+  for (let i = 0; i < total; i++) {
     if (i < driftBars) level += drift;
     const up = i % 2 === 0;
     m1.push(bar(end - (total - 1 - i) * MINUTE, up ? level - 0.5 : level + 0.5, up ? level + 0.5 : level - 0.5, 0.2));
   }
-  const previous = m1.at(-1)!.close;
-  m1.push(bar(end, previous, previous + breakout, 0.15));
-  const bid = m1.at(-1)!.close + 0.02;
+  if (options.shock !== undefined) {
+    const last = m1.at(-1)!;
+    m1[m1.length - 1] = bar(Date.parse(last.datetime), last.open, last.open + options.shock, 0.2);
+  }
+  const window = m1.slice(-8);
+  const high = Math.max(...window.map(c => c.high)), low = Math.min(...window.map(c => c.low));
+  const bid = breakout >= 0 ? high + breakout : low + breakout;
   return { nowMs: base.nowMs, m1, m5, quote: { bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: base.nowMs } };
 }
 check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla", () => {
@@ -276,7 +304,7 @@ check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla
     assert.deepEqual(s.evaluations.map(e => e.setup), ["filtri", "m1_gate"]);
     const gate = s.evaluations.at(-1)!;
     assert.equal(gate.status, "triggered");
-    assert.match(gate.reason, /range 8 M1 \d+\.\d\d-\d+\.\d\d/);
+    assert.match(gate.reason, /range 8 M1 chiuse \d+\.\d\d-\d+\.\d\d/);
     assert.match(gate.reason, /EMA20 M1 \d+\.\d\d/);
     assert.match(gate.reason, /ATR M1 \d+\.\d\d\$, SL \d+\.\d\d\$, TP \d+\.\d\d\$/);
     // SL = 2 x ATR con minimo 3$, TP = 0.6 x ATR con minimo 1.5$, indipendente dallo SL.
@@ -303,7 +331,7 @@ check("SHORT_ENABLED=false lascia solo la mtf", () => {
 check("m1_short: rottura contro l'EMA20 M1 scartata", () => {
   withShort({}, () => {
     // Serie in discesa: l'EMA20 resta sopra, il rimbalzo rompe il range ma non la direzione.
-    const s = evaluateScalper(shortInput({ drift: 1, flatBars: 13, breakout: -1.5 }));
+    const s = evaluateScalper(shortInput({ drift: 1, flatBars: 13, breakout: -0.5 }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     const gate = s.evaluations.find(e => e.setup === "m1_gate");
     assert.match(gate!.reason, /contro l'EMA20 M1/);
@@ -328,16 +356,46 @@ check("m1_short: il TP resta dentro i limiti indipendentemente dallo SL", () => 
     assert.ok(Math.abs(s.takeProfit! - (s.entry! + 1.5)) <= 0.011, JSON.stringify(s));
   });
 });
+check("mtf: la chiave porta livello e M1 chiusa, un solo tentativo per livello", () => {
+  const input = fixture();
+  const first = evaluateScalper(input);
+  assert.equal(first.direction, "BUY", JSON.stringify(first));
+  const closed = input.m1.at(-1)!;
+  assert.ok(first.setupKey!.includes(closed.datetime), first.setupKey ?? "");
+  assert.ok(first.setupKey!.includes(closed.high.toFixed(2)), first.setupKey ?? "");
+  // Altro tick sullo stesso livello: stessa chiave, quindi la prenotazione non riapre un secondo ordine.
+  const later = { ...input, quote: { ...input.quote, bid: input.quote.bid + 0.2, ask: input.quote.ask + 0.2, mid: input.quote.mid + 0.2 } };
+  assert.equal(evaluateScalper(later).setupKey, first.setupKey);
+});
+check("m1_short: un solo tentativo per livello, riarmato dalla nuova M1 chiusa", () => {
+  withShort({}, () => {
+    const input = shortInput();
+    const first = evaluateScalper(input);
+    assert.equal(first.setup, "m1_short", JSON.stringify(first));
+    const closed = input.m1.at(-1)!;
+    assert.ok(first.setupKey!.includes(closed.datetime), first.setupKey ?? "");
+    // Prezzo ancora piu' su, stesso range e stessa M1 chiusa: chiave invariata.
+    const higher = { ...input, quote: { ...input.quote, bid: input.quote.bid + 0.4, ask: input.quote.ask + 0.4, mid: input.quote.mid + 0.4 } };
+    assert.equal(evaluateScalper(higher).setupKey, first.setupKey);
+    // Nuova M1 chiusa dentro il range: stesso livello ma setup riarmato, chiave diversa.
+    const next = { ...input, nowMs: input.nowMs + MINUTE, m1: [...input.m1], quote: { ...input.quote, quotedAt: input.nowMs + MINUTE } };
+    next.m1.push(bar(Date.parse(closed.datetime) + MINUTE, closed.open, closed.close, 0.2));
+    const after = evaluateScalper(next);
+    assert.equal(after.setup, "m1_short", JSON.stringify(after));
+    assert.notEqual(after.setupKey, first.setupKey);
+  });
+});
 check("m1_short: chiusura dentro il range non entra", () => {
   withShort({}, () => {
-    const s = evaluateScalper(shortInput({ breakout: 0.2 }));
+    // Dentro il buffer: il livello e' toccato ma non superato di ENTRY_BUFFER_USD.
+    const s = evaluateScalper(shortInput({ breakout: 0.05 }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.match(s.evaluations.find(e => e.setup === "m1_gate")!.reason, /dentro il range/);
   });
 });
 check("m1_short: candela shock esclusa come nella mtf", () => {
   withShort({}, () => {
-    const s = evaluateScalper(shortInput({ breakout: 12 }));
+    const s = evaluateScalper(shortInput({ shock: 12 }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.match(s.evaluations.find(e => e.setup === "m1_gate")!.reason, /shock/);
   });

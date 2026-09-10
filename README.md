@@ -15,12 +15,18 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 
 A ogni tick viene valutata prima la strategia **mtf-continuation-v1** (M15 → M5 → M1, descritta sotto). Se produce un ordine si usa quello. Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda soltanto l'M1:
 
-- **Entry:** chiusura M1 fuori dal range delle ultime `SHORT_RANGE_BARS` (8) candele M1, nella direzione dell'EMA20 M1 — chiusura sopra l'EMA20 solo BUY, sotto solo SELL.
+- **Entry (su tick):** il prezzo live supera di `ENTRY_BUFFER_USD` il range delle ultime `SHORT_RANGE_BARS` (8) candele M1 **chiuse**, nella direzione dell'EMA20 M1 — prezzo sopra l'EMA20 solo BUY, sotto solo SELL. Non serve la chiusura della candela in corso.
 - **SL:** `SHORT_SL_ATR` (2.0) × ATR M1, alzato a `SHORT_SL_MIN_USD` (3$); se la distanza richiesta supera `SHORT_SL_MAX_USD` (8$) il trade viene **scartato**, non stretto.
 - **TP:** `SHORT_TP_ATR` (0.6) × ATR M1 dentro `SHORT_TP_MIN_USD`–`SHORT_TP_MAX_USD` (1.5–3$), **indipendente dallo SL**: il rapporto R:R è quindi minore di 1 per costruzione. Nessun breakeven e nessun quick profit.
 - **Comuni alla mtf e invariati:** spread massimo, candela shock, ATR M1 dentro i limiti, pausa re-entry 120 s, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, una sola posizione aperta, flatten di fine sessione, STOP, watchdog, Telegram e lotti da `exec_lots` senza cap di rischio.
 - I suoi trade finiscono con `setup = "m1_short"` in `scalper_signals` e in `trades`; la valutazione con i numeri (range, EMA20, ATR, SL, TP) compare in `stream_last_decision.evaluations` come voce `m1_gate`, accanto a `m15_gate`, e la card **Setup valutati** della dashboard mostra entrambe.
 - `SHORT_ENABLED=false` lascia attiva solo la mtf.
+
+### Ingressi su tick e un solo tentativo per livello
+
+Entrambi i setup entrano sul **prezzo corrente**, non sulla chiusura della candela. La candela in formazione non entra mai nel calcolo di range, EMA o ATR: quelli usano solo candele chiuse, del tick serve soltanto il prezzo per superare il livello (più il filtro candela shock, che continua a guardare anche la candela in corso).
+
+Il livello vale **una volta sola**: `setup_key` contiene il livello e la M1 chiusa che lo definisce (`level_used`), e l'indice unico su `scalper_signals.setup_key` impedisce un secondo ordine sullo stesso livello. Il setup si riarma quando chiude una nuova M1 — nuovo range, nuova chiave.
 
 ## Strategia M15 / M5 / M1
 
@@ -33,7 +39,7 @@ Versione: `mtf-continuation-v1`. Una sola strategia di continuazione, simmetrica
 
   L'esito del gate finisce in `stream_last_decision.evaluations` come `m15_gate` (per esempio `"M15 transizione, M5 bias BUY ok: M5 20 candele: max … vs …, min … vs …, prezzo … vs EMA20 M5 …"`) e resta visibile anche quando il tick viene poi scartato più a valle.
 - **M5 — setup:** impulso direzionale, seguito da almeno una candela di ritracciamento realmente contraria. Il rientro deve toccare la zona del livello rotto (`breakout_retest`) oppure EMA9 M5 (`micro_pullback`), mantenendo la struttura. Il setup scade dopo sei M5 senza ingresso.
-- **M1 — conferma:** candela chiusa nella direzione M15, corpo almeno 45%, chiusura oltre gli estremi delle due M1 precedenti. Niente ingresso su candela incompleta, shock o movimento già esteso. La valutazione avviene ad ogni quote, ma una candela in formazione non crea conferme.
+- **M1 — trigger su tick:** l'ordine parte appena il **prezzo live** supera di `ENTRY_BUFFER_USD` (0.10$) il massimo (BUY) o il minimo (SELL) dell'ultima M1 **chiusa**, senza aspettare la chiusura della candela in corso. Il confronto usa il lato conservativo della quote (bid per i long, ask per gli short), l'ingresso avviene ad ask/bid. Restano il filtro candela shock e il limite di inseguimento `MTF_MAX_CHASE_ATR`, ora misurato dal livello.
 - **Dati:** quote fresche, candele valide e ordinate, niente riempimento artificiale dei buchi. Le ultime 15 M1, 10 M5 e 8 M15 devono essere consecutive. Dopo un gap delle quote superiore a un minuto il worker ricarica lo storico. M15 non richiede una terza chiamata dati. Il buffer M5 ha minimo 120 candele.
 - **SL:** oltre gli estremi del pullback M5 e della microstruttura M1, con buffer spread/ATR. Distanza = max(struttura, 1.3 ATR M1, 3 USD di prezzo), massimo 8 USD di prezzo. Lo stop non viene stretto per far passare un setup.
 - **TP:** massimo 2R, limitato dal prossimo estremo dell'impulso o pivot confermato M5/M15 davanti all'ingresso. Occorre almeno 1.5R netto stimato dopo commissioni/slippage. Un ostacolo vicino fa scartare il trade, non viene ignorato per allontanare il target. Nessuna chiusura a importo fisso.
@@ -60,7 +66,7 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `SHORT_TP_MIN_USD` / `SHORT_TP_MAX_USD` | 1.5 / 3.0 | Limiti del TP, indipendenti dallo SL |
 | `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
 | `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
-| `MTF_M1_BODY_MIN` | 0.45 | Corpo minimo della conferma M1 |
+| `ENTRY_BUFFER_USD` | 0.10 | Margine oltre il livello per il trigger su tick (entrambi i setup) |
 | `MTF_MAX_CHASE_ATR` | 0.45 | Massima estensione dal close di conferma in ATR M1 |
 | `MTF_MAX_SPREAD_RISK` | 0.20 | Spread massimo rispetto al rischio sul prezzo |
 | `MTF_MIN_NET_RR` / `MTF_TARGET_RR` | 1.5 / 2 | R netto stimato minimo / obiettivo massimo |
