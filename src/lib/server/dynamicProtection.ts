@@ -79,8 +79,8 @@ function normalizeFloat(value: number, tickSizeUsd: number) {
 }
 
 /**
- * Directional tick normalization: levels are always rounded away from the current/entry side,
- * never closer. This preserves the requested minimum distance after quantization.
+ * Directional tick normalization. Levels are rounded away from entry/current price so
+ * quantization never makes the requested protection distance artificially smaller.
  */
 export function normalizeLevelToTick(input: {
   direction: TradeDirection;
@@ -117,8 +117,8 @@ export type DynamicDistances = {
 };
 
 /**
- * Calculates all distances from market inputs. Invalid ATR/spread/config never fall back to
- * invented values: the caller must reject/hold instead.
+ * Calculates distances from market inputs. Invalid ATR/spread/config never fall back to
+ * invented values: the caller must reject or hold instead.
  */
 export function dynamicDistances(
   atrM1: number,
@@ -184,7 +184,7 @@ export type InitialDynamicLevels = {
  * Paper/backtest initial plan.
  * SL is the widest requirement from structure + ATR M1 + spread + broker minimum.
  * TP is calculated by code from ATR M1 + spread and is fixed after entry.
- * Levels are quantized to tick size in the safe direction.
+ * Levels are quantized to tick size in the safe direction. Maxima are strict even after quantization.
  */
 export function initialDynamicLevels(input: {
   direction: TradeDirection;
@@ -224,10 +224,7 @@ export function initialDynamicLevels(input: {
 
   const requiredSlDistanceUsd = Math.max(base.requiredSlDistanceUsd!, structuralDistanceUsd, brokerMinRaw);
   if (requiredSlDistanceUsd > config.slMaxUsd) {
-    return {
-      ...empty("sl_distance_above_max"),
-      requiredSlDistanceUsd,
-    };
+    return { ...empty("sl_distance_above_max"), requiredSlDistanceUsd };
   }
 
   const requestedTpDistanceUsd = Math.max(base.tpDistanceUsd!, brokerMinRaw);
@@ -263,10 +260,12 @@ export function initialDynamicLevels(input: {
   const slDistanceUsd = input.direction === "BUY" ? input.entry - stopLoss : stopLoss - input.entry;
   const tpDistanceUsd = input.direction === "BUY" ? takeProfit - input.entry : input.entry - takeProfit;
   if (slDistanceUsd < brokerMinRaw || tpDistanceUsd < brokerMinRaw) return empty("invalid_market_data");
-  if (slDistanceUsd > config.slMaxUsd + tickSizeUsd + 1e-9) {
+
+  // Strict means strict: tick normalization must not be allowed to push either level past its max.
+  if (slDistanceUsd > config.slMaxUsd + 1e-9) {
     return { ...empty("sl_distance_above_max"), requiredSlDistanceUsd, slDistanceUsd };
   }
-  if (tpDistanceUsd > config.tpMaxUsd + tickSizeUsd + 1e-9) {
+  if (tpDistanceUsd > config.tpMaxUsd + 1e-9) {
     return { ...empty("tp_distance_above_max"), requiredSlDistanceUsd, tpDistanceUsd };
   }
 
@@ -324,8 +323,7 @@ export function dynamicProfitProtection(input: {
   const brokerMinRaw = input.brokerMinDistanceUsd ?? 0;
   const tickSizeUsd = input.tickSizeUsd ?? 0.01;
   const intervalMs = input.minUpdateIntervalMs ?? 350;
-  if (!validNonNegative(brokerMinRaw) || !validPositive(tickSizeUsd)
-    || !validNonNegative(intervalMs)) {
+  if (!validNonNegative(brokerMinRaw) || !validPositive(tickSizeUsd) || !validNonNegative(intervalMs)) {
     return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
   }
 
