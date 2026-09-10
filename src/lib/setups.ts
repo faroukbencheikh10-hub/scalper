@@ -12,7 +12,8 @@ export function setupLabel(setup: string | null | undefined) {
     : key === "liquidity_sweep" ? "Sweep di liquidità"
       : key === "momentum_breakout" ? "Momentum breakout"
         : key === "breakout_retest" ? "Breakout retest"
-          : key === "filtri" ? "Filtri di protezione"
-            : key && key !== "none" ? key : "—";
+          : key === "m15_gate" ? "Contesto M15/M5"
+            : key === "filtri" ? "Filtri di protezione"
+              : key && key !== "none" ? key : "—";
   return manual && label !== "—" ? `${label} (manuale)` : label;
 }

@@ -7,7 +7,7 @@ import type { Candle } from "../src/lib/types";
 
 // Isolate test configuration from deployment/local env.
 for (const key of Object.keys(process.env)) {
-  if (/^(MTF_|SCALPER_|SL_|SHOCK_)/.test(key)) delete process.env[key];
+  if (/^(MTF_|SCALPER_|SL_|SHOCK_|M15_)/.test(key)) delete process.env[key];
 }
 process.env.SCALPER_HOURS_UTC = "00:00-23:59";
 const nowMs = Date.UTC(2026, 8, 9, 10, 6, 1);
@@ -109,6 +109,42 @@ check("M15 range blocks an otherwise bullish M1", () => {
   const input = fixture();
   input.m5 = input.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
   rejected(input, /M15 in range/);
+});
+// M15 senza trend confermato ma banda larga: in soft mode decide il bias M5.
+// La minima di m5[110] scende sotto la minima del gruppo M15 precedente (rompe gli higher low M15)
+// restando sopra la minima delle 20 candele M5 precedenti (la struttura M5 HH/HL regge).
+function m15Transition(low: number) {
+  const input = fixture();
+  input.m5[110] = { ...input.m5[110], low };
+  return input;
+}
+function withTrendMode(mode: string, test: () => void) {
+  const previous = process.env.M15_TREND_MODE;
+  process.env.M15_TREND_MODE = mode;
+  try { test(); } finally {
+    if (previous === undefined) delete process.env.M15_TREND_MODE; else process.env.M15_TREND_MODE = previous;
+  }
+}
+check("M15 transition: M5 bias unlocks the entry in soft mode", () => {
+  const s = evaluateScalper(m15Transition(2240));
+  assert.equal(s.direction, "BUY", JSON.stringify(s));
+  assert.equal(s.setup, "micro_pullback");
+  const gate = s.evaluations.find(e => e.setup === "m15_gate");
+  assert.ok(gate && gate.status === "triggered", JSON.stringify(s.evaluations));
+  assert.match(gate!.reason, /M15 transizione, M5 bias BUY ok/);
+  // Il motivo porta i numeri: struttura M5, prezzo, EMA20 M5 e banda M15.
+  assert.match(gate!.reason, /max 2257\.20 vs 2244\.35/);
+  assert.match(gate!.reason, /EMA20 M5 \d+\.\d\d/);
+  assert.match(gate!.reason, /banda 12 M15 \d+\.\d\d\$ = \d+\.\d\d ATR15/);
+  // SL/TP restano quelli del setup, la modifica riguarda solo il contesto.
+  const base = evaluateScalper(fixture());
+  assert.equal(s.entry, base.entry); assert.equal(s.stopLoss, base.stopLoss); assert.equal(s.takeProfit, base.takeProfit);
+});
+check("M15_TREND_MODE=strict keeps blocking the same transition", () => {
+  withTrendMode("strict", () => rejected(m15Transition(2240), /M15 in range o transizione/));
+});
+check("M15 transition without M5 structure stays blocked", () => {
+  rejected(m15Transition(2239.5), /bias M5 non direzionale/);
 });
 check("M15 opposite to M1 cannot buy", () => {
   const input = fixture(); input.m5 = mirror(input).m5;

@@ -115,28 +115,65 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     if (rising && fast! > slow! && slope > atr15 * 0.05 && last15.close > slow!) direction = "BUY";
     if (falling && fast! < slow! && slope < -atr15 * 0.05 && last15.close < slow!) direction = "SELL";
   }
+  let gateNote = direction
+    ? "M15 trend " + direction + " confermato: sep " + sep.toFixed(2) + " ATR15, efficienza " + efficiency.toFixed(2) + "."
+    : "";
+
+  // M15_TREND_MODE=soft (default): il contesto M15 non confermato non blocca da solo. Blocca solo il
+  // range vero, cioe' una banda di 12 candele che vale pochi ATR con il prezzo dentro; in transizione
+  // la direzione la decide il bias M5 (struttura HH/HL o LL/LH piu' lato della EMA20 M5).
+  // Con M15_TREND_MODE=strict resta il comportamento precedente.
+  if (!direction && (process.env.M15_TREND_MODE?.trim().toLowerCase() ?? "soft") !== "strict") {
+    const band = m15.slice(-12), bandHigh = maxHigh(band), bandLow = minLow(band);
+    const width = bandHigh - bandLow, widthAtr = width / atr15, price = m5.at(-1)!.close;
+    const maxWidthAtr = env("M15_RANGE_BAND_ATR", 3, 0.5, 20);
+    const edge = width * env("M15_RANGE_EDGE", 0.15, 0, 0.45);
+    const inside = price > bandLow + edge && price < bandHigh - edge;
+    const bandDetail = "banda 12 M15 " + width.toFixed(2) + "$ = " + widthAtr.toFixed(2) + " ATR15 (max "
+      + maxWidthAtr.toFixed(2) + "), ATR15 " + atr15.toFixed(2) + "$, prezzo " + price.toFixed(2)
+      + " in " + bandLow.toFixed(2) + "-" + bandHigh.toFixed(2);
+    if (widthAtr <= maxWidthAtr && inside) {
+      return reject("M15 in range vero: " + bandDetail + ". Nessun movimento da seguire.");
+    }
+    const bars = Math.floor(env("M15_BIAS_M5_BARS", 20, 6, 60)), half = Math.floor(bars / 2);
+    const previous5 = m5.slice(-bars, -half), recent5 = m5.slice(-half);
+    const ema20 = emaCloseSeries(m5, 20).at(-1)!;
+    const recentHigh = maxHigh(recent5), previousHigh = maxHigh(previous5);
+    const recentLow = minLow(recent5), previousLow = minLow(previous5);
+    const bias = recentHigh > previousHigh && recentLow > previousLow && price > ema20 ? "BUY"
+      : recentHigh < previousHigh && recentLow < previousLow && price < ema20 ? "SELL" : null;
+    const biasDetail = "M5 " + bars + " candele: max " + recentHigh.toFixed(2) + " vs " + previousHigh.toFixed(2)
+      + ", min " + recentLow.toFixed(2) + " vs " + previousLow.toFixed(2)
+      + ", prezzo " + price.toFixed(2) + " vs EMA20 M5 " + ema20.toFixed(2);
+    if (!bias) return reject("M15 transizione, ma bias M5 non direzionale: " + biasDetail + " (" + bandDetail + ").");
+    direction = bias;
+    gateNote = "M15 transizione, M5 bias " + bias + " ok: " + biasDetail + " (" + bandDetail + ").";
+  }
   if (!direction) return reject("M15 in range o transizione: manca un trend strutturale confermato.");
   const d = direction;
+  // Il contesto che ha aperto il tick resta visibile anche quando il blocco arriva piu' avanti.
+  const gateEval: SetupEvaluation = { setup: "m15_gate", status: "triggered", direction: d, reason: gateNote };
+  const rejectAfterGate = (reason: string) => reject(reason, [gateEval, { setup: "filtri", status: "rejected", reason }]);
   const fast5 = emaCloseSeries(m5, 9), slow5 = emaCloseSeries(m5, 21);
   if (signed(d, fast5.at(-1)! - slow5.at(-1)!) <= 0
-    || signed(d, m5.at(-1)!.close - slow5.at(-1)!) < -atr5 * 0.25) return reject("M15 " + d + ", ma M5 contrario o struttura del pullback rotta.");
+    || signed(d, m5.at(-1)!.close - slow5.at(-1)!) < -atr5 * 0.25) return rejectAfterGate("M15 " + d + ", ma M5 contrario o struttura del pullback rotta.");
 
   const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
   const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
-  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) return reject("Candela M1 shock: attendo un nuovo setup, nessun inseguimento.");
+  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) return rejectAfterGate("Candela M1 shock: attendo un nuovo setup, nessun inseguimento.");
   const preceding = m1.slice(-3, -1);
   const triggerLevel = d === "BUY" ? maxHigh(preceding) : minLow(preceding);
   if (signed(d, trigger.close - trigger.open) <= 0 || body(trigger) < env("MTF_M1_BODY_MIN", 0.45, 0.1, 0.95)
-    || signed(d, trigger.close - triggerLevel) < atr1 * 0.03) return reject("M15 " + d + ": attendo chiusura M1 di ripartenza oltre la microstruttura.");
+    || signed(d, trigger.close - triggerLevel) < atr1 * 0.03) return rejectAfterGate("M15 " + d + ": attendo chiusura M1 di ripartenza oltre la microstruttura.");
   const entry = d === "BUY" ? quote.ask : quote.bid;
   const exitQuote = d === "BUY" ? quote.bid : quote.ask;
   const drift = signed(d, entry - trigger.close);
   if (drift > atr1 * env("MTF_MAX_CHASE_ATR", 0.45, 0.05, 2)
-    || signed(d, exitQuote - triggerLevel) < -atr1 * 0.1) return reject("Conferma M1 persa o ingresso già troppo esteso.");
+    || signed(d, exitQuote - triggerLevel) < -atr1 * 0.1) return rejectAfterGate("Conferma M1 persa o ingresso già troppo esteso.");
 
   // A directional M5 impulse followed by an actual retracement defines one persistent setup.
   const lookback = Math.floor(env("MTF_M5_SETUP_BARS", 6, 2, 12));
-  const evaluations: SetupEvaluation[] = [];
+  const evaluations: SetupEvaluation[] = [gateEval];
   for (let i = m5.length - 2; i >= Math.max(21, m5.length - 1 - lookback); i--) {
     const impulse = m5[i], tail = m5.slice(i + 1);
     if (signed(d, impulse.close - impulse.open) <= 0 || body(impulse) < 0.5 || range(impulse) < atr5 * 0.8) continue;
@@ -191,7 +228,7 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
     return { direction: d, setup, setupKey: key, entry, stopLoss: sl, takeProfit: tp,
       riskReward: Number(rr.toFixed(2)), slPlan: { structural: Number(structural.toFixed(2)), atr: Number(atrRisk.toFixed(2)),
         applied: Number(appliedRisk.toFixed(2)), minUsd, maxUsd, rr: Number(rr.toFixed(2)), estimatedCostPrice: cost, minNetR }, evaluations,
-      reasoning: STRATEGY_VERSION + ": M15 " + d + " con struttura e EMA9/21 coerenti; M5 " + setup + "; conferma M1 " + trigger.datetime + "."
+      reasoning: STRATEGY_VERSION + ": " + gateNote + " M5 " + setup + "; conferma M1 " + trigger.datetime + "."
         + " SL strutturale " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R), netto stimato " + netR.toFixed(2) + "R."
         + " Setup " + key + ". [shadow-score:" + score + "]" };
   }

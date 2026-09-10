@@ -15,7 +15,12 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 
 Versione: `mtf-continuation-v1`. Una sola strategia di continuazione, simmetrica BUY/SELL. Il worker decide ed esegue; le API web fanno soltanto analisi e controllo.
 
-- **M15 — contesto:** 30 candele complete minime, aggregate da tre M5 chiuse consecutive e allineate UTC. EMA9/21, pendenza e massimi/minimi di due blocchi consecutivi di tre M15 devono indicare la stessa direzione. Efficienza delle ultime otto chiusure almeno 0.35; range e transizione producono NO_TRADE.
+- **M15 — contesto:** 30 candele complete minime, aggregate da tre M5 chiuse consecutive e allineate UTC. EMA9/21, pendenza e massimi/minimi di due blocchi consecutivi di tre M15 devono indicare la stessa direzione, con efficienza delle ultime otto chiusure almeno 0.35: questo resta il trend M15 confermato.
+- **M15 non confermato (`M15_TREND_MODE`):** con `strict` il tick viene scartato come prima. Con `soft` (default) il filtro non blocca da solo:
+  - **range vero → NO_TRADE**: la banda delle ultime 12 M15 vale meno di `M15_RANGE_BAND_ATR` ATR15 **e** il prezzo è dentro la banda (con margine `M15_RANGE_EDGE` dai bordi). È l'unico caso di blocco, il motivo riporta banda, ATR15 e prezzo.
+  - **transizione → decide il bias M5**: serve struttura HH/HL (BUY) o LL/LH (SELL) confrontando le due metà delle ultime `M15_BIAS_M5_BARS` candele M5, con il prezzo dal lato giusto della EMA20 M5. Senza struttura il tick viene scartato con i valori numerici del confronto.
+
+  L'esito del gate finisce in `stream_last_decision.evaluations` come `m15_gate` (per esempio `"M15 transizione, M5 bias BUY ok: M5 20 candele: max … vs …, min … vs …, prezzo … vs EMA20 M5 …"`) e resta visibile anche quando il tick viene poi scartato più a valle.
 - **M5 — setup:** impulso direzionale, seguito da almeno una candela di ritracciamento realmente contraria. Il rientro deve toccare la zona del livello rotto (`breakout_retest`) oppure EMA9 M5 (`micro_pullback`), mantenendo la struttura. Il setup scade dopo sei M5 senza ingresso.
 - **M1 — conferma:** candela chiusa nella direzione M15, corpo almeno 45%, chiusura oltre gli estremi delle due M1 precedenti. Niente ingresso su candela incompleta, shock o movimento già esteso. La valutazione avviene ad ogni quote, ma una candela in formazione non crea conferme.
 - **Dati:** quote fresche, candele valide e ordinate, niente riempimento artificiale dei buchi. Le ultime 15 M1, 10 M5 e 8 M15 devono essere consecutive. Dopo un gap delle quote superiore a un minuto il worker ricarica lo storico. M15 non richiede una terza chiamata dati. Il buffer M5 ha minimo 120 candele.
@@ -32,6 +37,10 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | --- | --- | --- |
 | `MTF_M15_MIN_SEP_ATR` | 0.08 | Separazione EMA9/21 M15 in ATR |
 | `MTF_M15_MIN_EFFICIENCY` | 0.35 | Efficienza direzionale M15 |
+| `M15_TREND_MODE` | soft | `strict` = solo trend M15 confermato, `soft` = bias M5 in transizione |
+| `M15_RANGE_BAND_ATR` | 3.0 | Banda 12 M15 (in ATR15) sotto cui è range vero |
+| `M15_RANGE_EDGE` | 0.15 | Margine dai bordi della banda per dire "prezzo dentro" |
+| `M15_BIAS_M5_BARS` | 20 | Candele M5 confrontate per la struttura HH/HL o LL/LH |
 | `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
 | `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
 | `MTF_M1_BODY_MIN` | 0.45 | Corpo minimo della conferma M1 |

@@ -20,8 +20,8 @@ export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_r
 
 /** Diagnostica di un singolo tick: cosa e' stato valutato e perche' e' stato scartato. */
 export type SetupEvaluation = {
-  /** Nome del setup valutato oppure "filtri" per i blocchi di protezione a monte. */
-  setup: ScalperSetup | "filtri";
+  /** Setup valutato, "m15_gate" per il contesto M15/M5 o "filtri" per i blocchi di protezione a monte. */
+  setup: ScalperSetup | "filtri" | "m15_gate";
   status: "triggered" | "rejected";
   direction?: "BUY" | "SELL";
   reason: string;
