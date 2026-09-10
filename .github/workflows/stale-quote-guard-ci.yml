@@ -19,8 +19,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
+      - run: npm install --no-package-lock
       - name: Apply stale quote guard
         run: python3 scripts/_apply_stale_quote_guard.py
       - name: Typecheck
