@@ -1,0 +1,258 @@
+from pathlib import Path
+
+
+def replace_once(path: str, old: str, new: str):
+    p = Path(path)
+    text = p.read_text()
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{path}: expected one match, found {count}: {old[:120]!r}")
+    p.write_text(text.replace(old, new, 1))
+
+
+Path("src/lib/server/workerHeartbeat.ts").write_text('''export type ParsedWorkerHeartbeat = {
+  at: string | null;
+  atMs: number | null;
+  quoteAgeSec: number | null;
+};
+
+function finiteQuoteAge(value: unknown) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
+}
+
+export function encodeWorkerHeartbeat(at: Date, quoteAgeSec: unknown) {
+  return JSON.stringify({
+    at: at.toISOString(),
+    quoteAgeSec: finiteQuoteAge(quoteAgeSec),
+  });
+}
+
+/** Accepts the new JSON payload and the legacy ISO string during rolling deploys. */
+export function parseWorkerHeartbeat(value: string | undefined): ParsedWorkerHeartbeat {
+  if (!value) return { at: null, atMs: null, quoteAgeSec: null };
+  let at = value;
+  let quoteAgeSec: number | null = null;
+  try {
+    const parsed = JSON.parse(value) as { at?: unknown; quoteAgeSec?: unknown };
+    if (parsed && typeof parsed === "object") {
+      if (typeof parsed.at === "string") at = parsed.at;
+      quoteAgeSec = finiteQuoteAge(parsed.quoteAgeSec);
+    }
+  } catch {
+    // Legacy heartbeat was a plain ISO timestamp.
+  }
+  const parsedAt = Date.parse(at);
+  return {
+    at: Number.isFinite(parsedAt) ? new Date(parsedAt).toISOString() : null,
+    atMs: Number.isFinite(parsedAt) ? parsedAt : null,
+    quoteAgeSec,
+  };
+}
+''')
+
+replace_once(
+    "worker/streaming.ts",
+    'import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";\n',
+    'import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";\nimport { encodeWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";\n',
+)
+replace_once(
+    "worker/streaming.ts",
+    '''async function markWorker(status: string, extra?: Record<string, unknown>) {
+  await Promise.all([
+    setSetting("stream_worker_status", status),
+    setSetting("stream_worker_heartbeat", new Date().toISOString()),
+    extra ? setSetting("stream_worker_detail", JSON.stringify(extra)) : Promise.resolve(),
+  ]);
+}
+''',
+    '''async function markWorker(status: string, extra?: Record<string, unknown>) {
+  const now = new Date();
+  await Promise.all([
+    setSetting("stream_worker_status", status),
+    setSetting("stream_worker_heartbeat", encodeWorkerHeartbeat(now, extra?.quoteAgeSec)),
+    extra ? setSetting("stream_worker_detail", JSON.stringify(extra)) : Promise.resolve(),
+  ]);
+}
+''',
+)
+
+replace_once(
+    "src/app/api/health/route.ts",
+    'import { ensureSchema, getSettings } from "@/lib/server/db";\n',
+    'import { ensureSchema, getSettings } from "@/lib/server/db";\nimport { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";\n',
+)
+replace_once(
+    "src/app/api/health/route.ts",
+    '''    const heartbeat = settings.get("stream_worker_heartbeat");
+    const heartbeatMs = heartbeat ? Date.parse(heartbeat) : Number.NaN;
+    const heartbeatAgeSec = Number.isFinite(heartbeatMs)
+      ? Math.max(0, Math.floor((Date.now() - heartbeatMs) / 1000))
+      : null;
+''',
+    '''    const heartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
+    const heartbeatAgeSec = heartbeat.atMs !== null
+      ? Math.max(0, Math.floor((Date.now() - heartbeat.atMs) / 1000))
+      : null;
+''',
+)
+replace_once(
+    "src/app/api/health/route.ts",
+    '      return NextResponse.json({ ok: true, heartbeatAgeSec, status, systemStopped: stopped });\n',
+    '      return NextResponse.json({ ok: true, heartbeatAgeSec, quoteAgeSec: heartbeat.quoteAgeSec, status, systemStopped: stopped });\n',
+)
+replace_once(
+    "src/app/api/health/route.ts",
+    '''      heartbeatAgeSec,
+      status,
+    }, { status: 503 });
+''',
+    '''      heartbeatAgeSec,
+      quoteAgeSec: heartbeat.quoteAgeSec,
+      status,
+    }, { status: 503 });
+''',
+)
+
+replace_once(
+    "src/app/api/state/route.ts",
+    'import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";\n',
+    'import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";\nimport { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";\n',
+)
+replace_once(
+    "src/app/api/state/route.ts",
+    'type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };\n',
+    'type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };\n',
+)
+replace_once(
+    "src/app/api/state/route.ts",
+    '''    const workerStatus = settings.get("stream_worker_status") ?? "not_started";
+    const workerHeartbeat = settings.get("stream_worker_heartbeat");
+    const workerDetail = parseJson<WorkerDetail>(settings.get("stream_worker_detail"));
+''',
+    '''    const workerStatus = settings.get("stream_worker_status") ?? "not_started";
+    const workerHeartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
+    const workerDetail = parseJson<WorkerDetail>(settings.get("stream_worker_detail"));
+''',
+)
+replace_once(
+    "src/app/api/state/route.ts",
+    '''    const heartbeatMs = workerHeartbeat ? Date.parse(workerHeartbeat) : Number.NaN;
+    const heartbeatAgeMs = Number.isFinite(heartbeatMs) ? Math.max(0, now.getTime() - heartbeatMs) : null;
+''',
+    '''    const heartbeatMs = workerHeartbeat.atMs ?? Number.NaN;
+    const heartbeatAgeMs = workerHeartbeat.atMs !== null ? Math.max(0, now.getTime() - workerHeartbeat.atMs) : null;
+''',
+)
+replace_once(
+    "src/app/api/state/route.ts",
+    '      operational: { state, heartbeatFresh, heartbeatAgeSeconds: heartbeatAgeMs === null ? null : Math.floor(heartbeatAgeMs / 1000) },\n',
+    '      operational: { state, heartbeatFresh, heartbeatAgeSeconds: heartbeatAgeMs === null ? null : Math.floor(heartbeatAgeMs / 1000), quoteAgeSec: workerHeartbeat.quoteAgeSec ?? workerDetail?.quoteAgeSec ?? null },\n',
+)
+replace_once(
+    "src/app/api/state/route.ts",
+    '      stream: { status: workerStatus, heartbeat: workerHeartbeat ?? null, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },\n',
+    '      stream: { status: workerStatus, heartbeat: workerHeartbeat.at, heartbeatData: { at: workerHeartbeat.at, quoteAgeSec: workerHeartbeat.quoteAgeSec }, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },\n',
+)
+
+replace_once(
+    "worker/watchdog.ts",
+    'import { effectiveQuoteAgeSec } from "../src/lib/server/staleQuoteGuard";\n',
+    'import { effectiveQuoteAgeSec } from "../src/lib/server/staleQuoteGuard";\nimport { parseWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";\n',
+)
+replace_once(
+    "worker/watchdog.ts",
+    '''  const detail = parsedObject(settings.get("stream_worker_detail"));
+  const detailAgeRaw = Number(detail?.quoteAgeSec);
+''',
+    '''  const heartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
+  const detail = parsedObject(settings.get("stream_worker_detail"));
+  const detailAgeRaw = Number(detail?.quoteAgeSec);
+''',
+)
+replace_once(
+    "worker/watchdog.ts",
+    '''  const quoteAges = [detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
+  const quoteAgeSec = quoteAges.length > 0 ? Math.max(...quoteAges) : null;
+''',
+    '''  const heartbeatQuoteAgeSec = heartbeat.quoteAgeSec === null
+    ? null
+    : sessionAgeSec === null ? heartbeat.quoteAgeSec : Math.min(heartbeat.quoteAgeSec, sessionAgeSec);
+  const quoteAges = [heartbeatQuoteAgeSec, detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
+  const quoteAgeSec = quoteAges.length > 0 ? Math.max(...quoteAges) : null;
+''',
+)
+replace_once(
+    "worker/watchdog.ts",
+    '''  const heartbeat = settings.get("stream_worker_heartbeat");
+  const heartbeatMs = heartbeat ? Date.parse(heartbeat) : Number.NaN;
+  const ageSec = Number.isFinite(heartbeatMs) ? Math.max(0, Math.floor((Date.now() - heartbeatMs) / 1000)) : null;
+''',
+    '''  const heartbeatMs = heartbeat.atMs ?? Number.NaN;
+  const ageSec = heartbeat.atMs !== null ? Math.max(0, Math.floor((Date.now() - heartbeat.atMs) / 1000)) : null;
+''',
+)
+
+replace_once(
+    "src/app/page.tsx",
+    '  operational?: { state?: OperationalState; heartbeatFresh?: boolean; heartbeatAgeSeconds?: number | null };\n',
+    '  operational?: { state?: OperationalState; heartbeatFresh?: boolean; heartbeatAgeSeconds?: number | null; quoteAgeSec?: number | null };\n',
+)
+replace_once(
+    "src/app/page.tsx",
+    '''          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong>{decisionSetup ? <> · setup <strong>{setupLabel(decisionSetup)}</strong></> : null} — {shorten(decision.reasoning) || "nessun dettaglio"}</> : null}</p>
+''',
+    '''          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{Number.isFinite(data?.operational?.quoteAgeSec) ? <> · Ultima quote <strong style={{ color: style.color }}>{Math.max(0, Number(data?.operational?.quoteAgeSec))} s fa</strong></> : null}{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong>{decisionSetup ? <> · setup <strong>{setupLabel(decisionSetup)}</strong></> : null} — {shorten(decision.reasoning) || "nessun dettaglio"}</> : null}</p>
+''',
+)
+
+replace_once(
+    "scripts/stale-quote-scenarios.ts",
+    'import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";\n',
+    'import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";\nimport { encodeWorkerHeartbeat, parseWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";\n',
+)
+replace_once(
+    "scripts/stale-quote-scenarios.ts",
+    '''check("riapertura non eredita silenzio overnight", () => {
+  const oldQuote = start - 10 * 60 * 60_000;
+  assert.equal(decide(120, { lastQuoteReceivedAtMs: oldQuote }).action, "idle");
+  assert.equal(decide(121, { lastQuoteReceivedAtMs: oldQuote }).action, "reconnect");
+});
+console.log(`Stale quote scenarios passed: ${passed}`);
+''',
+    '''check("riapertura non eredita silenzio overnight", () => {
+  const oldQuote = start - 10 * 60 * 60_000;
+  assert.equal(decide(120, { lastQuoteReceivedAtMs: oldQuote }).action, "idle");
+  assert.equal(decide(121, { lastQuoteReceivedAtMs: oldQuote }).action, "reconnect");
+});
+check("heartbeat JSON include quoteAgeSec", () => {
+  const encoded = encodeWorkerHeartbeat(new Date(start + 10_000), 137.9);
+  assert.deepEqual(parseWorkerHeartbeat(encoded), {
+    at: new Date(start + 10_000).toISOString(), atMs: start + 10_000, quoteAgeSec: 137,
+  });
+});
+check("heartbeat legacy ISO resta compatibile", () => {
+  assert.deepEqual(parseWorkerHeartbeat(new Date(start).toISOString()), {
+    at: new Date(start).toISOString(), atMs: start, quoteAgeSec: null,
+  });
+});
+console.log(`Stale quote scenarios passed: ${passed}`);
+''',
+)
+
+replace_once(
+    "README.md",
+    '`stream_worker_detail` include `quoteAgeSec` e `quoteReceivedAt`. `stream_last_quote.receivedAt` è il timestamp reale dell\'ultima quote valida ricevuta e non viene più avanzato artificialmente dal timer di persistenza.',
+    '`stream_worker_heartbeat` è un payload JSON `{ at, quoteAgeSec }` (i lettori accettano anche il vecchio timestamp ISO durante i rolling deploy); la dashboard mostra l’età dell’ultima quote. `stream_worker_detail` include anche `quoteAgeSec` e `quoteReceivedAt`. `stream_last_quote.receivedAt` è il timestamp reale dell\'ultima quote valida ricevuta e non viene più avanzato artificialmente dal timer di persistenza.',
+)
+
+changed = set()
+for path in [
+    "worker/streaming.ts", "worker/watchdog.ts", "src/lib/server/workerHeartbeat.ts",
+    "src/app/api/health/route.ts", "src/app/api/state/route.ts", "src/app/page.tsx",
+    "scripts/stale-quote-scenarios.ts", "README.md",
+]:
+    changed.add(path)
+if "src/lib/server/scalperStrategy.ts" in changed:
+    raise SystemExit("strategy changed unexpectedly")
+print("Heartbeat quote-age patch staged")
