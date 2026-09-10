@@ -81,7 +81,7 @@ export async function GET() {
     let state: OperationalState;
     if (stopped) state = "STOP";
     else if (!heartbeatFresh) state = "OFFLINE";
-    else if (!sessionStatus.inside || sessionStatus.inFlattenWindow) state = "WAITING";
+    else if (sessionStatus.weekendClosed || sessionStatus.inFlattenWindow) state = "WAITING";
     else state = "LIVE";
 
     const errorIsCurrent = Boolean(parsedError?.atMs !== null && parsedError?.atMs !== undefined && (!Number.isFinite(heartbeatMs) || parsedError.atMs > heartbeatMs));

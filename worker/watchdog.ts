@@ -47,7 +47,6 @@ function sessionForcesClose() {
   if (status.minutesUntilEnd !== null && status.minutesUntilEnd <= SESSION_END_GUARD_MIN) {
     return `fine fascia fra ${status.minutesUntilEnd} min`;
   }
-  if (!status.inside) return "fuori fascia operativa";
   return null;
 }
 
