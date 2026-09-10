@@ -35,8 +35,18 @@ run("compressed band with price outside is transition", () => {
   assert.equal(classifyM15PaperRegime(base({ m15BandAtr: 2.4, priceInsideRangeBand: false })), "transition");
 });
 
-run("confirmed up structure remains trend_up", () => {
-  assert.equal(classifyM15PaperRegime(base({ structure: "trend_up", m15BandAtr: 2 })), "trend_up");
+run("confirmed up structure remains trend_up outside a compressed range", () => {
+  assert.equal(classifyM15PaperRegime(base({ structure: "trend_up", m15BandAtr: 3.5 })), "trend_up");
+});
+
+run("compressed range has priority over apparent trend structure while price stays inside", () => {
+  assert.equal(classifyM15PaperRegime(base({ structure: "trend_up", m15BandAtr: 2.4 })), "true_range");
+});
+
+run("compressed range with apparent trend still blocks m1_short", () => {
+  const d = evaluateShortContextPaper(base({ structure: "trend_up", m15BandAtr: 2.4, biasM5: "up" }));
+  assert.equal(d.regime, "true_range");
+  assert.equal(d.allowed, null);
 });
 
 run("M5 up + M15 transition allows BUY paper setup", () => {
@@ -71,6 +81,18 @@ run("recent M15 breakout keeps anti-chase protection", () => {
   assert.equal(d.allowed, null);
 });
 
+run("invalid M15 metrics fail closed for m1_short", () => {
+  const d = evaluateShortContextPaper(base({ m15BandAtr: Number.NaN }));
+  assert.equal(d.regime, "invalid");
+  assert.equal(d.allowed, null);
+});
+
+run("invalid maxBandAtr fails closed for m1_range", () => {
+  const d = evaluateRangeContextPaper(base({ biasM5: "flat", maxBandAtr: 0 }));
+  assert.equal(d.regime, "invalid");
+  assert.notEqual(d.reason, "m1_range context ok");
+});
+
 run("m1_range accepts only true range with flat M5", () => {
   const d = evaluateRangeContextPaper(base({ biasM5: "flat", m15BandAtr: 2.4 }));
   assert.equal(d.regime, "true_range");
@@ -83,4 +105,4 @@ run("m1_range rejects transition even with flat M5", () => {
   assert.notEqual(d.reason, "m1_range context ok");
 });
 
-console.log(`m15-transition paper scenarios: ${passed}/12 passed`);
+console.log(`m15-transition paper scenarios: ${passed}/16 passed`);
