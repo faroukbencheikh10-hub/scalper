@@ -1133,7 +1133,6 @@ async function main() {
     const status = getSessionStatus(new Date(), sessionConfig);
     if (status.weekendClosed) return { allowed: false, status, reasoning: "Mercato chiuso (weekend)" };
     if (status.inFlattenWindow) return { allowed: false, status, reasoning: `Chiusura sessione tra ${status.minutesUntilEnd ?? 0} min` };
-    if (!status.inside) return { allowed: false, status, reasoning: `Fuori fascia scalper ${sessionConfig.hoursUtc} UTC` };
     return { allowed: true, status, reasoning: null as string | null };
   };
 
@@ -1874,7 +1873,7 @@ async function main() {
   const staleQuoteTimer = setInterval(() => {
     const now = Date.now();
     const status = getSessionStatus(new Date(now), sessionConfig);
-    if (stopped || !status.inside) return;
+    if (stopped || status.weekendClosed) return;
     const sessionStartAtMs = status.sessionStartAt ? Date.parse(status.sessionStartAt) : Number.NaN;
     const decision = staleQuoteDecision({
       active: true,
@@ -1967,12 +1966,6 @@ nessuna quote valida da ${decision.quoteAgeSec ?? "?"} s`,
     if (status.inFlattenWindow) {
       latestDecision = noTradeDecision(`Chiusura sessione tra ${status.minutesUntilEnd ?? 0} min`, latestQuote);
       void flattenSymbol("end_of_session", status.sessionEndAt ?? `session-${new Date().toISOString().slice(0, 10)}`).catch(() => undefined);
-      return;
-    }
-
-    if (!status.inside) {
-      latestDecision = noTradeDecision(`Fuori fascia scalper ${sessionConfig.hoursUtc} UTC`, latestQuote);
-      if (hasExposure) void flattenSymbol("end_of_session", `outside-${new Date().toISOString().slice(0, 10)}`).catch(() => undefined);
     }
   }, 1000);
 

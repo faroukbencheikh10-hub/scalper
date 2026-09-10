@@ -143,7 +143,6 @@ export function getSessionStatus(now = new Date(), config = sessionConfigFromEnv
   let blockReason: string | null = null;
   if (weekendClosed) blockReason = "Mercato chiuso (weekend)";
   else if (inFlattenWindow) blockReason = `Chiusura sessione tra ${minutesUntilEnd ?? 0} min`;
-  else if (!current) blockReason = `Fuori fascia scalper ${config.hoursUtc} UTC`;
 
   return {
     inside: Boolean(current) && !weekendClosed,
@@ -174,5 +173,5 @@ export function sessionWindowStart(now = new Date(), config = sessionConfigFromE
 
 export function sessionAllowsEntry(now = new Date(), config = sessionConfigFromEnv()) {
   const status = getSessionStatus(now, config);
-  return status.inside && !status.inFlattenWindow && !status.weekendClosed;
+  return !status.inFlattenWindow && !status.weekendClosed;
 }

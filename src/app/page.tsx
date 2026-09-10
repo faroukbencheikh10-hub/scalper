@@ -4,8 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { SystemControl } from "@/components/system-control";
 import { setupLabel } from "@/lib/setups";
 import { usdDistanceToEurApprox } from "@/lib/lots";
+import { currentOperationalState, type OperationalState } from "@/lib/operationalState";
 
-type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
 type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
@@ -106,15 +106,6 @@ function shorten(value: string | undefined | null, max = 180) {
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
-function currentState(data: DashboardState | null, now: number): OperationalState {
-  if (!data) return "OFFLINE";
-  if (data.systemStopped) return "STOP";
-  const heartbeatMs = data.stream?.heartbeat ? Date.parse(data.stream.heartbeat) : Number.NaN;
-  if (!Number.isFinite(heartbeatMs) || now - heartbeatMs >= 60_000) return "OFFLINE";
-  if (!data.session?.inside || data.session?.inFlattenWindow) return "WAITING";
-  return "LIVE";
-}
-
 export default function Home() {
   const [data, setData] = useState<DashboardState | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -139,7 +130,7 @@ export default function Home() {
     return () => { window.clearInterval(polling); window.clearInterval(clock); };
   }, [refreshState]);
 
-  const status = currentState(data, now);
+  const status = currentOperationalState(data, now);
   const style = palette[status];
   const quote = data?.quote;
   const decision = data?.stream?.lastDecision;
@@ -217,9 +208,7 @@ export default function Home() {
           ? "Heartbeat assente o più vecchio di 60 secondi."
           : data.session?.weekendClosed
             ? "Mercato chiuso (weekend). Nessuna nuova apertura fino alla riapertura."
-            : data.session?.inFlattenWindow
-              ? `${data.session.blockReason ?? "Chiusura sessione imminente"}. Nuove aperture bloccate e posizioni portate a zero.`
-              : `${data.session?.blockReason ?? "Fuori fascia operativa"}. Ripartenza ${formatHourMinute(data.session?.nextStartAt, "UTC")} UTC.`;
+            : `${data.session?.blockReason ?? "Chiusura sessione imminente"}. Nuove aperture bloccate e posizioni portate a zero.`;
 
   return (
     <main>

@@ -131,7 +131,7 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
   const sessionConfig = sessionConfigFromEnv();
   if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
   const session = getSessionStatus(new Date(nowMs), sessionConfig);
-  if (!session.inside || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
+  if (session.weekendClosed || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
   const m1 = closedBars(input.m1, 1, nowMs), m5 = closedBars(input.m5, 5, nowMs);
   if (!m1 || !m5) return reject("Candele non valide, duplicate o fuori ordine.");
   const m15 = aggregateM15(m5);
@@ -455,7 +455,7 @@ function commonPreflight(input: EvaluateInput, nowMs: number): ScalperSignal | n
   const sessionConfig = sessionConfigFromEnv();
   if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
   const session = getSessionStatus(new Date(nowMs), sessionConfig);
-  if (!session.inside || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
+  if (session.weekendClosed || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
   if (!closedBars(input.m1, 1, nowMs) || !closedBars(input.m5, 5, nowMs)) return reject("Candele non valide, duplicate o fuori ordine.");
   return null;
 }
