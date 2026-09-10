@@ -21,7 +21,7 @@ type DashboardState = {
   ok: boolean;
   error?: string;
   systemStopped: boolean;
-  operational?: { state?: OperationalState; heartbeatFresh?: boolean; heartbeatAgeSeconds?: number | null };
+  operational?: { state?: OperationalState; heartbeatFresh?: boolean; heartbeatAgeSeconds?: number | null; quoteAgeSec?: number | null };
   session?: {
     hoursUtc?: string;
     inside?: boolean;
@@ -215,7 +215,7 @@ export default function Home() {
           <div className="status-kicker" style={{ color: style.color }}><span className="status-dot" aria-hidden="true" style={{ animation: status === "LIVE" ? undefined : "none" }} />{status === "WAITING" ? "IN ATTESA / SESSION GUARD" : status}</div>
           <h1>{status === "LIVE" ? "Scalper LIVE" : status === "WAITING" ? "Entrate in attesa" : status === "STOP" ? "Scalper in STOP" : "Worker offline"}</h1>
           <p>{statusDescription}</p>
-          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong>{decisionSetup ? <> · setup <strong>{setupLabel(decisionSetup)}</strong></> : null} — {shorten(decision.reasoning) || "nessun dettaglio"}</> : null}</p>
+          <p style={{ marginTop: 8 }}>Ultimo heartbeat <strong style={{ color: style.color }}>{heartbeatText(data?.stream?.heartbeat, now)}</strong>{Number.isFinite(data?.operational?.quoteAgeSec) ? <> · Ultima quote <strong style={{ color: style.color }}>{Math.max(0, Number(data?.operational?.quoteAgeSec))} s fa</strong></> : null}{decision ? <> · Decisione <strong className="signal-direction" data-direction={direction}>{direction}</strong>{decisionSetup ? <> · setup <strong>{setupLabel(decisionSetup)}</strong></> : null} — {shorten(decision.reasoning) || "nessun dettaglio"}</> : null}</p>
         </div>
         <div className="state-badge" style={{ color: style.color, background: style.background, borderColor: style.border }}>{status === "LIVE" ? "● LIVE" : style.label}</div>
       </section>

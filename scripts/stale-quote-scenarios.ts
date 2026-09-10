@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
+import { encodeWorkerHeartbeat, parseWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
 
 let passed = 0;
 function check(name: string, test: () => void) {
@@ -36,5 +37,16 @@ check("riapertura non eredita silenzio overnight", () => {
   const oldQuote = start - 10 * 60 * 60_000;
   assert.equal(decide(120, { lastQuoteReceivedAtMs: oldQuote }).action, "idle");
   assert.equal(decide(121, { lastQuoteReceivedAtMs: oldQuote }).action, "reconnect");
+});
+check("heartbeat JSON include quoteAgeSec", () => {
+  const encoded = encodeWorkerHeartbeat(new Date(start + 10_000), 137.9);
+  assert.deepEqual(parseWorkerHeartbeat(encoded), {
+    at: new Date(start + 10_000).toISOString(), atMs: start + 10_000, quoteAgeSec: 137,
+  });
+});
+check("heartbeat legacy ISO resta compatibile", () => {
+  assert.deepEqual(parseWorkerHeartbeat(new Date(start).toISOString()), {
+    at: new Date(start).toISOString(), atMs: start, quoteAgeSec: null,
+  });
 });
 console.log(`Stale quote scenarios passed: ${passed}`);

@@ -3,6 +3,7 @@ import { dbQuery, ensureSchema } from "@/lib/server/db";
 import { lotsMax, lotsMin, resolveLots } from "@/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY, LOT_CHOICES } from "@/lib/lots";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
+import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
 
 export const dynamic = "force-dynamic";
 
@@ -23,7 +24,7 @@ type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type ParsedError = { raw: string; message: string; at: string | null; atMs: number | null };
 type WorkerAccount = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
-type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
+type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
 
 function parseJson<T = Record<string, unknown>>(value: string | undefined): T | null {
   if (!value) return null;
@@ -63,7 +64,7 @@ export async function GET() {
 
     const now = new Date();
     const workerStatus = settings.get("stream_worker_status") ?? "not_started";
-    const workerHeartbeat = settings.get("stream_worker_heartbeat");
+    const workerHeartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
     const workerDetail = parseJson<WorkerDetail>(settings.get("stream_worker_detail"));
     const quote = parseJson(settings.get("stream_last_quote"));
     const lastDecision = parseJson(settings.get("stream_last_decision"));
@@ -71,8 +72,8 @@ export async function GET() {
     const parsedError = parseStreamError(settings.get("stream_last_error"));
     const stopped = settings.get("system_stop") === "true";
 
-    const heartbeatMs = workerHeartbeat ? Date.parse(workerHeartbeat) : Number.NaN;
-    const heartbeatAgeMs = Number.isFinite(heartbeatMs) ? Math.max(0, now.getTime() - heartbeatMs) : null;
+    const heartbeatMs = workerHeartbeat.atMs ?? Number.NaN;
+    const heartbeatAgeMs = workerHeartbeat.atMs !== null ? Math.max(0, now.getTime() - workerHeartbeat.atMs) : null;
     const heartbeatFresh = heartbeatAgeMs !== null && heartbeatAgeMs < 60_000;
     const config = workerSessionConfig(workerDetail);
     const sessionStatus = getSessionStatus(now, config);
@@ -92,7 +93,7 @@ export async function GET() {
       name: "scalper",
       mode: "MetaApi Streaming/WebSocket",
       serverTime: now.toISOString(),
-      operational: { state, heartbeatFresh, heartbeatAgeSeconds: heartbeatAgeMs === null ? null : Math.floor(heartbeatAgeMs / 1000) },
+      operational: { state, heartbeatFresh, heartbeatAgeSeconds: heartbeatAgeMs === null ? null : Math.floor(heartbeatAgeMs / 1000), quoteAgeSec: workerHeartbeat.quoteAgeSec ?? workerDetail?.quoteAgeSec ?? null },
       session: {
         hoursUtc: config.hoursUtc,
         inside: sessionStatus.inside,
@@ -118,7 +119,7 @@ export async function GET() {
       lotChoices: LOT_CHOICES,
       account: workerDetail?.account ?? null,
       results: { total: Number(st.total ?? 0), wins, losses, breakeven: Number(st.breakeven ?? 0), winRate: decided > 0 ? Number(((wins / decided) * 100).toFixed(1)) : 0, profit: Number(st.profit ?? 0), resultR: Number(st.result_r ?? 0), last: lastClosed.rows[0] ?? null },
-      stream: { status: workerStatus, heartbeat: workerHeartbeat ?? null, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },
+      stream: { status: workerStatus, heartbeat: workerHeartbeat.at, heartbeatData: { at: workerHeartbeat.at, quoteAgeSec: workerHeartbeat.quoteAgeSec }, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },
       signals: signals.rows,
     });
   } catch (err) {
