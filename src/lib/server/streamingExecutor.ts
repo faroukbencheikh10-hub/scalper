@@ -5,7 +5,7 @@ import { requiredMargin } from "@/lib/lots";
 import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
 import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
-import { closeReasonFromPrice, countsAsLoss, isManagedSetup } from "./positionManager";
+import { closeReasonFromPrice, countsAsLoss, isManagedSetup, sltpCloseReasonFromPrice } from "./positionManager";
 
 type StreamPosition = {
   id: string;
@@ -392,7 +392,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
 
   const rows = await dbQuery(
     `SELECT id,setup,direction,mt5_position_id,mt5_open_price,entry,stop_loss,take_profit,target1,tp_broker,
-            final_sl,breakeven_price,breakeven_at,trailing_updates,close_reason,created_at
+            final_sl,breakeven_price,breakeven_at,trailing_updates,close_reason,created_at,context_json
        FROM scalper_signals
       WHERE outcome IS NULL AND mt5_position_id IS NOT NULL
       ORDER BY created_at ASC`,
@@ -429,17 +429,28 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
     // lo stato puo' essere in ritardo, il prezzo no.
     const number = (value: unknown) => (Number.isFinite(Number(value)) ? Number(value) : null);
     const trailingUpdates = Number(signal.trailing_updates ?? 0);
+    // SLTP_MODE=fixed|trailing (dynamicSlTp.ts): il broker puo' chiudere la posizione prima del
+    // check attivo del worker. Riconosciuto da context_json.sltp, che non esiste per nessuna riga
+    // aperta con SLTP_MODE=off: quel ramo resta quindi identico a prima in ogni altro caso.
+    const sltp = (signal.context_json as { sltp?: { mode?: string; triggered?: boolean } } | null)?.sltp;
     const closeReason = signal.close_reason
       ? String(signal.close_reason)
-      : isManagedSetup(signal.setup)
-        ? closeReasonFromPrice(close, profit, {
-          initialStop: number(signal.stop_loss),
-          breakevenStop: number(signal.breakeven_price),
-          trailingStop: trailingUpdates > 0 ? number(signal.final_sl) : null,
-          brokerTp: number(signal.tp_broker),
-          target1: number(signal.target1 ?? signal.take_profit),
+      : sltp
+        ? sltpCloseReasonFromPrice(close, {
+          currentSl: number(signal.final_sl ?? signal.stop_loss),
+          slTightened: trailingUpdates > 0,
+          currentTp: number(signal.tp_broker ?? signal.target1 ?? signal.take_profit),
+          tpTriggered: sltp.triggered === true,
         })
-        : null;
+        : isManagedSetup(signal.setup)
+          ? closeReasonFromPrice(close, profit, {
+            initialStop: number(signal.stop_loss),
+            breakevenStop: number(signal.breakeven_price),
+            trailingStop: trailingUpdates > 0 ? number(signal.final_sl) : null,
+            brokerTp: number(signal.tp_broker),
+            target1: number(signal.target1 ?? signal.take_profit),
+          })
+          : null;
     await dbQuery(
       `UPDATE scalper_signals
           SET mt5_close_price=$2,mt5_profit=$3,outcome=$4,result_r=$5,closed_at=COALESCE($6::timestamptz,now()),

@@ -43,3 +43,16 @@ export function stopDistanceFrom(entry: unknown, stopLoss: unknown) {
   const distance = Math.abs(a - b);
   return distance > 0 ? distance : DEFAULT_STOP_DISTANCE;
 }
+
+/**
+ * Cambio USD/EUR approssimativo, solo per mostrare in dashboard un equivalente in € delle
+ * distanze SL/TP in $ (SLTP_MODE=fixed|trailing): a 0.01 lotti 1$ di distanza ≈ 0.85€ di P&L.
+ * Mai usato per rischio, ordini o log del worker: quelli restano sempre e solo in $ di distanza.
+ */
+export const USD_TO_EUR_RATE_APPROX = 0.85;
+
+/** Equivalente approssimativo in € di una distanza in $ ai lotti correnti: distanceUsd * 100 * lots * rate. */
+export function usdDistanceToEurApprox(distanceUsd: number, lots: number) {
+  if (!Number.isFinite(distanceUsd) || !Number.isFinite(lots)) return null;
+  return distanceUsd * CONTRACT_SIZE * lots * USD_TO_EUR_RATE_APPROX;
+}
