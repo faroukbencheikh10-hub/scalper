@@ -5,6 +5,7 @@ import {
   dynamicDistances,
   dynamicProfitProtection,
   initialDynamicLevels,
+  type DynamicProtectionConfig,
 } from "../src/lib/server/dynamicProtection";
 
 let passed = 0;
@@ -17,8 +18,10 @@ function check(name: string, test: () => void) {
 check("dynamic: SL/TP are calculated from ATR and spread", () => {
   const calm = dynamicDistances(1.0, 0.1);
   const fast = dynamicDistances(3.0, 0.4);
-  assert.ok(fast.requiredSlDistanceUsd > calm.requiredSlDistanceUsd);
-  assert.ok(fast.tpDistanceUsd > calm.tpDistanceUsd);
+  assert.equal(calm.valid, true);
+  assert.equal(fast.valid, true);
+  assert.ok(fast.requiredSlDistanceUsd! > calm.requiredSlDistanceUsd!);
+  assert.ok(fast.tpDistanceUsd! > calm.tpDistanceUsd!);
 });
 
 check("dynamic: BUY starts with calculated SL below and TP above entry", () => {
@@ -26,6 +29,14 @@ check("dynamic: BUY starts with calculated SL below and TP above entry", () => {
   assert.equal(levels.valid, true);
   assert.ok(levels.stopLoss !== null && levels.stopLoss < 4400);
   assert.ok(levels.takeProfit !== null && levels.takeProfit > 4400);
+});
+
+check("dynamic: TP is code-calculated from ATR M1 + spread", () => {
+  const calm = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 1, spreadUsd: 0.1 });
+  const fast = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 3, spreadUsd: 0.4 });
+  assert.equal(calm.valid, true);
+  assert.equal(fast.valid, true);
+  assert.ok(fast.tpDistanceUsd! > calm.tpDistanceUsd!);
 });
 
 check("dynamic: market structure can widen the initial SL", () => {
@@ -39,7 +50,7 @@ check("dynamic: market structure can widen the initial SL", () => {
   });
   assert.equal(base.valid, true);
   assert.equal(structural.valid, true);
-  assert.ok(structural.slDistanceUsd > base.slDistanceUsd);
+  assert.ok(structural.slDistanceUsd! > base.slDistanceUsd!);
   assert.equal(structural.stopLoss, 4395);
 });
 
@@ -55,6 +66,51 @@ check("dynamic: oversized required SL rejects setup instead of tightening it", (
   assert.equal(levels.rejectReason, "sl_distance_above_max");
   assert.equal(levels.stopLoss, null);
   assert.equal(levels.takeProfit, null);
+});
+
+check("dynamic: invalid ATR fails closed", () => {
+  const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: Number.NaN, spreadUsd: 0.2 });
+  assert.equal(levels.valid, false);
+  assert.equal(levels.rejectReason, "invalid_market_data");
+  assert.equal(levels.stopLoss, null);
+  assert.equal(levels.takeProfit, null);
+});
+
+check("dynamic: invalid spread fails closed", () => {
+  const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 2, spreadUsd: -0.1 });
+  assert.equal(levels.valid, false);
+  assert.equal(levels.rejectReason, "invalid_market_data");
+});
+
+check("dynamic: incoherent config fails closed", () => {
+  const bad: DynamicProtectionConfig = {
+    slAtrMult: 1.3,
+    slMinUsd: 9,
+    slMaxUsd: 8,
+    tpAtrMult: 0.8,
+    tpMinUsd: 1.5,
+    tpMaxUsd: 4,
+    spreadMult: 3,
+    trailAtrMult: 0.35,
+    trailMinUsd: 0.3,
+    trailMaxUsd: 1.2,
+  };
+  const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 2, spreadUsd: 0.2, config: bad });
+  assert.equal(levels.valid, false);
+  assert.equal(levels.rejectReason, "invalid_config");
+});
+
+check("dynamic: broker minimum distance is respected at entry", () => {
+  const levels = initialDynamicLevels({
+    direction: "BUY",
+    entry: 4400,
+    atrM1: 1,
+    spreadUsd: 0.1,
+    brokerMinDistanceUsd: 2,
+  });
+  assert.equal(levels.valid, true);
+  assert.ok(levels.tpDistanceUsd! >= 2);
+  assert.ok(levels.slDistanceUsd! >= 2);
 });
 
 check("dynamic: SL tightens immediately without +2/+3 EUR trigger", () => {
@@ -82,6 +138,7 @@ check("dynamic: stronger favourable move keeps tightening SL", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(first.kind, "trail");
   const second = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
@@ -90,6 +147,7 @@ check("dynamic: stronger favourable move keeps tightening SL", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(second.kind, "trail");
   assert.ok(second.stopLoss > first.stopLoss);
 });
 
@@ -102,6 +160,7 @@ check("dynamic: pullback never loosens an already tightened BUY SL", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(first.kind, "trail");
   const pullback = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
@@ -110,7 +169,22 @@ check("dynamic: pullback never loosens an already tightened BUY SL", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(pullback.kind, "hold");
   assert.equal(pullback.stopLoss, first.stopLoss);
+});
+
+check("dynamic: tiny improvement is held instead of producing noisy updates", () => {
+  const action = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4400.805,
+    currentStopLoss: 4400,
+    atrM1: 2,
+    spreadUsd: 0.2,
+    minImprovementUsd: 0.01,
+  });
+  assert.equal(action.kind, "hold");
+  assert.equal(action.stopLoss, 4400);
 });
 
 check("dynamic: TP is fixed after entry while only SL moves", () => {
@@ -126,6 +200,7 @@ check("dynamic: TP is fixed after entry while only SL moves", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(action.kind, "trail");
   assert.ok(action.stopLoss > levels.stopLoss!);
   assert.equal(levels.takeProfit, initialTp);
   assert.equal("takeProfit" in action, false);
@@ -143,6 +218,7 @@ check("dynamic: SELL mirrors BUY and SL only moves downward", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(first.kind, "trail");
   const second = dynamicProfitProtection({
     direction: "SELL",
     entry: 4400,
@@ -151,8 +227,9 @@ check("dynamic: SELL mirrors BUY and SL only moves downward", () => {
     atrM1: 2,
     spreadUsd: 0.2,
   });
+  assert.equal(second.kind, "trail");
   assert.ok(first.stopLoss < levels.stopLoss!);
   assert.ok(second.stopLoss < first.stopLoss);
 });
 
-console.log(`dynamic-protection scenarios: ${passed}/9 passed`);
+console.log(`dynamic-protection scenarios: ${passed}/15 passed`);
