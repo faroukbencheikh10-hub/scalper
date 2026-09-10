@@ -1,0 +1,445 @@
+name: stale-quote-guard-ci
+
+on:
+  push:
+    branches: [stale-quote-guard]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: stale-quote-guard
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply stale quote guard only
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import json
+
+          def replace_once(path: str, old: str, new: str):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}: {old[:120]!r}")
+              p.write_text(text.replace(old, new, 1))
+
+          # Pure health-state helper. It is intentionally outside scalperStrategy.ts.
+          Path("src/lib/server/staleQuoteGuard.ts").write_text(r'''export type StaleQuoteAction = "idle" | "reconnect" | "exit";
+
+export type StaleQuoteDecisionInput = {
+  active: boolean;
+  nowMs: number;
+  lastQuoteReceivedAtMs: number | null;
+  sessionStartAtMs: number | null;
+  fallbackStartAtMs: number;
+  staleQuoteSec: number;
+  staleQuoteExitSec: number;
+};
+
+function finiteMs(value: number | null | undefined) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/**
+ * Quote silence is counted only from the current operating session (or from the
+ * current subscription baseline), so the normal overnight/weekend gap can
+ * never trigger a reconnect/exit immediately when the session reopens.
+ */
+export function effectiveQuoteAgeSec(
+  nowMs: number,
+  lastQuoteReceivedAtMs: number | null,
+  sessionStartAtMs: number | null,
+  fallbackStartAtMs: number,
+) {
+  const references = [
+    finiteMs(lastQuoteReceivedAtMs),
+    finiteMs(sessionStartAtMs),
+    finiteMs(fallbackStartAtMs),
+  ].filter((value): value is number => value !== null);
+  if (references.length === 0) return null;
+  const reference = Math.max(...references);
+  return Math.max(0, Math.floor((nowMs - reference) / 1000));
+}
+
+export function staleQuoteDecision(input: StaleQuoteDecisionInput): {
+  action: StaleQuoteAction;
+  quoteAgeSec: number | null;
+} {
+  if (!input.active) return { action: "idle", quoteAgeSec: null };
+  const quoteAgeSec = effectiveQuoteAgeSec(
+    input.nowMs,
+    input.lastQuoteReceivedAtMs,
+    input.sessionStartAtMs,
+    input.fallbackStartAtMs,
+  );
+  if (quoteAgeSec === null) return { action: "idle", quoteAgeSec: null };
+  if (quoteAgeSec > input.staleQuoteExitSec) return { action: "exit", quoteAgeSec };
+  if (quoteAgeSec > input.staleQuoteSec) return { action: "reconnect", quoteAgeSec };
+  return { action: "idle", quoteAgeSec };
+}
+''')
+
+          # streaming.ts: health/recovery only. Strategy imports and evaluation logic stay untouched.
+          replace_once(
+              "worker/streaming.ts",
+              'import { riskPerLot } from "../src/lib/server/orderSafety";\n',
+              'import { riskPerLot } from "../src/lib/server/orderSafety";\nimport { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  const finalQuoteMaxAgeMs = envInt("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);\n  const sessionConfig = sessionConfigFromEnv();\n',
+              '  const finalQuoteMaxAgeMs = envInt("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);\n  const staleQuoteSec = envInt("STALE_QUOTE_SEC", 120, 30, 3600);\n  const staleQuoteExitSec = Math.max(staleQuoteSec + 30, envInt("STALE_QUOTE_EXIT_SEC", 300, 60, 7200));\n  const sessionConfig = sessionConfigFromEnv();\n  const workerStartedAtMs = Date.now();\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  const connection = account.getStreamingConnection();\n  const tradingConnection = connection as unknown as FlattenConnection;\n',
+              '  let connection = account.getStreamingConnection();\n  let tradingConnection = connection as unknown as FlattenConnection;\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  let latestQuote: Quote | null = null;\n  let latestDecision: Record<string, unknown> | null = null;\n',
+              '  let latestQuote: Quote | null = null;\n  let lastQuoteReceivedAtMs = 0;\n  let quoteWatchStartedAtMs = workerStartedAtMs;\n  let latestDecision: Record<string, unknown> | null = null;\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  let decisionPersistBusy = false;\n  let flattenBusy = false;\n',
+              '  let decisionPersistBusy = false;\n  let flattenBusy = false;\n  let staleReconnectBusy = false;\n  let staleExitBusy = false;\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '    finalQuoteMaxAgeMs,\n    ...lossGuards(),\n',
+              '    finalQuoteMaxAgeMs,\n    quoteAgeSec: Math.max(0, Math.floor((Date.now() - (lastQuoteReceivedAtMs || quoteWatchStartedAtMs)) / 1000)),\n    quoteReceivedAt: lastQuoteReceivedAtMs > 0 ? new Date(lastQuoteReceivedAtMs).toISOString() : null,\n    staleQuoteSec,\n    staleQuoteExitSec,\n    ...lossGuards(),\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '    if (quote.quotedAt! > Date.now() + 500 || Date.now() - quote.quotedAt! > finalQuoteMaxAgeMs\n      || (latestQuote?.quotedAt && quote.quotedAt! < latestQuote.quotedAt)) return;\n    const previousQuoteAt = latestQuote?.quotedAt ?? 0;\n',
+              '    if (quote.quotedAt! > Date.now() + 500 || Date.now() - quote.quotedAt! > finalQuoteMaxAgeMs\n      || (latestQuote?.quotedAt && quote.quotedAt! < latestQuote.quotedAt)) return;\n    lastQuoteReceivedAtMs = Date.now();\n    const previousQuoteAt = latestQuote?.quotedAt ?? 0;\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  const subscribe = async () => {\n    ready = false;\n    const seeded = await seedCandles(m1Max, m5Max);\n    m1 = seeded.m1;\n    m5 = seeded.m5;\n    await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);\n    subscribed = true;\n    ready = true;\n    await markWorker("streaming", workerDetail());\n  };\n\n  void sendTelegram(\n',
+              '''  const subscribe = async (resetQuoteWatch = true) => {\n    ready = false;\n    if (resetQuoteWatch) quoteWatchStartedAtMs = Date.now();\n    const seeded = await seedCandles(m1Max, m5Max);\n    m1 = seeded.m1;\n    m5 = seeded.m5;\n    await connection.subscribeToMarketData(symbol(), marketDataSubscriptions);\n    subscribed = true;\n    ready = true;\n    await markWorker("streaming", workerDetail());\n  };\n\n  const reconnectStaleQuotes = async (quoteAgeSec: number | null) => {\n    if (staleReconnectBusy || staleExitBusy || stopped) return;\n    staleReconnectBusy = true;\n    ready = false;\n    subscribed = false;\n    latestQuote = null;\n    const at = new Date().toISOString();\n    console.warn("[scalper-worker] stale_quote_reconnect", JSON.stringify({\n      at,\n      quoteAgeSec,\n      staleQuoteSec,\n      staleQuoteExitSec,\n    }));\n    await markWorker("stale_reconnect", { ...workerDetail(), quoteAgeSec, reason: "quote ferme" })\n      .catch((error) => console.error(error));\n    try {\n      connection.removeSynchronizationListener(listener);\n      await connection.close().catch((error) => console.warn("[scalper-worker] stale close", error));\n      // MetaApi documenta che un'istanza chiusa non va riutilizzata: ne creiamo una nuova.\n      connection = account.getStreamingConnection();\n      tradingConnection = connection as unknown as FlattenConnection;\n      connection.addSynchronizationListener(listener);\n      await connection.connect();\n      await connection.waitSynchronized();\n      if (stopped || staleExitBusy) return;\n      // Non azzera l'orologio di silenzio: se nessuna quote torna, STALE_QUOTE_EXIT_SEC resta assoluto.\n      await subscribe(false);\n      console.log("[scalper-worker] stale_quote_reconnected", JSON.stringify({\n        at: new Date().toISOString(),\n        quoteAgeSec,\n      }));\n    } catch (error) {\n      const message = error instanceof Error ? error.message : String(error);\n      console.warn("[scalper-worker] stale_quote_reconnect_failed", message);\n      await setSetting("stream_last_error", `${new Date().toISOString()} stale quote reconnect: ${message}`)\n        .catch((settingError) => console.error(settingError));\n    } finally {\n      staleReconnectBusy = false;\n    }\n  };\n\n  void sendTelegram(\n''',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '  if (!stopped) {\n    await subscribe();\n  } else {\n    await flattenSymbol("system_stop", "startup-system-stop").catch(() => undefined);\n    await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });\n  }\n\n  const controlTimer = setInterval(() => {\n',
+              '''  if (!stopped) {\n    await subscribe();\n  } else {\n    await flattenSymbol("system_stop", "startup-system-stop").catch(() => undefined);\n    await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });\n  }\n\n  const staleQuoteTimer = setInterval(() => {\n    const now = Date.now();\n    const status = getSessionStatus(new Date(now), sessionConfig);\n    if (stopped || !status.inside) return;\n    const sessionStartAtMs = status.sessionStartAt ? Date.parse(status.sessionStartAt) : null;\n    const decision = staleQuoteDecision({\n      active: true,\n      nowMs: now,\n      lastQuoteReceivedAtMs: lastQuoteReceivedAtMs || null,\n      sessionStartAtMs: Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : null,\n      fallbackStartAtMs: quoteWatchStartedAtMs,\n      staleQuoteSec,\n      staleQuoteExitSec,\n    });\n\n    if (decision.action === "exit") {\n      if (staleExitBusy) return;\n      staleExitBusy = true;\n      ready = false;\n      subscribed = false;\n      console.error("[scalper-worker] stale_quote_exit", JSON.stringify({\n        at: new Date(now).toISOString(),\n        quoteAgeSec: decision.quoteAgeSec,\n        staleQuoteExitSec,\n      }));\n      void (async () => {\n        await markWorker("stale_exit", {\n          ...workerDetail(),\n          quoteAgeSec: decision.quoteAgeSec,\n          reason: "quote ferme",\n        }).catch((error) => console.error(error));\n        await sendTelegram(\n          `🚨 SCALPER ${symbol()} · worker riavviato per quote ferme`\n          + `\\nnessuna quote valida da ${decision.quoteAgeSec ?? "?"} s`,\n        ).catch((error) => console.error(error));\n      })().finally(() => process.exit(1));\n      return;\n    }\n\n    if (decision.action === "reconnect" && !staleReconnectBusy) {\n      void reconnectStaleQuotes(decision.quoteAgeSec);\n    }\n  }, 30_000);\n\n  const controlTimer = setInterval(() => {\n''',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '    void setSetting("stream_last_quote", JSON.stringify({ ...snapshot, receivedAt: new Date().toISOString() }))\n',
+              '    const receivedAt = lastQuoteReceivedAtMs > 0 ? new Date(lastQuoteReceivedAtMs).toISOString() : null;\n    void setSetting("stream_last_quote", JSON.stringify({ ...snapshot, receivedAt }))\n',
+          )
+          replace_once(
+              "worker/streaming.ts",
+              '    clearInterval(controlTimer);\n    clearInterval(sessionTimer);\n',
+              '    clearInterval(staleQuoteTimer);\n    clearInterval(controlTimer);\n    clearInterval(sessionTimer);\n',
+          )
+
+          # watchdog.ts: stale quote safety + Railway restart. Existing position safety remains unchanged.
+          replace_once(
+              "worker/watchdog.ts",
+              'import { watchdogClosePosition, watchdogPositions, type WatchdogPosition } from "../src/lib/server/watchdogMetaApi";\n',
+              'import { watchdogClosePosition, watchdogPositions, type WatchdogPosition } from "../src/lib/server/watchdogMetaApi";\nimport { effectiveQuoteAgeSec } from "../src/lib/server/staleQuoteGuard";\n',
+          )
+          replace_once(
+              "worker/watchdog.ts",
+              'const ALERT_INTERVAL_MS = 30 * 60_000;\nconst SESSION_END_GUARD_MIN = 15;\nconst ALERT_SETTING_KEY = "watchdog_last_alert";\n',
+              'const ALERT_INTERVAL_MS = 30 * 60_000;\nconst STALE_QUOTE_ALERT_INTERVAL_MS = 10 * 60_000;\nconst STALE_QUOTE_SEC = 180;\nconst SESSION_END_GUARD_MIN = 15;\nconst ALERT_SETTING_KEY = "watchdog_last_alert";\nconst STALE_QUOTE_ALERT_SETTING_KEY = "watchdog_last_stale_quote_alert";\nconst RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2";\n',
+          )
+          replace_once(
+              "worker/watchdog.ts",
+              'async function alertThrottled(text: string, lastAlert: string | undefined) {\n  const previous = lastAlert ? Date.parse(lastAlert) : Number.NaN;\n  if (Number.isFinite(previous) && Date.now() - previous < ALERT_INTERVAL_MS) return false;\n  await setSetting(ALERT_SETTING_KEY, new Date().toISOString());\n  await sendTelegram(text);\n  return true;\n}\n\nasync function main() {\n',
+              r'''async function alertThrottled(
+  text: string,
+  lastAlert: string | undefined,
+  settingKey = ALERT_SETTING_KEY,
+  intervalMs = ALERT_INTERVAL_MS,
+) {
+  const previous = lastAlert ? Date.parse(lastAlert) : Number.NaN;
+  if (Number.isFinite(previous) && Date.now() - previous < intervalMs) return false;
+  await setSetting(settingKey, new Date().toISOString());
+  await sendTelegram(text);
+  return true;
+}
+
+function parsedObject(raw: string | undefined) {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+async function railwayGraphql<T>(token: string, query: string, variables: Record<string, string>) {
+  const response = await fetch(RAILWAY_API_URL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const payload = await response.json() as { data?: T; errors?: Array<{ message?: string }> };
+  if (!response.ok || payload.errors?.length) {
+    const graphError = payload.errors?.map((item) => item.message ?? "GraphQL error").join(" | ");
+    throw new Error(`Railway GraphQL ${response.status}: ${graphError || response.statusText}`);
+  }
+  if (!payload.data) throw new Error("Railway GraphQL: risposta senza data");
+  return payload.data;
+}
+
+type RailwayServiceData = {
+  service: {
+    serviceInstances: {
+      edges: Array<{
+        node: {
+          environmentId?: string | null;
+          latestDeployment?: { id?: string | null; status?: string | null; createdAt?: string | null } | null;
+        };
+      }>;
+    };
+  } | null;
+};
+
+async function restartRailwayService(token: string, serviceId: string) {
+  const lookup = await railwayGraphql<RailwayServiceData>(
+    token,
+    `query StaleQuoteService($serviceId: String!) {
+      service(id: $serviceId) {
+        serviceInstances {
+          edges {
+            node {
+              environmentId
+              latestDeployment { id status createdAt }
+            }
+          }
+        }
+      }
+    }`,
+    { serviceId },
+  );
+  const instances = lookup.service?.serviceInstances.edges.map((edge) => edge.node) ?? [];
+  const preferredEnvironmentId = process.env.RAILWAY_ENVIRONMENT_ID?.trim();
+  const candidates = instances
+    .filter((node) => node.latestDeployment?.id)
+    .sort((a, b) => Date.parse(b.latestDeployment?.createdAt ?? "") - Date.parse(a.latestDeployment?.createdAt ?? ""));
+  const target = (preferredEnvironmentId
+    ? candidates.find((node) => node.environmentId === preferredEnvironmentId)
+    : null) ?? candidates[0];
+  if (!target?.latestDeployment?.id) throw new Error(`Railway: nessun deployment trovato per service ${serviceId}`);
+
+  if (target.environmentId) {
+    try {
+      await railwayGraphql<{ serviceInstanceRedeploy: boolean }>(
+        token,
+        `mutation StaleQuoteRedeploy($environmentId: String!, $serviceId: String!) {
+          serviceInstanceRedeploy(environmentId: $environmentId, serviceId: $serviceId)
+        }`,
+        { environmentId: target.environmentId, serviceId },
+      );
+      return { method: "serviceInstanceRedeploy", deploymentId: target.latestDeployment.id, environmentId: target.environmentId };
+    } catch (error) {
+      console.warn("[scalper-watchdog] serviceInstanceRedeploy fallita, provo deploymentRestart", errorText(error));
+    }
+  }
+
+  await railwayGraphql<{ deploymentRestart: boolean }>(
+    token,
+    `mutation StaleQuoteRestart($id: String!) { deploymentRestart(id: $id) }`,
+    { id: target.latestDeployment.id },
+  );
+  return { method: "deploymentRestart", deploymentId: target.latestDeployment.id, environmentId: target.environmentId ?? null };
+}
+
+async function main() {
+''',
+          )
+          replace_once(
+              "worker/watchdog.ts",
+              '    "stream_last_error",\n    ALERT_SETTING_KEY,\n',
+              '    "stream_last_error",\n    "stream_worker_detail",\n    "stream_last_quote",\n    ALERT_SETTING_KEY,\n    STALE_QUOTE_ALERT_SETTING_KEY,\n',
+          )
+          replace_once(
+              "worker/watchdog.ts",
+              '  const maxAgeSec = envInt("WATCHDOG_MAX_AGE_SEC", 180, 30);\n  const closeAfterSec = envInt("WATCHDOG_CLOSE_AFTER_SEC", 600, 60);\n  const heartbeat = settings.get("stream_worker_heartbeat");\n',
+              r'''  const maxAgeSec = envInt("WATCHDOG_MAX_AGE_SEC", 180, 30);
+  const closeAfterSec = envInt("WATCHDOG_CLOSE_AFTER_SEC", 600, 60);
+  const nowMs = Date.now();
+  const sessionStatus = getSessionStatus(new Date(nowMs), sessionConfigFromEnv());
+  const sessionStartAtMs = sessionStatus.sessionStartAt ? Date.parse(sessionStatus.sessionStartAt) : Number.NaN;
+  const sessionAgeSec = Number.isFinite(sessionStartAtMs)
+    ? Math.max(0, Math.floor((nowMs - sessionStartAtMs) / 1000))
+    : null;
+  const detail = parsedObject(settings.get("stream_worker_detail"));
+  const detailAgeRaw = Number(detail?.quoteAgeSec);
+  const detailAgeSec = Number.isFinite(detailAgeRaw) && detailAgeRaw >= 0
+    ? sessionAgeSec === null ? Math.floor(detailAgeRaw) : Math.min(Math.floor(detailAgeRaw), sessionAgeSec)
+    : null;
+  const lastQuote = parsedObject(settings.get("stream_last_quote"));
+  const receivedAtMs = lastQuote?.receivedAt ? Date.parse(String(lastQuote.receivedAt)) : Number.NaN;
+  const storedAgeSec = effectiveQuoteAgeSec(
+    nowMs,
+    Number.isFinite(receivedAtMs) ? receivedAtMs : null,
+    Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : null,
+    Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : nowMs,
+  );
+  const quoteAges = [detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
+  const quoteAgeSec = quoteAges.length > 0 ? Math.max(...quoteAges) : null;
+
+  if (sessionStatus.inside && quoteAgeSec !== null && quoteAgeSec > STALE_QUOTE_SEC) {
+    console.warn("[scalper-watchdog] quote ferme", { quoteAgeSec, thresholdSec: STALE_QUOTE_SEC });
+    const alerted = await alertThrottled(
+      `🚨 SCALPER ${symbol()} · quote MetaApi ferme da ${quoteAgeSec} s (soglia ${STALE_QUOTE_SEC} s)`,
+      settings.get(STALE_QUOTE_ALERT_SETTING_KEY),
+      STALE_QUOTE_ALERT_SETTING_KEY,
+      STALE_QUOTE_ALERT_INTERVAL_MS,
+    );
+    const railwayToken = process.env.RAILWAY_API_TOKEN?.trim();
+    const railwayServiceId = process.env.RAILWAY_SERVICE_ID?.trim();
+    if (alerted && railwayToken && railwayServiceId) {
+      try {
+        const restart = await restartRailwayService(railwayToken, railwayServiceId);
+        console.warn("[scalper-watchdog] railway_restart", restart);
+      } catch (error) {
+        const message = `Railway restart fallito: ${errorText(error)}`;
+        console.error("[scalper-watchdog]", message);
+        await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`).catch(() => undefined);
+      }
+    }
+  }
+
+  const heartbeat = settings.get("stream_worker_heartbeat");
+''',
+          )
+
+          # Separate deterministic scenario: stalled quote -> reconnect -> exit, plus session reopen grace.
+          Path("scripts/stale-quote-scenarios.ts").write_text(r'''import assert from "node:assert/strict";
+import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
+
+let passed = 0;
+function check(name: string, test: () => void) {
+  try {
+    test();
+    passed += 1;
+    console.log("OK " + name);
+  } catch (error) {
+    console.error("FAIL " + name);
+    throw error;
+  }
+}
+
+const start = Date.UTC(2026, 8, 10, 6, 30, 0);
+const decide = (seconds: number, overrides: Partial<Parameters<typeof staleQuoteDecision>[0]> = {}) =>
+  staleQuoteDecision({
+    active: true,
+    nowMs: start + seconds * 1000,
+    lastQuoteReceivedAtMs: start,
+    sessionStartAtMs: start,
+    fallbackStartAtMs: start,
+    staleQuoteSec: 120,
+    staleQuoteExitSec: 300,
+    ...overrides,
+  });
+
+check("quote ferma -> reconnect -> exit", () => {
+  assert.equal(decide(120).action, "idle");
+  assert.deepEqual(decide(121), { action: "reconnect", quoteAgeSec: 121 });
+  assert.equal(decide(299).action, "reconnect");
+  assert.deepEqual(decide(301), { action: "exit", quoteAgeSec: 301 });
+});
+
+check("una nuova quote azzera il silenzio", () => {
+  const freshAt = start + 250_000;
+  const result = decide(301, { lastQuoteReceivedAtMs: freshAt });
+  assert.deepEqual(result, { action: "idle", quoteAgeSec: 51 });
+});
+
+check("fuori fascia la guardia non fa nulla", () => {
+  const result = decide(900, { active: false });
+  assert.deepEqual(result, { action: "idle", quoteAgeSec: null });
+});
+
+check("riapertura sessione non eredita il silenzio overnight", () => {
+  const oldQuote = start - 10 * 60 * 60_000;
+  assert.equal(decide(120, { lastQuoteReceivedAtMs: oldQuote }).action, "idle");
+  assert.equal(decide(121, { lastQuoteReceivedAtMs: oldQuote }).action, "reconnect");
+});
+
+console.log(`Stale quote scenarios passed: ${passed}`);
+''')
+
+          package = json.loads(Path("package.json").read_text())
+          package["scripts"]["scenarios"] = "tsx scripts/strategy-scenarios.ts && tsx scripts/stale-quote-scenarios.ts"
+          Path("package.json").write_text(json.dumps(package, indent=2, ensure_ascii=False) + "\n")
+
+          readme = Path("README.md")
+          text = readme.read_text()
+          marker = "## Auto-riparazione quote MetaApi"
+          if marker in text:
+              raise SystemExit("README already contains stale quote section")
+          text += r'''
+
+## Auto-riparazione quote MetaApi
+
+Il worker controlla la salute delle quote ogni 30 secondi **solo dentro `SCALPER_HOURS_UTC`**. Il normale silenzio fuori fascia/weekend non conta: alla riapertura il timer riparte dall'inizio della sessione. Se una quote valida non arriva entro la soglia, il worker chiude l'istanza streaming MetaApi, crea una nuova connessione, rifà `waitSynchronized()` e risottoscrive XAUUSD. Se il flusso non torna entro la soglia di uscita, salva `stream_worker_status=stale_exit`, invia Telegram con `worker riavviato per quote ferme` ed esce con codice 1, così la policy Railway `ALWAYS` avvia un processo pulito.
+
+Environment del recovery:
+
+- `STALE_QUOTE_SEC` — secondi senza quote prima del reconnect; default `120`.
+- `STALE_QUOTE_EXIT_SEC` — secondi senza quote prima di `process.exit(1)`; default `300` (viene mantenuto almeno 30 s sopra la soglia reconnect).
+- `RAILWAY_API_TOKEN` — opzionale, **segreto server-only** usato dal watchdog per richiedere il riavvio via Railway GraphQL; se manca il watchdog manda soltanto Telegram.
+- `RAILWAY_SERVICE_ID` — ID del servizio Railway da riavviare, cioè `scalper-worker`. Il watchdog risolve l'istanza/environment del servizio e usa `serviceInstanceRedeploy`, con `deploymentRestart` come fallback.
+
+`stream_worker_detail` include `quoteAgeSec` e `quoteReceivedAt`; `stream_last_quote.receivedAt` è il timestamp reale dell'ultima quote valida ricevuta e non viene più avanzato artificialmente dal timer di persistenza. Il watchdog controlla le quote in fascia a 180 secondi, limita l'alert Telegram a uno ogni 10 minuti e prova il riavvio Railway solo quando entrambe le variabili Railway sono presenti.
+'''
+          readme.write_text(text)
+
+          changed = {line.strip() for line in __import__('subprocess').check_output(["git", "diff", "--name-only"], text=True).splitlines()}
+          allowed = {
+              "worker/streaming.ts",
+              "worker/watchdog.ts",
+              "src/lib/server/staleQuoteGuard.ts",
+              "scripts/stale-quote-scenarios.ts",
+              "package.json",
+              "README.md",
+          }
+          if not changed <= allowed:
+              raise SystemExit(f"Unexpected changed files: {sorted(changed - allowed)}")
+          if "src/lib/server/scalperStrategy.ts" in changed:
+              raise SystemExit("Strategy file changed unexpectedly")
+          print("Changed files:", sorted(changed))
+          PY
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Scenarios
+        run: npm run scenarios
+      - name: Diff safety
+        shell: bash
+        run: |
+          git diff --check
+          test -z "$(git diff --name-only | grep -E '(^|/)scalperStrategy\.ts$' || true)"
+          git status --short
+      - name: Commit verified changes
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add worker/streaming.ts worker/watchdog.ts src/lib/server/staleQuoteGuard.ts scripts/stale-quote-scenarios.ts package.json README.md
+          git commit -m "Auto-repair stale MetaApi quote stream"
+          git push origin HEAD:stale-quote-guard
