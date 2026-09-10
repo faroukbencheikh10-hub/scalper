@@ -20,7 +20,10 @@ import {
   type SltpMode,
 } from "../src/lib/server/dynamicSlTp";
 import { riskPerLot } from "../src/lib/server/orderSafety";
-import { sessionLiquiditySnapshot } from "../src/lib/server/sessionLiquidity";
+import {
+  computeLiquiditySnapshot, createLiquidityState, describeLiquiditySnapshot, lotMultiplierFor,
+  setupsAllowedFor, updateLiquidityState,
+} from "../src/lib/server/marketLiquidity";
 import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
 import { encodeWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
 import { setupLabel } from "../src/lib/setups";
@@ -273,6 +276,9 @@ async function main() {
   let subscribed = false;
   let ready = false;
   let activeLots = lots();
+  // Liquidita' del momento da segnali di mercato reali (spread/tick-rate/ATR), non dall'orologio:
+  // un solo stato per la vita del processo, aggiornato ad ogni tick dentro la fascia oraria.
+  const liquidityState = createLiquidityState(workerStartedAtMs);
 
   const refreshControl = async () => {
     const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY]);
@@ -1179,11 +1185,25 @@ async function main() {
       return;
     }
 
-    // Sessioni forex reali e livello di liquidita' del momento, DENTRO la fascia SCALPER_HOURS_UTC
-    // gia' verificata sopra: non cambia mai se il worker e' dentro o fuori sessione, solo quali
-    // setup valutare (LOW esclude m1_short/m1_range) e quanti lotti usare per l'ingresso.
-    const liquidity = sessionLiquiditySnapshot(quote.quotedAt ?? Date.now());
-    const liquidityEvaluation: SetupEvaluation = { setup: "session_liquidity", status: "triggered", reason: liquidity.reason };
+    // Liquidita' del momento da segnali di mercato reali (spread/tick-rate/ATR), DENTRO la fascia
+    // SCALPER_HOURS_UTC gia' verificata sopra: non cambia mai se il worker e' dentro o fuori
+    // sessione, solo quali setup valutare (LOW esclude m1_short/m1_range) e quanti lotti usare.
+    // L'ATR arriva dalla stessa atr() gia' usata dalla strategia, mai ricalcolato da zero qui.
+    const atrM1ForLiquidity = atr(closedBars(m1, 1, Date.now()) ?? [], 14, true);
+    const atrM15ForLiquidity = atr(aggregateM15(closedBars(m5, 5, Date.now()) ?? []), 14, true);
+    if (atrM1ForLiquidity) liquidityState.atrM1 = atrM1ForLiquidity;
+    if (atrM15ForLiquidity) liquidityState.atrM15 = atrM15ForLiquidity;
+    updateLiquidityState(liquidityState, { ts: quote.quotedAt ?? Date.now(), bid: quote.bid, ask: quote.ask });
+    const liquiditySnapshot = computeLiquiditySnapshot(liquidityState, Date.now());
+    const allowedSetups = setupsAllowedFor(liquiditySnapshot.level);
+    const liquidity = {
+      level: liquiditySnapshot.level,
+      snapshot: liquiditySnapshot,
+      lots: lotMultiplierFor(liquiditySnapshot.level, activeLots),
+      disableShort: !allowedSetups.includes("m1_short"),
+      disableRange: !allowedSetups.includes("m1_range"),
+    };
+    const liquidityEvaluation: SetupEvaluation = { setup: "market_liquidity", status: "triggered", reason: describeLiquiditySnapshot(liquiditySnapshot) };
     const withLiquidityEvaluation = (signal: ScalperSignal): ScalperSignal => {
       signal.evaluations = [liquidityEvaluation, ...signal.evaluations];
       return signal;
@@ -1479,9 +1499,10 @@ async function main() {
         Number(connection.terminalState.price(symbol())?.lossTickValue));
       const orderRisk = (size: number) => perLot === null ? lossAtStop(size, slDistance) : size * perLot;
       // Liquidita' del momento: lotti ridotti in MEDIUM/LOW (1 in HIGH, nessuna modifica),
-      // arrotondati al passo lotti del broker con lo stesso clampLots usato ovunque nel worker.
-      // Il cap di rischio sotto puo' ancora ridurli ulteriormente, mai riportarli sopra.
-      const sessionLots = clampLots(activeLots * liquidity.lotMultiplier);
+      // gia' arrotondati al passo lotti da lotMultiplierFor; clampLots resta comunque una rete di
+      // sicurezza in piu' sui limiti SCALPER_LOTS_MIN/MAX del broker. Il cap di rischio sotto puo'
+      // ancora ridurli ulteriormente, mai riportarli sopra.
+      const sessionLots = clampLots(liquidity.lots);
       let orderLots = sessionLots;
       let lotsCapped = false;
       if (riskCap !== null && orderRisk(orderLots) > riskCap) {
@@ -1516,8 +1537,10 @@ async function main() {
         requestedLots: activeLots,
         lotsCapped,
         liquidityLevel: liquidity.level,
-        liquidityActiveSessions: liquidity.activeSessions,
-        liquidityLotMultiplier: liquidity.lotMultiplier,
+        liquiditySpreadRatio: liquidity.snapshot.spreadRatio,
+        liquidityTickRatePct: liquidity.snapshot.tickRatePct,
+        liquidityAtrRatio: liquidity.snapshot.atrRatio,
+        liquidityWarmup: liquidity.snapshot.warmup,
         managedExit,
         target1,
         tpBroker: brokerTp,
@@ -1687,7 +1710,7 @@ async function main() {
         const targetLabel = managedExit ? "Target1" : "TP";
         const sltpLabel = activeSltpMode === "trailing" ? "TP trailing" : activeSltpMode === "fixed" ? "TP fisso" : targetLabel;
         const lotsAdjustedNote = orderLots !== activeLots
-          ? ` (da ${activeLots}${liquidity.lotMultiplier !== 1 ? ` × ${liquidity.lotMultiplier} liquidita' ${liquidity.level}` : ""}${lotsCapped ? ", ridotti per il cap rischio" : ""})`
+          ? ` (da ${activeLots}, liquidita' ${liquidity.level}${lotsCapped ? ", ridotti anche per il cap rischio" : ""})`
           : "";
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${finalSignal.direction}`
@@ -1697,7 +1720,7 @@ async function main() {
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `${managedExit ? `\nTP broker (sicurezza) ${money(brokerTp)} a ${money(riskPlan.tpBrokerDistance)}$ · uscita gestita: breakeven a Target1 poi trailing M5` : ""}`
           + `${useSltpEngine ? `\nSLTP_MODE=${activeSltpMode}: SL da struttura, si stringe soltanto${activeSltpMode === "trailing" ? "; TP trailing dopo il trigger di estensione" : "; TP fisso"}.` : ""}`
-          + `\nliquidita' ${liquidity.level} · sessioni attive: ${liquidity.activeSessions.length ? liquidity.activeSessions.join(", ") : "nessuna"}`
+          + `\n${describeLiquiditySnapshot(liquidity.snapshot)}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error" || execution.status === "pending_confirmation") {
