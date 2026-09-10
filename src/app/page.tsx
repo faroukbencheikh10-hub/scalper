@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { SystemControl } from "@/components/system-control";
 import { setupLabel } from "@/lib/setups";
+import { usdDistanceToEurApprox } from "@/lib/lots";
 
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
@@ -10,6 +11,8 @@ type SetupEvaluation = { setup?: string; status?: string; direction?: string | n
 type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
 /** Piano di uscita del trade aperto: nessun TP al broker, breakeven a target1 e trailing sulla M5. */
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
+/** Piano SLTP_MODE=fixed|trailing: SL da struttura (si stringe solo), TP fisso o trailing sui nuovi massimi/minimi. */
+type SltpExit = { positionId?: string; direction?: string; entry?: number; mode?: "fixed" | "trailing"; stopLoss?: number; slUpdates?: number; initialTp?: number; currentTp?: number; tpTriggered?: boolean; peak?: number };
 type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[]; risk?: RiskPlan | null };
 type StreamError = { message: string; at: string | null };
 type Flatten = { at?: string; closed?: string[]; canceled?: string[]; reason?: string; failures?: string[] };
@@ -45,7 +48,7 @@ type DashboardState = {
   stream?: {
     status?: string;
     heartbeat?: string | null;
-    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; managed?: ManagedExit[]; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; m15?: number } | null;
+    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; managed?: ManagedExit[]; sltp?: SltpExit[]; sltpMode?: "off" | "fixed" | "trailing"; m15GateMode?: "off" | "live"; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; m15?: number } | null;
     lastDecision?: Decision | null;
     lastFlatten?: Flatten | null;
     currentError?: StreamError | null;
@@ -167,13 +170,32 @@ export default function Home() {
       : "—";
   const managed = data?.stream?.detail?.managed ?? [];
   const openExit = managed[0] ?? null;
-  const openExitText = openExit
-    ? `SL ${money(Number(openExit.stopLoss))} · Target1 ${money(Number(openExit.target1))} raggiunto: ${openExit.target1Hit ? "sì" : "no"}`
-      + ` · TP broker ${Number.isFinite(openExit.tpBroker) ? money(Number(openExit.tpBroker)) : "—"}`
-      + ` · trailing ${openExit.trailingActive ? `attivo (${openExit.trailingUpdates ?? 0} aggiornamenti)` : "non attivo"}`
-      + `${openExit.breakevenAt ? ` · breakeven ${money(Number(openExit.breakevenPrice))} alle ${formatTime(openExit.breakevenAt)}` : ""}`
-      + `${openExit.fillPending ? " · fill non confermato" : ""}`
-    : "nessun trade gestito aperto";
+  const sltpList = data?.stream?.detail?.sltp ?? [];
+  const openSltp = sltpList[0] ?? null;
+  const m15GateLive = data?.stream?.detail?.m15GateMode === "live";
+  const currentLots = Number(data?.lots ?? data?.stream?.detail?.lots ?? Number.NaN);
+  /** € equivalente approssimativo ai lotti correnti di una distanza in $ dall'apertura. */
+  const eurFor = (distanceUsd: number) => {
+    const eur = usdDistanceToEurApprox(distanceUsd, currentLots);
+    return eur === null ? "" : ` (≈${money(Math.abs(eur))}€)`;
+  };
+  const sltpExitText = openSltp
+    ? `SL ${openSltp.mode === "trailing" ? "trailing " : ""}${money(Number(openSltp.stopLoss))}`
+      + `${Number.isFinite(openSltp.entry) && Number.isFinite(openSltp.stopLoss) ? eurFor(Math.abs(Number(openSltp.stopLoss) - Number(openSltp.entry))) : ""}`
+      + ` · ${openSltp.mode === "trailing" ? "TP trailing" : "TP fisso"} ${money(Number(openSltp.currentTp))}`
+      + `${Number.isFinite(openSltp.entry) && Number.isFinite(openSltp.currentTp) ? eurFor(Math.abs(Number(openSltp.currentTp) - Number(openSltp.entry))) : ""}`
+      + `${openSltp.mode === "trailing" ? ` (picco ${money(Number(openSltp.peak))}${openSltp.tpTriggered ? ", trailing attivo" : ", non ancora esteso"})` : ""}`
+      + ` · SL stretto ${openSltp.slUpdates ?? 0} volte`
+    : null;
+  const openExitText = sltpExitText
+    ? sltpExitText
+    : openExit
+      ? `SL ${money(Number(openExit.stopLoss))} · Target1 ${money(Number(openExit.target1))} raggiunto: ${openExit.target1Hit ? "sì" : "no"}`
+        + ` · TP broker ${Number.isFinite(openExit.tpBroker) ? money(Number(openExit.tpBroker)) : "—"}`
+        + ` · trailing ${openExit.trailingActive ? `attivo (${openExit.trailingUpdates ?? 0} aggiornamenti)` : "non attivo"}`
+        + `${openExit.breakevenAt ? ` · breakeven ${money(Number(openExit.breakevenPrice))} alle ${formatTime(openExit.breakevenAt)}` : ""}`
+        + `${openExit.fillPending ? " · fill non confermato" : ""}`
+      : "nessun trade gestito aperto";
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
   const lastResult = results?.last;
@@ -256,6 +278,7 @@ export default function Home() {
         <div className="micro-status">
           <span>M1 {data?.stream?.detail?.m1 ?? "—"}</span><span>M5 {data?.stream?.detail?.m5 ?? "—"}</span><span>M15 {data?.stream?.detail?.m15 ?? "—"}</span>
           <span>{data?.session?.hoursUtc ?? "—"} UTC</span><span>MT5 {data?.autoExec === true ? "AUTO ON" : data?.autoExec === false ? "AUTO OFF" : "—"}</span>
+          {m15GateLive ? <span className="state-badge" style={{ color: "#8fffc5", background: "rgba(39,145,101,.15)", borderColor: "rgba(96,247,170,.55)" }}>Gate M15: 4 stati</span> : null}
         </div>
       </section>
 

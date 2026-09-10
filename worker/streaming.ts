@@ -5,13 +5,19 @@ import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
-import { contextM5M15, evaluateScalper, plannedEntryValid, STRATEGY_VERSION } from "../src/lib/server/scalperStrategy";
+import { contextM5M15, evaluateScalper, m15GateMode, plannedEntryValid, STRATEGY_VERSION } from "../src/lib/server/scalperStrategy";
 import { aggregateM15, closedBars } from "../src/lib/server/marketStructure";
+import { atr } from "../src/lib/server/indicators";
 import {
   applyAction, closeConfirmedByAbsence, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup,
   m5CloseAction, openManagedExit, oppositeSignalIgnored, referencePrice, retargetOnFill, tickAction,
   trackMissing, type ManagedCloseReason, type ManagedExitState, type MissingPosition,
 } from "../src/lib/server/positionManager";
+import {
+  decideTpBrokerUpdate, initTrailingTp, initialLevels as sltpInitialLevels, recalcTighterStop,
+  sltpMode, stopsLevelMinDistanceUsd, takeProfitTouched, tpCloseReason, updateTrailingTp,
+  type SltpMode,
+} from "../src/lib/server/dynamicSlTp";
 import { riskPerLot } from "../src/lib/server/orderSafety";
 import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
 import { encodeWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
@@ -122,6 +128,25 @@ type ManagedPosition = {
 type ManagedOrder = {
   id: string;
   symbol: string;
+};
+
+/**
+ * Stato in memoria di una posizione gestita da SLTP_MODE=fixed|trailing. peak/tpTriggered hanno
+ * senso solo in modalita' "trailing" (fixed non li usa mai: currentTp resta sempre initialTp).
+ */
+type SltpExitState = {
+  positionId: string;
+  signalId: string | null;
+  direction: "BUY" | "SELL";
+  entry: number;
+  mode: "fixed" | "trailing";
+  stopLoss: number;
+  slUpdates: number;
+  initialTp: number;
+  currentTp: number;
+  tpTriggered: boolean;
+  peak: number;
+  lastUpdateAtMs: number | null;
 };
 
 type FlattenConnection = StreamingConnectionLike & {
@@ -266,6 +291,12 @@ async function main() {
   let lastReseedAttempt = 0;
   // Piano di uscita dei setup gestiti, per posizione. Sopravvive ai riavvii via scalper_signals.
   const managedExits = new Map<string, ManagedExitState>();
+  // SLTP_MODE=fixed|trailing: motore unico di SL/TP da struttura, sostituisce managedExits per le
+  // posizioni aperte mentre e' attivo. Sopravvive ai riavvii riusando le stesse colonne esistenti
+  // (final_sl, target1, tp_broker, breakeven_price, breakeven_at, trailing_updates/active) con un
+  // significato diverso, distinto da managedExits solo tramite context_json.sltp (nessuna colonna
+  // nuova: vedi dynamicSlTp.ts per il contratto completo).
+  const sltpExits = new Map<string, SltpExitState>();
   // Una posizione sparita dal terminal state non e' chiusa: MetaApi la perde per qualche tick
   // subito dopo l'apertura. Serve la conferma per tempo e tick, o un deal di chiusura in history.
   const missingPositions = new Map<string, MissingPosition>();
@@ -396,6 +427,22 @@ async function main() {
       trailingActive: state.trailingUpdates > 0,
       trailingUpdates: state.trailingUpdates,
     })),
+    // SLTP_MODE=fixed|trailing: "off" lascia questo array sempre vuoto, la card posizione della
+    // dashboard resta quella di sopra basata su "managed"/"risk".
+    m15GateMode: m15GateMode(),
+    sltpMode: sltpMode(),
+    sltp: [...sltpExits.values()].map((state) => ({
+      positionId: state.positionId,
+      direction: state.direction,
+      entry: state.entry,
+      mode: state.mode,
+      stopLoss: state.stopLoss,
+      slUpdates: state.slUpdates,
+      initialTp: state.initialTp,
+      currentTp: state.currentTp,
+      tpTriggered: state.tpTriggered,
+      peak: state.peak,
+    })),
     riskMaxPct,
     riskCapActive: riskMaxPct > 0,
     finalQuoteMaxAgeMs,
@@ -506,6 +553,202 @@ async function main() {
     );
   };
 
+  // --- SLTP_MODE=fixed|trailing: SL/TP da struttura M1+ATR+spread, sostituisce l'uscita gestita
+  // sopra mentre e' attivo. Riusa le stesse colonne (final_sl=SL corrente, target1=TP iniziale
+  // fisso, tp_broker=TP corrente al broker, trailing_updates/active=quante volte lo SL si e'
+  // stretto, breakeven_price=picco/valle tracciato, breakeven_at=quando il TP trailing ha
+  // scattato) con un significato diverso da managedExits, distinto solo da context_json.sltp:
+  // nessuna colonna nuova, nessuna ambiguita' perche' le due mappe non si popolano mai per la
+  // stessa posizione (managedExits solo con SLTP_MODE=off, sltpExits solo altrimenti).
+
+  const persistSltpExit = async (state: SltpExitState) => {
+    if (state.signalId) {
+      await dbQuery(
+        `UPDATE scalper_signals
+            SET final_sl=$2,target1=$3,tp_broker=$4,trailing_updates=$5,trailing_active=$6,
+                breakeven_price=$7,breakeven_at=CASE WHEN $8 THEN COALESCE(breakeven_at,now()) ELSE breakeven_at END,
+                context_json=COALESCE(context_json,'{}'::jsonb)
+                  ||jsonb_build_object('sltp',jsonb_build_object('mode',$9::text,'triggered',$8))
+          WHERE id=$1`,
+        [state.signalId, state.stopLoss, state.initialTp, state.currentTp, state.slUpdates,
+          state.slUpdates > 0, state.peak, state.tpTriggered, state.mode],
+      );
+    }
+    await dbQuery(
+      `UPDATE trades SET final_sl=$2,target1=$3,tp_broker=$4,trailing_updates=$5,trailing_active=$6,
+              breakeven_price=$7,breakeven_at=CASE WHEN $8 THEN COALESCE(breakeven_at,now()) ELSE breakeven_at END
+        WHERE source='scalper' AND mt5_position_id=$1`,
+      [state.positionId, state.stopLoss, state.initialTp, state.currentTp, state.slUpdates,
+        state.slUpdates > 0, state.peak, state.tpTriggered],
+    );
+  };
+
+  /** Riprende i piani SLTP aperti dopo un riavvio: solo le righe con context_json.sltp. */
+  const restoreSltpExits = async () => {
+    const result = await dbQuery(
+      `SELECT id::text AS id,direction,mt5_position_id,mt5_open_price,entry,final_sl,target1,tp_broker,
+              trailing_updates,breakeven_price,breakeven_at,context_json
+         FROM scalper_signals
+        WHERE outcome IS NULL AND mt5_position_id IS NOT NULL AND context_json->'sltp' IS NOT NULL`,
+    );
+    for (const row of result.rows) {
+      const positionId = String(row.mt5_position_id ?? "");
+      if (!positionId || sltpExits.has(positionId)) continue;
+      const entry = Number(row.mt5_open_price ?? row.entry);
+      const stopLoss = Number(row.final_sl);
+      const initialTp = Number(row.target1);
+      const currentTp = Number.isFinite(Number(row.tp_broker)) ? Number(row.tp_broker) : initialTp;
+      if (![entry, stopLoss, initialTp, currentTp].every((value) => Number.isFinite(value))) continue;
+      const sltp = (row.context_json as { sltp?: { mode?: string; triggered?: boolean } } | null)?.sltp;
+      sltpExits.set(positionId, {
+        positionId,
+        signalId: String(row.id),
+        direction: row.direction === "SELL" ? "SELL" : "BUY",
+        entry,
+        mode: sltp?.mode === "trailing" ? "trailing" : "fixed",
+        stopLoss,
+        slUpdates: Number(row.trailing_updates ?? 0),
+        initialTp,
+        currentTp,
+        tpTriggered: sltp?.triggered === true,
+        // Il picco esatto pre-riavvio non e' recuperabile senza una colonna dedicata: si riparte
+        // in modo conservativo dal livello corrente (mai piu' generoso di quanto gia' noto al
+        // broker), che al prossimo nuovo massimo/minimo torna a crescere normalmente.
+        peak: Number.isFinite(Number(row.breakeven_price)) ? Number(row.breakeven_price) : entry,
+        lastUpdateAtMs: null,
+      });
+    }
+  };
+
+  /**
+   * Un solo modifyPosition per tick per posizione: SL e TP (quando cambia) viaggiano insieme,
+   * cosi' un valore non toccato non rischia mai di essere azzerato da un campo omesso. Se il
+   * broker rifiuta, un solo ritentativo al minimo consentito dallo stopsLevel; se rifiuta ancora
+   * si rinuncia e si logga sltp_rejected, mantenendo il livello precedente (il prossimo tick
+   * ritenta da capo, rispettando comunque il rate-limit).
+   */
+  const applySltpLevels = async (input: {
+    positionId: string;
+    direction: "BUY" | "SELL";
+    stopLoss: number;
+    takeProfit: number;
+    /** Livello attualmente noto al broker: il ritentativo al minimo stopsLevel non deve mai andare oltre, mai allargare lo stop. */
+    previousStopLoss: number;
+    stopsLevelMinUsd: number;
+    currentPrice: number;
+    label: string;
+  }): Promise<{ stopLoss: number; takeProfit: number } | null> => {
+    try {
+      await retryTrade(input.label, () => tradingConnection.modifyPosition(input.positionId, input.stopLoss, input.takeProfit));
+      return { stopLoss: input.stopLoss, takeProfit: input.takeProfit };
+    } catch (firstError) {
+      if (!(input.stopsLevelMinUsd > 0)) {
+        console.warn("[scalper-worker] sltp_rejected", JSON.stringify({
+          at: new Date().toISOString(), positionId: input.positionId, label: input.label, error: String(firstError),
+        }));
+        return null;
+      }
+      // Il minimo dello stopsLevel non deve mai spingere lo SL oltre quello gia' noto al broker:
+      // "mantieni/apri senza quel livello" vale anche per il ritentativo, lo SL si stringe soltanto.
+      const safeSl = input.direction === "BUY"
+        ? Math.max(input.previousStopLoss, Math.min(input.stopLoss, input.currentPrice - input.stopsLevelMinUsd))
+        : Math.min(input.previousStopLoss, Math.max(input.stopLoss, input.currentPrice + input.stopsLevelMinUsd));
+      const safeTp = input.direction === "BUY"
+        ? Math.max(input.takeProfit, input.currentPrice + input.stopsLevelMinUsd)
+        : Math.min(input.takeProfit, input.currentPrice - input.stopsLevelMinUsd);
+      try {
+        await retryTrade(`${input.label} (minimo stopsLevel)`, () => tradingConnection.modifyPosition(input.positionId, safeSl, safeTp));
+        return { stopLoss: safeSl, takeProfit: safeTp };
+      } catch (secondError) {
+        console.warn("[scalper-worker] sltp_rejected", JSON.stringify({
+          at: new Date().toISOString(), positionId: input.positionId, label: input.label, error: String(secondError),
+        }));
+        return null;
+      }
+    }
+  };
+
+  const driveSltpExits = async (openPositions: ManagedPosition[], quote: Quote) => {
+    if (sltpExits.size === 0 || stopped || flattenBusy) return;
+    const closedM1 = closedBars(m1, 1, Date.now()) ?? [];
+    if (closedM1.length < 20) return;
+    const atrM1 = atr(closedM1, 14, true);
+    if (!atrM1 || !(atrM1 > 0)) return;
+    const spreadUsd = quote.spread;
+    const spec = connection.terminalState.specification?.(symbol());
+    const tickSizeUsd = Number(spec?.tickSize) > 0 ? Number(spec!.tickSize) : 0.01;
+    const stopsLevelMinUsd = stopsLevelMinDistanceUsd(spec?.stopsLevel, spec?.point ?? tickSizeUsd);
+    const nowMs = Date.now();
+
+    for (const position of openPositions) {
+      const state = sltpExits.get(position.id);
+      if (!state) continue;
+      const priceRef = referencePrice(state.direction, quote);
+      // Riferimento del rate-limit catturato una volta sola: SL e TP condividono lo stesso
+      // budget di aggiornamenti (SLTP_UPDATE_MIN_INTERVAL_SEC), ma la decisione dell'uno non deve
+      // far apparire "appena aggiornato" l'altro nello stesso tick.
+      const rateLimitReferenceMs = state.lastUpdateAtMs;
+
+      // 1. TP trailing: aggiorna picco/trigger sempre, anche se l'aggiornamento al broker slitta
+      // per il rate-limit, cosi' il tocco sotto si valuta sempre sul livello vero.
+      let tpCandidate: number | null = null;
+      if (state.mode === "trailing") {
+        const trail = updateTrailingTp(
+          { peak: state.peak, triggered: state.tpTriggered, currentTp: state.currentTp },
+          { direction: state.direction, currentPrice: priceRef, initialTp: state.initialTp, entry: state.entry },
+        );
+        state.peak = trail.peak;
+        state.tpTriggered = trail.triggered;
+        if (trail.currentTp !== state.currentTp) tpCandidate = trail.currentTp;
+        state.currentTp = trail.currentTp;
+      }
+
+      // 2. SL: si stringe soltanto, stesso motore in fixed e trailing.
+      const slDecision = recalcTighterStop({
+        direction: state.direction, currentPrice: priceRef, currentStopLoss: state.stopLoss,
+        m1: closedM1, atrM1, spreadUsd, tickSizeUsd, nowMs, lastUpdateAtMs: rateLimitReferenceMs,
+      });
+
+      // 3. Un solo modifyPosition combinato per tick per posizione, quando SL e/o TP migliorano
+      // abbastanza da giustificare un aggiornamento e il rate-limit lo consente.
+      const tpDecision = tpCandidate === null ? null : decideTpBrokerUpdate({
+        direction: state.direction, candidateTp: tpCandidate, currentBrokerTp: state.currentTp,
+        tickSizeUsd, nowMs, lastUpdateAtMs: rateLimitReferenceMs,
+      });
+      if (slDecision.kind === "update" || tpDecision?.kind === "update") {
+        const nextSl = slDecision.kind === "update" ? slDecision.stopLoss : state.stopLoss;
+        const nextTp = tpDecision?.kind === "update" ? tpDecision.takeProfit : state.currentTp;
+        const applied = await applySltpLevels({
+          positionId: position.id, direction: state.direction, stopLoss: nextSl, takeProfit: nextTp,
+          previousStopLoss: state.stopLoss, stopsLevelMinUsd, currentPrice: priceRef,
+          label: `SL/TP posizione ${position.id}`,
+        });
+        if (applied) {
+          if (applied.stopLoss !== state.stopLoss) state.slUpdates++;
+          state.stopLoss = applied.stopLoss;
+          state.currentTp = applied.takeProfit;
+          state.lastUpdateAtMs = nowMs;
+        }
+      }
+
+      sltpExits.set(position.id, state);
+      await persistSltpExit(state).catch((error) => console.error(error));
+
+      // 3. Tocco del TP corrente: chiusura attiva a mercato. E' una rete di sicurezza aggiuntiva
+      // al TP gia' impostato al broker: se il broker chiude prima lui va bene lo stesso, lo
+      // riconosce syncStreamingExecutor dal deal reale via context_json.sltp.
+      if (takeProfitTouched({ direction: state.direction, triggered: state.tpTriggered, referencePriceUsd: priceRef, tpLevel: state.currentTp })) {
+        try {
+          await retryTrade(`Chiusura TP ${state.mode} posizione ${position.id}`, () => tradingConnection.closePosition(position.id));
+          sltpExits.delete(position.id);
+          await recordClosedPosition(position, tpCloseReason(state.tpTriggered)).catch((error) => console.error(error));
+        } catch (error) {
+          await setSetting("stream_last_error", `${new Date().toISOString()} Chiusura TP ${position.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
+  };
+
   /**
    * Una posizione assente dal terminal state e' chiusa solo dopo la conferma: abbastanza tick
    * consecutivi e abbastanza tempo, oppure un deal di chiusura in history. Prima di allora non si
@@ -516,6 +759,10 @@ async function main() {
     knownPositionIds.delete(positionId);
     missingPositions.delete(positionId);
     lastPositionCloseAt = Date.now();
+    // Il broker puo' aver chiuso lui una posizione SLTP_MODE prima del check attivo del worker: il
+    // motivo si legge dal prezzo reale in syncStreamingExecutor via context_json.sltp, qui basta
+    // smettere di gestirla.
+    sltpExits.delete(positionId);
     const closing = managedExits.get(positionId);
     if (!closing) return;
     managedExits.delete(positionId);
@@ -921,6 +1168,7 @@ async function main() {
 
     // Breakeven e trailing girano anche mentre un ingresso e' in corso: sono gestione, non ingresso.
     await driveManagedExits(openPositions, quote);
+    await driveSltpExits(openPositions, quote);
 
     if (m1.length < 35 || m5.length < 30) return;
     if (decisionBusy || Date.now() < signalLockUntil || Date.now() < orderErrorUntil || flattenBusy) return;
@@ -1117,6 +1365,42 @@ async function main() {
         return;
       }
 
+      // SLTP_MODE=fixed|trailing: sostituisce SL/TP calcolati dalla strategia con struttura M1 +
+      // ATR M1 + spread, capped a SL_MAX/TP_MAX. off (default) lascia finalSignal invariato, bit
+      // per bit come main: nessuna delle funzioni di dynamicSlTp.ts viene mai chiamata in quel caso.
+      const activeSltpMode: SltpMode = sltpMode();
+      if (activeSltpMode !== "off") {
+        const closedM1ForLevels = closedBars(m1, 1, Date.now()) ?? [];
+        const atrM1ForLevels = atr(closedM1ForLevels, 14, true);
+        if (!atrM1ForLevels || !(atrM1ForLevels > 0) || !Number.isFinite(finalSignal.entry)) {
+          const reason = "SLTP_MODE: ATR M1 non disponibile, nessun ordine senza livelli calcolabili dalla struttura.";
+          await markSkipped(signalId, reason);
+          latestDecision = noTradeDecision(reason, finalQuote, { setup: finalSignal.setup, evaluations: finalSignal.evaluations });
+          return;
+        }
+        const levelsSpec = connection.terminalState.specification?.(symbol());
+        const levelsTickSizeUsd = Number(levelsSpec?.tickSize) > 0 ? Number(levelsSpec!.tickSize) : 0.01;
+        const levelsStopsLevelMinUsd = stopsLevelMinDistanceUsd(levelsSpec?.stopsLevel, levelsSpec?.point ?? levelsTickSizeUsd);
+        const sltpInitial = sltpInitialLevels({
+          direction: finalSignal.direction as "BUY" | "SELL",
+          entry: finalSignal.entry!,
+          m1: closedM1ForLevels,
+          atrM1: atrM1ForLevels,
+          spreadUsd: finalQuote.spread,
+          brokerMinDistanceUsd: levelsStopsLevelMinUsd,
+          tickSizeUsd: levelsTickSizeUsd,
+        });
+        if (!sltpInitial.valid) {
+          const reason = "SLTP_MODE: SL/TP da struttura non calcolabili al prezzo corrente, nessun ordine senza livelli validi.";
+          await markSkipped(signalId, reason);
+          latestDecision = noTradeDecision(reason, finalQuote, { setup: finalSignal.setup, evaluations: finalSignal.evaluations });
+          return;
+        }
+        finalSignal.stopLoss = sltpInitial.stopLoss;
+        finalSignal.takeProfit = sltpInitial.takeProfit;
+        finalSignal.tpBroker = null;
+      }
+
       await dbQuery(
         `UPDATE scalper_signals
             SET entry=$2,stop_loss=$3,take_profit=$4,risk_reward=$5,reasoning=$6,
@@ -1157,7 +1441,10 @@ async function main() {
       }
       const riskPct = balanceKnown && perLot !== null ? (riskMoney / balance) * 100 : null;
       // Sui setup gestiti il livello calcolato e' target1, non un TP: al broker non viene inviato.
-      const managedExit = isManagedSetup(finalSignal.setup);
+      // Con SLTP_MODE attivo il motore cambia del tutto (vedi sltpExits sotto): l'uscita gestita
+      // "classica" (breakeven poi trailing M5) resta solo per SLTP_MODE=off, come oggi in main.
+      const useSltpEngine = activeSltpMode !== "off";
+      const managedExit = !useSltpEngine && isManagedSetup(finalSignal.setup);
       const target1 = finalSignal.takeProfit!;
       // Ogni ordine parte con SL e TP: sui setup gestiti il TP e' la rete di sicurezza, non l'obiettivo.
       const brokerTp = managedExit ? finalSignal.tpBroker ?? null : finalSignal.takeProfit!;
@@ -1195,19 +1482,23 @@ async function main() {
         ? Number.POSITIVE_INFINITY
         : Math.abs(sendCheck.entry - finalSignal.entry!);
       const maxEntryDrift = Math.max(0.25, slDistance * 0.15);
+      // plannedEntryValid ricontrolla il piano R:R/minNetR della STRATEGIA: con SLTP_MODE attivo
+      // SL/TP sono gia' stati sostituiti sopra con quelli da struttura, che rispondono ai loro
+      // stessi vincoli (sltpInitial.valid, gia' verificato) e non a quelli del setup originale.
+      const plannedInvalid = !useSltpEngine && !plannedEntryValid(finalSignal, sendQuote);
       if (
         sendAgeMs > finalQuoteMaxAgeMs
         || sendCheck.direction !== finalSignal.direction
         || sendCheck.setup !== finalSignal.setup
         || sendCheck.setupKey !== finalSignal.setupKey
         || entryDrift > maxEntryDrift
-        || !plannedEntryValid(finalSignal, sendQuote)
+        || plannedInvalid
       ) {
         const reason = sendAgeMs > finalQuoteMaxAgeMs
           ? `Final send-check: quote vecchia ${Math.round(sendAgeMs)} ms.`
           : sendCheck.direction !== finalSignal.direction || sendCheck.setup !== finalSignal.setup
             ? `Final send-check: ${finalSignal.direction}/${finalSignal.setup ?? "—"} non più valido, ora ${sendCheck.direction}/${sendCheck.setup ?? "—"}.`
-            : !plannedEntryValid(finalSignal, sendQuote)
+            : plannedInvalid
               ? "Final send-check: SL/TP pianificati non rispettano più il rapporto netto o il limite di stop."
               : `Final send-check: prezzo mosso di ${entryDrift.toFixed(2)}$ oltre il massimo ${maxEntryDrift.toFixed(2)}$.`;
         await markSkipped(signalId, reason);
@@ -1309,14 +1600,40 @@ async function main() {
           missingPositions.delete(state.positionId);
           await persistManagedExit(state).catch((error) => console.error(error));
         }
+        if (useSltpEngine && execution.status === "opened" && execution.positionId) {
+          // SL/TP da struttura: si riparte dal fill reale quando disponibile, altrimenti
+          // dall'entry teorica (corretto comunque dai ricalcoli successivi ad ogni tick).
+          const filled = Number(execution.openPrice);
+          const openPrice = Number.isFinite(filled) && filled > 0 ? filled : finalSignal.entry!;
+          const sltpState: SltpExitState = {
+            positionId: String(execution.positionId),
+            signalId,
+            direction: finalSignal.direction,
+            entry: openPrice,
+            mode: activeSltpMode === "trailing" ? "trailing" : "fixed",
+            stopLoss: finalSignal.stopLoss!,
+            slUpdates: 0,
+            initialTp: finalSignal.takeProfit!,
+            currentTp: finalSignal.takeProfit!,
+            tpTriggered: false,
+            peak: openPrice,
+            lastUpdateAtMs: null,
+          };
+          sltpExits.set(sltpState.positionId, sltpState);
+          knownPositionIds.add(sltpState.positionId);
+          missingPositions.delete(sltpState.positionId);
+          await persistSltpExit(sltpState).catch((error) => console.error(error));
+        }
         const targetLabel = managedExit ? "Target1" : "TP";
+        const sltpLabel = activeSltpMode === "trailing" ? "TP trailing" : activeSltpMode === "fixed" ? "TP fisso" : targetLabel;
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${finalSignal.direction}`
           + `\nlotti ${orderLots}${lotsCapped ? ` (ridotti da ${activeLots} per il cap rischio)` : ""}`
-          + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · ${targetLabel} ${money(target1)}`
-          + `\nSL ${money(riskPlan.slDistance)}$ · ${targetLabel} ${money(riskPlan.target1Distance)}$ a ${finalSignal.riskReward}R`
+          + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · ${sltpLabel} ${money(target1)}`
+          + `\nSL ${money(riskPlan.slDistance)}$ · ${sltpLabel} ${money(riskPlan.target1Distance)}$ a ${finalSignal.riskReward}R`
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `${managedExit ? `\nTP broker (sicurezza) ${money(brokerTp)} a ${money(riskPlan.tpBrokerDistance)}$ · uscita gestita: breakeven a Target1 poi trailing M5` : ""}`
+          + `${useSltpEngine ? `\nSLTP_MODE=${activeSltpMode}: SL da struttura, si stringe soltanto${activeSltpMode === "trailing" ? "; TP trailing dopo il trigger di estensione" : "; TP fisso"}.` : ""}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error" || execution.status === "pending_confirmation") {
@@ -1400,6 +1717,7 @@ async function main() {
   );
   await refreshLossGuards();
   await restoreManagedExits().catch((error) => console.error(error));
+  await restoreSltpExits().catch((error) => console.error(error));
   console.log("[scalper-worker] synchronized", {
     symbol: symbol(),
     purgedSignals: purged.rowCount,
@@ -1628,6 +1946,7 @@ nessuna quote valida da ${decision.quoteAgeSec ?? "?"} s`,
     void refreshLossGuards().catch((error) => console.error(error));
     // Riprende i piani di uscita non ancora in memoria (ordine collegato in ritardo, worker riavviato).
     void restoreManagedExits().catch((error) => console.error(error));
+    void restoreSltpExits().catch((error) => console.error(error));
   }, lossLockRefreshMs);
 
   const heartbeatTimer = setInterval(() => {

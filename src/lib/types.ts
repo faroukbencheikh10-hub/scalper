@@ -30,10 +30,20 @@ export type SetupEvaluation = {
   reason: string;
 };
 
+/**
+ * Stato M15 a 4 valori (M15_GATE_MODE=live): true_range ha sempre priorita' su transition/trend,
+ * anche quando gli swing sembrano direzionali. transition e' tutto cio' che non e' ne' un range
+ * vero ne' un trend confermato. Calcolato e loggato sempre, anche con M15_GATE_MODE=off.
+ */
+export type M15Regime = "true_range" | "transition" | "trend_up" | "trend_down";
+
 /** Bias M5 e stato M15 letti a ogni tick prima di valutare m1_short e m1_range. */
 export type MarketContext = {
   biasM5: "up" | "down" | "flat";
+  /** Stato a 3 valori usato dal gate quando M15_GATE_MODE=off (invariato rispetto a prima). */
   m15State: "trend_up" | "trend_down" | "range";
+  /** Stato a 4 valori, sempre calcolato: usato dal gate solo quando M15_GATE_MODE=live. */
+  m15Regime: M15Regime;
   m15BreakoutRecent: boolean;
   /** EMA20 M5 sull'ultima M5 chiusa e cinque candele prima. */
   ema20M5: number;

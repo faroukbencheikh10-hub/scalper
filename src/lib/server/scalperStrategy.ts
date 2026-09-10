@@ -1,4 +1,4 @@
-import type { Candle, MarketContext, Quote, ScalperSignal, SetupEvaluation } from "../types";
+import type { Candle, M15Regime, MarketContext, Quote, ScalperSignal, SetupEvaluation } from "../types";
 import { atr, emaCloseSeries } from "./indicators";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure";
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
@@ -19,6 +19,29 @@ export const STRATEGY_VERSION = "mtf-continuation-v1";
 function env(name: string, fallback: number, min: number, max: number) {
   const raw = process.env[name]?.trim(), value = raw ? Number(raw) : NaN;
   return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
+}
+
+/**
+ * Gate M15 a 4 stati. Default "off": nessun cambio di comportamento rispetto a main, m15State
+ * resta a 3 valori e "range" blocca sempre m1_short. "live" sblocca la zona grigia: m1_short passa
+ * anche con M15 in transizione, purche' M5 sia direzionale e M15 non sia un range vero ne' un
+ * trend opposto. Qualsiasi valore diverso da "live" (incluso assente o non riconosciuto) e' "off".
+ */
+export function m15GateMode(): "off" | "live" {
+  return (process.env.M15_GATE_MODE?.trim().toLowerCase() ?? "off") === "live" ? "live" : "off";
+}
+
+/**
+ * Classificazione pura dello stato M15 a 4 valori. Il range compresso ha SEMPRE priorita': anche
+ * se gli swing dell'ultima banda sembrano direzionali, un M15 compresso resta true_range e non
+ * diventa mai transition ne' trend. "transition" e' tutto cio' che non e' ne' un range vero ne'
+ * un trend con struttura confermata (HH/HL o LL/LH).
+ */
+export function classifyM15Regime(input: { compressed: boolean; structureUp: boolean; structureDown: boolean }): M15Regime {
+  if (input.compressed) return "true_range";
+  if (input.structureUp) return "trend_up";
+  if (input.structureDown) return "trend_down";
+  return "transition";
 }
 function reject(reason: string, evaluations?: SetupEvaluation[]): ScalperSignal {
   return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
@@ -131,8 +154,11 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     if (rising && fast! > slow! && slope > atr15 * 0.05 && last15.close > slow!) direction = "BUY";
     if (falling && fast! < slow! && slope < -atr15 * 0.05 && last15.close < slow!) direction = "SELL";
   }
+  // Stato M15 a 4 valori loggato sempre (anche con M15_GATE_MODE=off): non cambia nessuna delle
+  // due condizioni di direzione della mtf qui sopra o sotto, e' solo l'etichetta nel reasoning.
   let gateNote = direction
-    ? "M15 trend " + direction + " confermato: sep " + sep.toFixed(2) + " ATR15, efficienza " + efficiency.toFixed(2) + "."
+    ? "M15 trend " + direction + " confermato: sep " + sep.toFixed(2) + " ATR15, efficienza " + efficiency.toFixed(2)
+      + ". m15_regime=" + (direction === "BUY" ? "trend_up" : "trend_down") + " (gate=" + m15GateMode() + ")."
     : "";
 
   // M15_TREND_MODE=soft (default): il contesto M15 non confermato non blocca da solo. Blocca solo il
@@ -147,7 +173,8 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     const inside = price > bandLow + edge && price < bandHigh - edge;
     const bandDetail = "banda 12 M15 " + width.toFixed(2) + "$ = " + widthAtr.toFixed(2) + " ATR15 (max "
       + maxWidthAtr.toFixed(2) + "), ATR15 " + atr15.toFixed(2) + "$, prezzo " + price.toFixed(2)
-      + " in " + bandLow.toFixed(2) + "-" + bandHigh.toFixed(2);
+      + " in " + bandLow.toFixed(2) + "-" + bandHigh.toFixed(2)
+      + ". m15_regime=" + (widthAtr <= maxWidthAtr && inside ? "true_range" : "transition") + " (gate=" + m15GateMode() + ")";
     if (widthAtr <= maxWidthAtr && inside) {
       return reject("M15 in range vero: " + bandDetail + ". Nessun movimento da seguire.");
     }
@@ -312,10 +339,16 @@ export function contextM5M15(m5: Candle[], nowMs: number): MarketContext | null 
   const higherLows = lows.length >= 2 && lows.at(-1)!.low > lows.at(-2)!.low;
   const lowerLows = lows.length >= 2 && lows.at(-1)!.low < lows.at(-2)!.low;
   const lowerHighs = highs.length >= 2 && highs.at(-1)!.high < highs.at(-2)!.high;
-  // Senza struttura chiara in nessuna delle due direzioni il contesto resta range.
-  const m15State: MarketContext["m15State"] = m15BandAtr <= maxBandAtr ? "range"
-    : higherHighs && higherLows ? "trend_up"
-      : lowerLows && lowerHighs ? "trend_down" : "range";
+  const compressed = m15BandAtr <= maxBandAtr;
+  // Stato a 4 valori, sempre calcolato e sempre in log: il range compresso ha sempre priorita',
+  // "transition" e' la banda larga senza struttura HH/HL o LL/LH confermata. Non influenza la
+  // decisione finche' M15_GATE_MODE resta "off": m15State a 3 valori sotto e' invariato.
+  const m15Regime = classifyM15Regime({ compressed, structureUp: higherHighs && higherLows, structureDown: lowerLows && lowerHighs });
+  // Senza struttura chiara in nessuna delle due direzioni il contesto resta range. Invariato bit
+  // per bit rispetto a prima: dipende solo da compressed/higherHighs&&higherLows/lowerLows&&lowerHighs.
+  const m15State: MarketContext["m15State"] = compressed ? "range"
+    : m15Regime === "trend_up" ? "trend_up"
+      : m15Regime === "trend_down" ? "trend_down" : "range";
 
   const last15 = m15.at(-1)!, previous15 = m15.slice(-1 - CONTEXT_M15_BARS, -1);
   const brokeUp = last15.close > maxHigh(previous15), brokeDown = last15.close < minLow(previous15);
@@ -326,12 +359,13 @@ export function contextM5M15(m5: Candle[], nowMs: number): MarketContext | null 
     + ", EMA20 " + CONTEXT_EMA_LOOKBACK + " candele prima " + ema20M5Before.toFixed(2) + ")"
     + ", m15_state=" + m15State + " (banda " + CONTEXT_M15_BARS + " M15 " + m15BandWidth.toFixed(2) + "$ = "
     + m15BandAtr.toFixed(2) + " ATR15, range sotto " + maxBandAtr.toFixed(2) + ", ATR15 " + atr15.toFixed(2) + "$)"
+    + ", m15_regime=" + m15Regime + " (gate=" + m15GateMode() + ")"
     + ", m15_breakout_recent=" + m15BreakoutRecent
     + " (ultima M15 " + last15.datetime + " chiusa " + last15.close.toFixed(2)
     + " vs " + minLow(previous15).toFixed(2) + "-" + maxHigh(previous15).toFixed(2)
     + ", chiusa da " + Math.round(closedAgo / 1000) + " s)";
 
-  return { biasM5, m15State, m15BreakoutRecent, ema20M5, ema20M5Before, closeM5,
+  return { biasM5, m15State, m15Regime, m15BreakoutRecent, ema20M5, ema20M5Before, closeM5,
     m15BandWidth: Number(m15BandWidth.toFixed(2)), m15BandAtr: Number(m15BandAtr.toFixed(2)),
     atr15: Number(atr15.toFixed(2)), detail };
 }
@@ -347,12 +381,33 @@ function rejectContext(reason: string, direction?: "BUY" | "SELL"): ScalperSigna
 /**
  * Contesto obbligatorio per m1_short: si opera solo nella direzione del bias M5, con l'M15 dalla
  * stessa parte, mai in range e mai subito dopo una rottura M15.
+ *
+ * M15_GATE_MODE=off (default): comportamento invariato bit per bit, sul m15State a 3 valori.
+ * M15_GATE_MODE=live: gate a 4 stati sul m15Regime. true_range e trend opposto bloccano sempre
+ * come prima; la differenza e' che "transition" (M15 non ancora confermato ma non un range vero)
+ * non blocca piu' da sola: il bias M5 puo' portare il trade, la zona grigia si sblocca.
  */
-function shortContextGate(label: string, context: MarketContext | null) {
+export function shortContextGate(label: string, context: MarketContext | null) {
   if (!context) return { allowed: null, blocked: rejectContext(label + ": contesto M5/M15 non disponibile, storico M5/M15 insufficiente.") };
   const allowed: "BUY" | "SELL" | null = context.biasM5 === "up" ? "BUY" : context.biasM5 === "down" ? "SELL" : null;
   const detail = " (" + context.detail + ")";
   if (!allowed) return { allowed: null, blocked: rejectContext(label + ": bias_m5=flat" + detail + ".") };
+
+  if (m15GateMode() === "live") {
+    if (context.m15Regime === "true_range") {
+      return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_regime=true_range" + detail + ".", allowed) };
+    }
+    const contraryRegime: M15Regime = allowed === "BUY" ? "trend_down" : "trend_up";
+    if (context.m15Regime === contraryRegime) {
+      return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_regime=" + contraryRegime + " contrario al bias M5" + detail + ".", allowed) };
+    }
+    if (context.m15BreakoutRecent) {
+      return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_breakout_recent=true" + detail + ".", allowed) };
+    }
+    // trend_<stessa direzione> o transition: il bias M5 porta il trade.
+    return { allowed, blocked: null };
+  }
+
   const contrary = allowed === "BUY" ? "trend_down" : "trend_up";
   if (context.m15State === contrary) {
     return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_state=" + contrary + " contrario al bias M5" + detail + ".", allowed) };

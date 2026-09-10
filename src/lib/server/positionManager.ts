@@ -14,7 +14,11 @@ export const TRAILING_BUFFER_USD = 0.2;
 
 export type ManagedCloseReason =
   | "sl_initial" | "sl_breakeven" | "sl_trailing" | "tp_broker" | "target1"
-  | "flatten" | "stop" | "watchdog" | "manual";
+  | "flatten" | "stop" | "watchdog" | "manual"
+  // SLTP_MODE=fixed|trailing (dynamicSlTp.ts): tp_fixed prima del trigger di estensione, tp_trailing
+  // dopo. sltp_rejected e' l'ultima spiaggia quando il broker ha rifiutato due volte sia lo SL sia
+  // il TP calcolati e non resta nessun livello noto a cui attribuire la chiusura.
+  | "tp_fixed" | "tp_trailing" | "sltp_rejected";
 
 /** Tick del simbolo: la granularita' con cui si riconosce "chiuso su quel livello". */
 export const PRICE_TICK_USD = 0.01;
@@ -227,6 +231,30 @@ export function closeReasonFromPrice(
   if (near(closePrice, levels.initialStop) && Number.isFinite(profit) && profit < 0) return "sl_initial";
   if (near(closePrice, levels.brokerTp)) return "tp_broker";
   if (near(closePrice, levels.target1)) return "target1";
+  return "manual";
+}
+
+/** Livelli noti di una posizione SLTP_MODE=fixed|trailing (dynamicSlTp.ts), letti da context_json. */
+export type SltpCloseLevels = {
+  currentSl: number | null;
+  /** true se lo SL si e' gia' stretto almeno una volta rispetto a quello iniziale. */
+  slTightened: boolean;
+  currentTp: number | null;
+  /** true se il trigger di estensione del TP trailing era gia' superato al momento della chiusura. */
+  tpTriggered: boolean;
+};
+
+/**
+ * Motivo di chiusura per le posizioni gestite da SLTP_MODE, letto anch'esso dal prezzo REALE del
+ * deal quando il broker chiude prima del check attivo del worker (vedi POSITION_GONE_CONFIRM).
+ * Separata da closeReasonFromPrice perche' il vocabolario e i livelli sono diversi: qui non
+ * esistono breakeven ne' target1, solo lo SL corrente (sl_initial finche' non si e' mai stretto,
+ * sl_trailing dopo) e il TP corrente (tp_fixed prima del trigger di estensione, tp_trailing dopo).
+ */
+export function sltpCloseReasonFromPrice(closePrice: number, levels: SltpCloseLevels): ManagedCloseReason {
+  if (!Number.isFinite(closePrice)) return "manual";
+  if (near(closePrice, levels.currentSl)) return levels.slTightened ? "sl_trailing" : "sl_initial";
+  if (near(closePrice, levels.currentTp)) return levels.tpTriggered ? "tp_trailing" : "tp_fixed";
   return "manual";
 }
 
