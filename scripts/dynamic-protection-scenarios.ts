@@ -136,6 +136,58 @@ check("dynamic: explicit tick normalizer preserves safe side for SELL", () => {
   assert.equal(tp, 4398.45);
 });
 
+check("dynamic: SL max stays strict after tick rounding", () => {
+  const config: DynamicProtectionConfig = {
+    slAtrMult: 1,
+    slMinUsd: 3,
+    slMaxUsd: 3,
+    tpAtrMult: 0.8,
+    tpMinUsd: 1.5,
+    tpMaxUsd: 4,
+    spreadMult: 3,
+    trailAtrMult: 0.35,
+    trailMinUsd: 0.3,
+    trailMaxUsd: 1.2,
+  };
+  const levels = initialDynamicLevels({
+    direction: "BUY",
+    entry: 4400.03,
+    atrM1: 1,
+    spreadUsd: 0.1,
+    tickSizeUsd: 0.05,
+    config,
+  });
+  assert.equal(levels.valid, false);
+  assert.equal(levels.rejectReason, "sl_distance_above_max");
+  assert.ok(levels.slDistanceUsd! > config.slMaxUsd);
+});
+
+check("dynamic: TP max stays strict after tick rounding", () => {
+  const config: DynamicProtectionConfig = {
+    slAtrMult: 1.3,
+    slMinUsd: 3,
+    slMaxUsd: 8,
+    tpAtrMult: 0.8,
+    tpMinUsd: 1.5,
+    tpMaxUsd: 1.5,
+    spreadMult: 3,
+    trailAtrMult: 0.35,
+    trailMinUsd: 0.3,
+    trailMaxUsd: 1.2,
+  };
+  const levels = initialDynamicLevels({
+    direction: "BUY",
+    entry: 4400.03,
+    atrM1: 1,
+    spreadUsd: 0.1,
+    tickSizeUsd: 0.05,
+    config,
+  });
+  assert.equal(levels.valid, false);
+  assert.equal(levels.rejectReason, "tp_distance_above_max");
+  assert.ok(levels.tpDistanceUsd! > config.tpMaxUsd);
+});
+
 check("dynamic: adaptive minimum improvement uses tick spread and floor", () => {
   assert.equal(adaptiveMinImprovementUsd({ spreadUsd: 0.4, tickSizeUsd: 0.01 }), 0.1);
   assert.equal(adaptiveMinImprovementUsd({ spreadUsd: 0.04, tickSizeUsd: 0.01 }), 0.05);
@@ -310,4 +362,4 @@ check("dynamic: SELL mirrors BUY and SL only moves downward", () => {
   assert.ok(second.stopLoss < first.stopLoss);
 });
 
-console.log(`dynamic-protection scenarios: ${passed}/21 passed`);
+console.log(`dynamic-protection scenarios: ${passed}/23 passed`);
