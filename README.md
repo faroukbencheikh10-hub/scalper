@@ -244,6 +244,7 @@ Environment del recovery:
 - `STALE_QUOTE_SEC` — secondi senza quote prima del reconnect; default `120`.
 - `STALE_QUOTE_EXIT_SEC` — secondi senza quote prima di `process.exit(1)`; default `300`. Per sicurezza resta almeno 30 secondi sopra la soglia reconnect.
 - `RAILWAY_API_TOKEN` — opzionale e server-only; il watchdog lo usa per il riavvio via Railway GraphQL. Se manca, manda solo l'alert Telegram.
-- `RAILWAY_SERVICE_ID` — ID del servizio Railway da riavviare (`scalper-worker`). Il watchdog risolve l'environment del servizio, prova `serviceInstanceRedeploy` e usa `deploymentRestart` come fallback.
+- `RAILWAY_SERVICE_ID` — variabile automatica Railway che identifica **il servizio corrente**. Sul servizio separato `scalper-watchdog` identifica quindi il watchdog e non deve essere usata come target del restart.
+- `SCALPER_WORKER_SERVICE_ID` — ID reale di `scalper-worker` quando il watchdog gira in un servizio separato; è il target usato per `serviceInstanceRedeploy`, con `deploymentRestart` come fallback.
 
 `stream_worker_detail` include `quoteAgeSec` e `quoteReceivedAt`. `stream_last_quote.receivedAt` è il timestamp reale dell'ultima quote valida ricevuta e non viene più avanzato artificialmente dal timer di persistenza. In fascia il watchdog considera quote stale oltre 180 secondi, limita il relativo alert Telegram a uno ogni 10 minuti e prova il restart Railway solo se entrambe le variabili Railway sono presenti.

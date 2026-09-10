@@ -270,10 +270,13 @@ async function main() {
       STALE_QUOTE_ALERT_INTERVAL_MS,
     );
     const railwayToken = process.env.RAILWAY_API_TOKEN?.trim();
-    const railwayServiceId = process.env.RAILWAY_SERVICE_ID?.trim();
-    if (alerted && railwayToken && railwayServiceId) {
+    const currentRailwayServiceId = process.env.RAILWAY_SERVICE_ID?.trim();
+    const currentRailwayServiceName = process.env.RAILWAY_SERVICE_NAME?.trim();
+    const railwayWorkerServiceId = process.env.SCALPER_WORKER_SERVICE_ID?.trim()
+      || (currentRailwayServiceName === "scalper-worker" ? currentRailwayServiceId : undefined);
+    if (alerted && railwayToken && railwayWorkerServiceId) {
       try {
-        const restart = await restartRailwayService(railwayToken, railwayServiceId);
+        const restart = await restartRailwayService(railwayToken, railwayWorkerServiceId);
         console.warn("[scalper-watchdog] railway_restart", restart);
       } catch (error) {
         const message = `Railway restart fallito: ${errorText(error)}`;
