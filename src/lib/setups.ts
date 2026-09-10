@@ -14,10 +14,11 @@ export function setupLabel(setup: string | null | undefined) {
         : key === "breakout_retest" ? "Breakout retest"
           : key === "m1_short" ? "Breakout range M1"
             : key === "m1_range" ? "Rientro dal bordo (range M1)"
-              : key === "range_gate" ? "Range M1 (contesto)"
-                : key === "m15_gate" ? "Contesto M15/M5"
-                  : key === "m1_gate" ? "Breakout M1 (contesto)"
-                    : key === "filtri" ? "Filtri di protezione"
-                      : key && key !== "none" ? key : "—";
+              : key === "context_gate" ? "Contesto M5/M15"
+                : key === "range_gate" ? "Range M1 (contesto)"
+                  : key === "m15_gate" ? "Contesto M15/M5 (mtf)"
+                    : key === "m1_gate" ? "Breakout M1 (contesto)"
+                      : key === "filtri" ? "Filtri di protezione"
+                        : key && key !== "none" ? key : "—";
   return manual && label !== "—" ? `${label} (manuale)` : label;
 }

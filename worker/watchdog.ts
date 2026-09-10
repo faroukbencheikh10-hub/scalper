@@ -1,6 +1,11 @@
 // Watchdog: processo one-shot (cron Railway ogni 5 min) che termina sempre con exit 0.
 // Se il worker streaming e' morto avvisa su Telegram e, se necessario, chiude le
 // posizioni rimaste aperte usando MetaApi REST.
+//
+// Non esiste e non deve esistere alcuna chiusura per eta' o durata della posizione: i trade
+// restano aperti finche' non li chiude lo stop, il flatten di fine fascia o lo STOP. Le soglie
+// WATCHDOG_MAX_AGE_SEC e WATCHDOG_CLOSE_AFTER_SEC misurano solo l'eta' dell'heartbeat del worker,
+// cioe' da quanto il worker non risponde, mai da quanto e' aperta una posizione.
 
 import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
 import { deals, symbol } from "../src/lib/server/metaApi";
@@ -72,16 +77,18 @@ async function recordClosure(position: WatchdogPosition, reason: string) {
     const risk = Math.abs(open - Number(signal.stop_loss));
     const signed = Number(signal.entry) < Number(signal.stop_loss) ? open - close : close - open;
     const resultR = risk > 0 ? Number((signed / risk).toFixed(2)) : 0;
+    // La chiusura d'emergenza non e' mai una perdita del setup: close_reason resta "watchdog".
     await dbQuery(
       `UPDATE scalper_signals
           SET mt5_open_price=COALESCE(mt5_open_price,$2),mt5_close_price=$3,mt5_profit=$4,
               outcome=$5,result_r=$6,closed_at=COALESCE($7::timestamptz,now()),
-              mt5_volume=COALESCE(mt5_volume,$8)
+              mt5_volume=COALESCE(mt5_volume,$8),close_reason='watchdog',final_sl=COALESCE(final_sl,stop_loss)
         WHERE id=$1`,
       [signal.id, open, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null, volume],
     );
     await dbQuery(
-      `UPDATE trades SET reason=$2,payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason',$2)
+      `UPDATE trades SET reason=$2,close_reason='watchdog',
+              payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason','watchdog')
         WHERE source='scalper' AND mt5_position_id=$1`,
       [position.id, reason],
     );

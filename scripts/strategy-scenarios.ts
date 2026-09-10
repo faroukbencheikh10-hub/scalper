@@ -3,6 +3,10 @@ import assert from "node:assert/strict";
 import { evaluateScalper, plannedEntryValid } from "../src/lib/server/scalperStrategy";
 import { definitelyRejected, recoverOrder, riskPerLot } from "../src/lib/server/orderSafety";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "../src/lib/server/marketStructure";
+import {
+  applyAction, closeReasonFromState, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup,
+  m5CloseAction, openManagedExit, oppositeSignalIgnored, stopHit, tickAction,
+} from "../src/lib/server/positionManager";
 import type { Candle } from "../src/lib/types";
 
 // Isolate test configuration from deployment/local env.
@@ -269,15 +273,75 @@ check("Pivot needs closed candles on both sides", () => {
   const bars = [bar(0, 10, 10), bar(MINUTE, 11, 11), bar(2 * MINUTE, 20, 20)];
   assert.equal(swingLevels(bars, "BUY").length, 0);
 });
+// --- Contesto M5/M15 per m1_short e m1_range -------------------------------------------------
+// Tutte queste M5 hanno corpi piccoli rispetto al range: nessuna puo' fare da impulso alla mtf,
+// che in questi scenari non produce mai un ordine e lascia il campo ai due setup M1.
+const M5 = 5 * MINUTE, M15 = 15 * MINUTE;
+
+/**
+ * M15 a gradini: due gruppi a favore e uno contro, cosi' massimi e minimi crescono (o calano)
+ * con swing riconoscibili. Con shape "range" i gruppi si alternano e la banda resta stretta.
+ */
+function contextM5(bias: "up" | "down", options: { shape?: "trend" | "range"; end?: number; total?: number; endLevel?: number } = {}) {
+  const end = options.end ?? Date.UTC(2026, 8, 9, 10, 5), total = options.total ?? 120;
+  const shape = options.shape ?? "trend", endLevel = options.endLevel ?? 2200;
+  const deltas = Array.from({ length: total }, (_, i) => {
+    const group = Math.floor((end - (total - 1 - i) * M5) / M15) % (shape === "trend" ? 3 : 2);
+    const step = shape === "trend" ? (group === 2 ? -0.5 : 1) : (group === 1 ? -1 : 1);
+    return bias === "up" ? step : -step;
+  });
+  const levels: number[] = [];
+  let level = 0;
+  for (const delta of deltas) { levels.push(level); level += delta; }
+  const offset = endLevel - level;
+  return deltas.map((delta, i) => bar(end - (total - 1 - i) * M5,
+    levels[i] + offset, levels[i] + offset + delta, Math.max(0.5, Math.abs(delta))));
+}
+
+/**
+ * M5 di un laterale: storia in salita lenta, poi candele larghe che contengono tutto il movimento
+ * M1. L'ultima chiude sotto una EMA20 ancora in salita, quindi il bias resta "flat".
+ */
+function rangeContextM5(band: { low: number; high: number }, options: { end?: number; total?: number } = {}) {
+  const end = options.end ?? Date.UTC(2026, 8, 9, 10, 5), total = options.total ?? 120;
+  const mid = (band.low + band.high) / 2, wide = (band.high - band.low) / 2 + 20;
+  const out: Candle[] = [];
+  let previous = mid - (total - 6) * 0.5;
+  for (let i = 0; i < total; i++) {
+    const close = i <= total - 7 ? mid - (total - 7 - i) * 0.5 : i <= total - 3 ? mid + 10 : mid - 6;
+    out.push(bar(end - (total - 1 - i) * M5, previous, close, i <= total - 7 ? 0.6 : wide));
+    previous = close;
+  }
+  return out;
+}
+
+/** Porta l'ultima M15 completa a chiudere oltre la banda delle 12 precedenti: rottura fresca. */
+function withM15Breakout(m5: Candle[], atMs: number) {
+  const closed = closedBars(m5.filter(c => Date.parse(c.datetime) <= atMs), 5, atMs)!;
+  const m15 = aggregateM15(closed);
+  const last = m15.at(-1)!, previous = m15.slice(-13, -1);
+  const startMs = Date.parse(last.datetime);
+  const target = Math.max(...previous.map(c => c.high)) + 1;
+  const open = last.open, span = (target - open) / 3;
+  return m5.map(candle => {
+    const t = Date.parse(candle.datetime);
+    if (t < startMs || t >= startMs + M15) return candle;
+    const step = (t - startMs) / M5;
+    return bar(t, open + span * step, open + span * (step + 1), Math.max(0.5, Math.abs(span)));
+  });
+}
+
 // --- m1_short: secondo setup, valutato solo quando la mtf non produce un ordine ---
-// M5 piatte => contesto M15 in range vero => la mtf non entra mai in questi scenari.
-// Il trigger e' il prezzo live: le candele costruiscono solo il range chiuso, la quote lo supera o no.
-function shortInput(options: { drift?: number; flatBars?: number; breakout?: number; shock?: number } = {}) {
+// Il trigger e' il prezzo live: le candele M1 costruiscono solo il range chiuso, la quote lo supera o no.
+function shortInput(options: { drift?: number; flatBars?: number; breakout?: number; shock?: number;
+  bias?: "up" | "down"; shape?: "trend" | "range"; breakoutM15?: boolean } = {}) {
   const base = fixture();
   const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
   const drift = options.drift ?? 0, flatBars = options.flatBars ?? total, breakout = options.breakout ?? 0.5;
   const driftBars = total - flatBars;
-  const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
+  const at = options.breakoutM15 ? Date.UTC(2026, 8, 9, 10, 2, 1) : base.nowMs;
+  const built = contextM5(options.bias ?? "up", { shape: options.shape });
+  const m5 = options.breakoutM15 ? withM15Breakout(built, at) : built;
   const m1: Candle[] = [];
   let level = 2200 - driftBars * drift;
   for (let i = 0; i < total; i++) {
@@ -289,10 +353,12 @@ function shortInput(options: { drift?: number; flatBars?: number; breakout?: num
     const last = m1.at(-1)!;
     m1[m1.length - 1] = bar(Date.parse(last.datetime), last.open, last.open + options.shock, 0.2);
   }
-  const window = m1.slice(-8);
+  const live = m1.filter(c => Date.parse(c.datetime) <= at);
+  const window = live.slice(-8);
   const high = Math.max(...window.map(c => c.high)), low = Math.min(...window.map(c => c.low));
   const bid = breakout >= 0 ? high + breakout : low + breakout;
-  return { nowMs: base.nowMs, m1, m5, quote: { bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: base.nowMs } };
+  return { nowMs: at, m1: live, m5: m5.filter(c => Date.parse(c.datetime) <= at),
+    quote: { bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: at } };
 }
 check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla", () => {
   withShort({}, () => {
@@ -301,8 +367,13 @@ check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla
     assert.equal(s.direction, "BUY", JSON.stringify(s));
     assert.equal(s.setup, "m1_short");
     assert.ok(s.setupKey?.startsWith("m1-short-v1:BUY:"), s.setupKey ?? "");
-    // Le due valutazioni convivono: contesto mtf scartato + m1_gate con i numeri.
-    assert.deepEqual(s.evaluations.map(e => e.setup), ["filtri", "m1_gate"]);
+    // Le valutazioni convivono: contesto mtf scartato, poi context_gate M5/M15 e m1_gate con i numeri.
+    assert.deepEqual(s.evaluations.map(e => e.setup).slice(-2), ["context_gate", "m1_gate"]);
+    const context = s.evaluations.find(e => e.setup === "context_gate")!;
+    assert.equal(context.status, "triggered");
+    assert.match(context.reason, /bias_m5=up .*EMA20 M5 \d+\.\d\d, EMA20 5 candele prima \d+\.\d\d/);
+    assert.match(context.reason, /m15_state=trend_up/);
+    assert.match(context.reason, /m15_breakout_recent=false/);
     const gate = s.evaluations.at(-1)!;
     assert.equal(gate.status, "triggered");
     assert.match(gate.reason, /range 8 M1 chiuse \d+\.\d\d-\d+\.\d\d/);
@@ -331,8 +402,9 @@ check("SHORT_ENABLED=false lascia solo la mtf", () => {
 });
 check("m1_short: rottura contro l'EMA20 M1 scartata", () => {
   withShort({}, () => {
-    // Serie in discesa: l'EMA20 resta sopra, il rimbalzo rompe il range ma non la direzione.
-    const s = evaluateScalper(shortInput({ drift: 1, flatBars: 13, breakout: -0.5 }));
+    // Serie M1 in salita con bias M5 al ribasso: la rottura al ribasso passa il contesto ma trova
+    // l'EMA20 M1 dalla parte sbagliata.
+    const s = evaluateScalper(shortInput({ drift: 1, flatBars: 13, breakout: -0.5, bias: "down" }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     const gate = s.evaluations.find(e => e.setup === "m1_gate");
     assert.match(gate!.reason, /contro l'EMA20 M1/);
@@ -412,13 +484,14 @@ function withRange(env: Record<string, string>, test: () => void) {
     for (const [k, v] of previous) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 }
-// Zig-zag M1 dentro una banda, poi una gamba verso il bordo e la candela di rifiuto. M5 piatte => la mtf non entra mai.
-function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset?: number; lastBody?: number; leg?: number } = {}) {
+// Zig-zag M1 dentro una banda, poi una gamba verso il bordo e la candela di rifiuto.
+// Le M5 di contesto contengono tutto il movimento M1 e lasciano il bias a "flat".
+function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset?: number; lastBody?: number;
+  leg?: number; breakoutM15?: boolean; bias?: "up" | "down" } = {}) {
   const base = fixture();
   const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
   const direction = options.direction ?? "BUY", step = options.step ?? 1, leg = options.leg ?? 7;
   const lastBody = options.lastBody ?? (direction === "BUY" ? 0.3 : -0.3);
-  const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
   const m1: Candle[] = [];
   let level = 2200;
   const push = (i: number, delta: number) => {
@@ -430,14 +503,19 @@ function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset
   // lunga la gamba, piu' il range delle 8 M1 e' largo rispetto all'ATR (con leg 7 riempie la finestra).
   for (let i = total - 1 - leg; i < total - 1; i++) push(i, direction === "BUY" ? -step : step);
   m1.push(bar(end, level, level + (direction === "BUY" ? lastBody : lastBody), 0.15));
-  const window = m1.slice(-8);
+  const at = options.breakoutM15 ? Date.UTC(2026, 8, 9, 10, 2, 1) : base.nowMs;
+  const live = m1.filter(c => Date.parse(c.datetime) <= at);
+  const band = { low: Math.min(...live.map(c => c.low)), high: Math.max(...live.map(c => c.high)) };
+  const built = options.bias ? contextM5(options.bias) : rangeContextM5(band);
+  const m5 = (options.breakoutM15 ? withM15Breakout(built, at) : built).filter(c => Date.parse(c.datetime) <= at);
+  const window = live.slice(-8);
   const high = Math.max(...window.map(c => c.high)), low = Math.min(...window.map(c => c.low));
   const offset = options.offset ?? 0.3;
   const ask = direction === "BUY" ? low + offset : high - offset;
   const bid = direction === "BUY" ? ask - 0.12 : ask;
-  return { nowMs: base.nowMs, m1, m5,
+  return { nowMs: at, m1: live, m5,
     quote: { bid: direction === "BUY" ? ask - 0.12 : high - offset, ask: direction === "BUY" ? ask : high - offset + 0.12,
-      mid: bid + 0.06, spread: 0.12, quotedAt: base.nowMs } };
+      mid: bid + 0.06, spread: 0.12, quotedAt: at } };
 }
 check("m1_range: BUY sul rientro dal minimo del range", () => {
   withRange({}, () => {
@@ -565,5 +643,173 @@ check("m1_range: la mtf ha la precedenza e RANGE_ENABLED=false lo spegne", () =>
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.ok(!s.evaluations.some(e => e.setup === "range_gate"));
   });
+});
+// --- Contesto M5/M15 obbligatorio per m1_short e m1_range ------------------------------------
+function contextReason(s: ReturnType<typeof evaluateScalper>) {
+  return s.evaluations.find(e => e.setup === "context_gate")!.reason;
+}
+check("contesto: m1_short BUY scartato con bias_m5=down", () => {
+  withShort({}, () => {
+    // Rottura M1 verso l'alto ma bias M5 al ribasso: il contesto ammette solo SELL.
+    const s = evaluateScalper(shortInput({ bias: "down" }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "m1_gate"), "il contesto blocca prima del gate M1");
+    assert.match(contextReason(s), /m1_short BUY: bias_m5=down ammette solo SELL/);
+    assert.match(contextReason(s), /EMA20 M5 \d+\.\d\d, EMA20 5 candele prima \d+\.\d\d/);
+  });
+});
+check("contesto: m1_short BUY accettato con bias_m5=up e m15_state=trend_up", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput());
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.equal(s.setup, "m1_short");
+    const context = s.evaluations.find(e => e.setup === "context_gate")!;
+    assert.equal(context.status, "triggered");
+    assert.equal(context.direction, "BUY");
+    assert.match(context.reason, /bias_m5=up/);
+    assert.match(context.reason, /m15_state=trend_up/);
+    assert.match(context.reason, /m15_breakout_recent=false/);
+  });
+});
+check("contesto: m1_short BUY scartato con m15_state=range", () => {
+  withShort({}, () => {
+    // Gruppi M15 alternati: banda stretta in ATR15, il contesto resta laterale.
+    const s = evaluateScalper(shortInput({ shape: "range", bias: "down" }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "m1_gate"));
+    assert.match(contextReason(s), /m1_short BUY: m15_state=range/);
+    assert.match(contextReason(s), /banda 12 M15 \d+\.\d\d\$ = \d+\.\d\d ATR15, range sotto 3\.00/);
+  });
+});
+check("contesto: m1_range scartato con bias_m5=up", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ bias: "up" }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "range_gate"), "il contesto blocca prima del gate del range");
+    assert.match(contextReason(s), /m1_range: bias_m5=up, il mercato non e' laterale/);
+  });
+});
+check("contesto: m1_range accettato con bias_m5=flat e range 8 M1 dentro le 6 M5", () => {
+  withRange({}, () => {
+    const input = rangeInput();
+    const s = evaluateScalper(input);
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.equal(s.setup, "m1_range");
+    assert.match(contextReason(s), /m1_range: contesto ok/);
+    assert.match(contextReason(s), /bias_m5=flat/);
+    // Il contenimento e' vero sui dati, non solo nel messaggio.
+    const window = closedBars(input.m1, 1, input.nowMs)!.slice(-8);
+    const container = closedBars(input.m5, 5, input.nowMs)!.slice(-6);
+    assert.ok(Math.max(...window.map(c => c.high)) <= Math.max(...container.map(c => c.high)));
+    assert.ok(Math.min(...window.map(c => c.low)) >= Math.min(...container.map(c => c.low)));
+  });
+});
+check("contesto: m1_short e m1_range scartati con m15_breakout_recent=true", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput({ breakoutM15: true }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "m1_gate"));
+    assert.match(contextReason(s), /m1_short BUY: m15_breakout_recent=true/);
+  });
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ breakoutM15: true }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "range_gate"));
+    assert.match(contextReason(s), /m1_range: m15_breakout_recent=true/);
+  });
+});
+
+// --- Uscita gestita: breakeven a target1, poi trailing sulla struttura M5 ---------------------
+const exitM5Start = Date.UTC(2026, 8, 9, 9, 0);
+/** Candela M5 con minimo esatto: serve a pilotare gli swing low del trailing. */
+const swingBar = (index: number, low: number) => bar(exitM5Start + index * 5 * MINUTE, low + 0.3, low + 0.8, 0.3);
+const tick = (bid: number) => ({ bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: nowMs });
+
+check("uscita: target1 porta a breakeven, poi il trailing M5 sale tre volte e chiude in sl_trailing", () => {
+  let state = openManagedExit({
+    positionId: "p1", signalId: "s1", setup: "m1_short", direction: "BUY",
+    openPrice: 2200, initialStop: 2197, target1: 2203,
+  });
+  // Prima di target1 nessuna azione e lo stop iniziale resta fermo.
+  assert.equal(tickAction(state, tick(2202.5), nowMs, 0.1), null);
+  assert.equal(state.stopLoss, 2197);
+  // Il BID tocca target1: stop a open + ENTRY_BUFFER_USD, una volta sola.
+  const breakeven = tickAction(state, tick(2203.1), nowMs, 0.1)!;
+  assert.equal(breakeven.kind, "breakeven");
+  assert.equal(breakeven.kind === "breakeven" && breakeven.stopLoss, 2200.1);
+  state = applyAction(state, breakeven);
+  assert.equal(state.stopLoss, 2200.1);
+  assert.equal(state.breakevenPrice, 2200.1);
+  assert.equal(tickAction(state, tick(2204), nowMs, 0.1), null, "il breakeven si imposta una volta sola");
+
+  // Tre chiusure M5 con swing low crescenti: tre aggiornamenti, ogni volta piu' in alto.
+  const lows = [2202.0, 2200.5, 2202.0, 2201.0, 2203.0, 2201.5, 2204.0];
+  const bars = lows.map((low, i) => swingBar(i, low));
+  const expected = [2200.3, 2200.8, 2201.3];
+  for (let step = 0; step < 3; step++) {
+    const action = m5CloseAction(state, bars.slice(0, 3 + step * 2))!;
+    assert.equal(action.kind, "trailing", JSON.stringify(action));
+    assert.ok(action.kind === "trailing" && Math.abs(action.to - expected[step]) <= 0.011, JSON.stringify(action));
+    assert.ok(action.kind === "trailing" && action.to > state.stopLoss, "lo stop non torna mai indietro");
+    state = applyAction(state, action);
+  }
+  assert.equal(state.trailingUpdates, 3);
+  assert.ok(Math.abs(state.stopLoss - 2201.3) <= 0.011, String(state.stopLoss));
+  // Uno swing piu' basso non riporta indietro lo stop.
+  const backwards = m5CloseAction(state, [...bars, swingBar(7, 2199.0), swingBar(8, 2205.0)]);
+  assert.equal(backwards, null, "un nuovo swing piu' basso non abbassa lo stop");
+
+  // Il BID rompe l'ultimo stop: uscita in profitto, close_reason sl_trailing, non e' una perdita.
+  assert.ok(stopHit(state, tick(2201.2)));
+  assert.equal(closeReasonFromState(state), "sl_trailing");
+  assert.ok(state.stopLoss - state.openPrice > 0, "lo stop e' sopra l'apertura, l'uscita e' in profitto");
+  assert.equal(countsAsLoss("LOSS", closeReasonFromState(state)), false);
+});
+check("uscita: senza target1 lo stop iniziale chiude in sl_initial e conta come perdita", () => {
+  let state = openManagedExit({
+    positionId: "p2", signalId: "s2", setup: "m1_short", direction: "BUY",
+    openPrice: 2200, initialStop: 2197, target1: 2203,
+  });
+  for (const bid of [2201, 2199.5, 2198]) {
+    assert.equal(tickAction(state, tick(bid), nowMs, 0.1), null);
+    assert.equal(m5CloseAction(state, [swingBar(0, 2202), swingBar(1, 2200.5), swingBar(2, 2202)]), null,
+      "senza breakeven il trailing non parte");
+    assert.equal(state.stopLoss, 2197, "prima del breakeven lo stop iniziale resta fermo");
+  }
+  assert.ok(stopHit(state, tick(2196.9)));
+  assert.equal(closeReasonFromState(state), "sl_initial");
+  assert.equal(countsAsLoss("LOSS", "sl_initial"), true);
+  state = applyAction(state, { kind: "breakeven", stopLoss: 2200.1, at: new Date(nowMs).toISOString() });
+  assert.equal(closeReasonFromState(state), "sl_breakeven");
+});
+check("uscita: con un BUY aperto un segnale SELL viene solo loggato, nessun ordine", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput({ bias: "down", breakout: -0.5 }));
+    assert.equal(s.direction, "SELL", JSON.stringify(s));
+    assert.equal(s.setup, "m1_short");
+    // Con una posizione aperta nessun setup viene valutato per l'ingresso...
+    assert.equal(entryBlockedByOpenPositions(1, 1), true);
+    // ...e il segnale contrario resta solo a log: non chiude e non inverte.
+    assert.equal(oppositeSignalIgnored(["BUY"], s.direction), true);
+    assert.equal(oppositeSignalIgnored(["SELL"], s.direction), false);
+    assert.equal(oppositeSignalIgnored([], s.direction), false);
+    assert.equal(entryBlockedByOpenPositions(0, 1), false);
+  });
+});
+check("uscita: sl_breakeven non blocca la direzione, sl_initial si", () => {
+  assert.equal(countsAsLoss("LOSS", "sl_breakeven"), false);
+  assert.equal(countsAsLoss("LOSS", "sl_trailing"), false);
+  assert.equal(countsAsLoss("LOSS", "flatten"), false);
+  assert.equal(countsAsLoss("LOSS", "stop"), false);
+  assert.equal(countsAsLoss("LOSS", "watchdog"), false);
+  assert.equal(countsAsLoss("LOSS", "sl_initial"), true);
+  // La mtf non scrive close_reason: le sue perdite continuano a bloccare la direzione come prima.
+  assert.equal(countsAsLoss("LOSS", null), true);
+  assert.equal(countsAsLoss("WIN", "sl_initial"), false);
+  // Solo m1_short e m1_range hanno l'uscita gestita: la mtf tiene il TP al broker.
+  assert.equal(isManagedSetup("m1_short"), true);
+  assert.equal(isManagedSetup("m1_range"), true);
+  assert.equal(isManagedSetup("micro_pullback"), false);
+  assert.equal(isManagedSetup("breakout_retest"), false);
 });
 console.log(passed + " scenari superati.");
