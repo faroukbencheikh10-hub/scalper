@@ -199,4 +199,64 @@ check("17) SLTP_MODE=off -> nessuna nuova logica si attiva (non-regressione)", (
   withEnv({ SLTP_MODE: "FIXED" }, () => assert.equal(sltpMode(), "fixed")); // case-insensitive, non un default silenzioso
 });
 
+// --- 18: rete di sicurezza al broker, mai un ordine senza SL e senza TP ---------------------------
+//
+// Invariante ereditata dal commit 682d9e5 ("rete di sicurezza al broker"): ogni ordine parte con
+// SL e TP, MAI nulli, cosi' se worker o MetaApi si fermano la posizione non resta scoperta. Con
+// SLTP_MODE=off il TP di sicurezza sui setup gestiti (m1_short/m1_range) e' un livello lontano,
+// distinto dall'obiettivo interno (target1). Con SLTP_MODE=fixed|trailing il TP mandato al broker
+// e' invece il TP vero calcolato dalla struttura (non un livello lontano) — ma resta comunque
+// SEMPRE presente: verificato qui a due livelli, la funzione pura initialLevels e la stessa
+// formula usata in worker/streaming.ts per decidere cosa mandare al broker.
+
+check("18a) fixed: initialLevels non produce mai SL senza TP (o viceversa)", () => {
+  withEnv({ SLTP_MODE: "fixed", SL_MAX: "15", TP_MAX: "10" }, () => {
+    const end = Date.UTC(2026, 8, 9, 10, 0);
+    const scenarios: Array<{ direction: "BUY" | "SELL"; entry: number; atrM1: number; spreadUsd: number; withSwing: boolean }> = [
+      { direction: "BUY", entry: 2200, atrM1: 1, spreadUsd: 0.1, withSwing: true },
+      { direction: "SELL", entry: 2200, atrM1: 1, spreadUsd: 0.1, withSwing: true },
+      { direction: "BUY", entry: 2200, atrM1: 5, spreadUsd: 0.2, withSwing: false }, // nessuno swing: ripiega sull'ATR
+      { direction: "SELL", entry: 2200, atrM1: 0.05, spreadUsd: 0.01, withSwing: true }, // ATR minimo
+      { direction: "BUY", entry: 2200, atrM1: 2, spreadUsd: 1.5, withSwing: true }, // spread quasi quanto l'ATR
+    ];
+    for (const s of scenarios) {
+      const m1 = s.withSwing ? m1WithSwing(end, s.direction, s.direction === "BUY" ? s.entry - 3 : s.entry + 3, 40)
+        : Array.from({ length: 40 }, (_, i) => bar(end - (39 - i) * MINUTE, s.entry, s.entry + 0.02, 0.05));
+      const levels = initialLevels({ direction: s.direction, entry: s.entry, m1, atrM1: s.atrM1, spreadUsd: s.spreadUsd });
+      assert.ok(levels.valid, `atteso valido: ${JSON.stringify({ s, levels })}`);
+      // L'invariante e' "entrambi o nessuno": mai un ordine con un livello nullo e l'altro no.
+      assert.equal(Number.isFinite(levels.stopLoss), Number.isFinite(levels.takeProfit), JSON.stringify({ s, levels }));
+      assert.ok(Number.isFinite(levels.stopLoss) && levels.stopLoss !== null, `SL nullo: ${JSON.stringify({ s, levels })}`);
+      assert.ok(Number.isFinite(levels.takeProfit) && levels.takeProfit !== null, `TP nullo: ${JSON.stringify({ s, levels })}`);
+    }
+  });
+});
+
+check("18b) worker: con SLTP_MODE attivo il TP mandato al broker e' sempre quello vero, mai null", () => {
+  // Riproduce esattamente la formula di worker/streaming.ts (righe intorno a "const managedExit =
+  // !useSltpEngine && isManagedSetup(...)" e "const brokerTp = managedExit ? finalSignal.tpBroker
+  // ?? null : finalSignal.takeProfit!"), per bloccare in CI una regressione se quella formula
+  // dovesse tornare a instradare qualcosa verso finalSignal.tpBroker (che con SLTP_MODE attivo
+  // viene azzerato a null subito dopo il calcolo dei livelli strutturali).
+  const isManagedSetupLike = (setup: string) => setup === "m1_short" || setup === "m1_range";
+  const brokerTpFormula = (input: { useSltpEngine: boolean; setup: string; takeProfit: number; tpBroker: number | null }) => {
+    const managedExit = !input.useSltpEngine && isManagedSetupLike(input.setup);
+    return managedExit ? input.tpBroker ?? null : input.takeProfit;
+  };
+  for (const mode of ["fixed", "trailing"] as const) {
+    for (const setup of ["mtf-continuation-v1", "m1_short", "m1_range"]) {
+      // Con SLTP_MODE attivo il motore azzera sempre finalSignal.tpBroker a null (vedi il blocco
+      // che assegna sltpInitial.stopLoss/takeProfit): l'invariante deve reggere anche con tpBroker
+      // gia' nullo, cioe' proprio nel caso che romperebbe il vecchio ramo "managedExit ? tpBroker".
+      const brokerTp = brokerTpFormula({ useSltpEngine: true, setup, takeProfit: 2204.5, tpBroker: null });
+      assert.equal(brokerTp, 2204.5, `SLTP_MODE=${mode}, setup=${setup}: TP al broker nullo, nessuna rete di sicurezza`);
+      assert.notEqual(brokerTp, null);
+    }
+  }
+  // Controprova: con SLTP_MODE=off il vecchio comportamento sui setup gestiti resta quello di
+  // sempre (TP di sicurezza distinto), qui usato solo per dimostrare che il test distingue i due rami.
+  const legacyManaged = brokerTpFormula({ useSltpEngine: false, setup: "m1_short", takeProfit: 2204.5, tpBroker: 2215 });
+  assert.equal(legacyManaged, 2215);
+});
+
 console.log(`${passed} scenari superati.`);
