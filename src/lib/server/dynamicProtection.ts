@@ -60,6 +60,54 @@ function validMarketData(atrM1: number, spreadUsd: number) {
     && Number.isFinite(spreadUsd) && spreadUsd >= 0;
 }
 
+function validNonNegative(value: number) {
+  return Number.isFinite(value) && value >= 0;
+}
+
+function validPositive(value: number) {
+  return Number.isFinite(value) && value > 0;
+}
+
+function decimalPlaces(step: number) {
+  const text = step.toString().toLowerCase();
+  if (text.includes("e-")) return Number(text.split("e-")[1] ?? 0);
+  return (text.split(".")[1] ?? "").length;
+}
+
+function normalizeFloat(value: number, tickSizeUsd: number) {
+  return Number(value.toFixed(Math.min(12, Math.max(0, decimalPlaces(tickSizeUsd) + 2))));
+}
+
+/**
+ * Directional tick normalization: levels are always rounded away from the current/entry side,
+ * never closer. This preserves the requested minimum distance after quantization.
+ */
+export function normalizeLevelToTick(input: {
+  direction: TradeDirection;
+  kind: "stopLoss" | "takeProfit";
+  value: number;
+  tickSizeUsd: number;
+}) {
+  if (!validPositive(input.value) || !validPositive(input.tickSizeUsd)) return null;
+  const scaled = input.value / input.tickSizeUsd;
+  const roundUp = (input.direction === "BUY" && input.kind === "takeProfit")
+    || (input.direction === "SELL" && input.kind === "stopLoss");
+  const ticks = roundUp ? Math.ceil(scaled - 1e-10) : Math.floor(scaled + 1e-10);
+  return normalizeFloat(ticks * input.tickSizeUsd, input.tickSizeUsd);
+}
+
+export function adaptiveMinImprovementUsd(input: {
+  spreadUsd: number;
+  tickSizeUsd: number;
+  floorUsd?: number;
+}) {
+  const floorUsd = input.floorUsd ?? 0.05;
+  if (!validNonNegative(input.spreadUsd) || !validPositive(input.tickSizeUsd) || !validNonNegative(floorUsd)) {
+    return null;
+  }
+  return Math.max(input.tickSizeUsd, input.spreadUsd * 0.25, floorUsd);
+}
+
 export type DynamicDistances = {
   valid: boolean;
   rejectReason: "invalid_market_data" | "invalid_config" | null;
@@ -69,7 +117,7 @@ export type DynamicDistances = {
 };
 
 /**
- * Calculates all distances from live market inputs. Invalid ATR/spread/config never fall back to
+ * Calculates all distances from market inputs. Invalid ATR/spread/config never fall back to
  * invented values: the caller must reject/hold instead.
  */
 export function dynamicDistances(
@@ -134,9 +182,9 @@ export type InitialDynamicLevels = {
 
 /**
  * Paper/backtest initial plan.
- * SL is the widest requirement from structure + ATR M1 + spread + configured minimum.
+ * SL is the widest requirement from structure + ATR M1 + spread + broker minimum.
  * TP is calculated by code from ATR M1 + spread and is fixed after entry.
- * If inputs/config are invalid, or required SL exceeds its maximum, no plan is produced.
+ * Levels are quantized to tick size in the safe direction.
  */
 export function initialDynamicLevels(input: {
   direction: TradeDirection;
@@ -145,6 +193,7 @@ export function initialDynamicLevels(input: {
   spreadUsd: number;
   structuralDistanceUsd?: number | null;
   brokerMinDistanceUsd?: number;
+  tickSizeUsd?: number;
   config?: DynamicProtectionConfig;
 }): InitialDynamicLevels {
   const config = input.config ?? dynamicProtectionConfig();
@@ -160,16 +209,18 @@ export function initialDynamicLevels(input: {
     takeProfit: null,
   });
 
-  if (!Number.isFinite(input.entry) || input.entry <= 0) return empty("invalid_market_data");
+  if (!validPositive(input.entry)) return empty("invalid_market_data");
   if (!base.valid) return empty(base.rejectReason!);
 
   const structuralRaw = input.structuralDistanceUsd;
-  if (structuralRaw !== undefined && structuralRaw !== null
-    && (!Number.isFinite(structuralRaw) || structuralRaw < 0)) return empty("invalid_market_data");
+  if (structuralRaw !== undefined && structuralRaw !== null && !validNonNegative(structuralRaw)) {
+    return empty("invalid_market_data");
+  }
   const structuralDistanceUsd = structuralRaw ?? 0;
 
   const brokerMinRaw = input.brokerMinDistanceUsd ?? 0;
-  if (!Number.isFinite(brokerMinRaw) || brokerMinRaw < 0) return empty("invalid_market_data");
+  const tickSizeUsd = input.tickSizeUsd ?? 0.01;
+  if (!validNonNegative(brokerMinRaw) || !validPositive(tickSizeUsd)) return empty("invalid_market_data");
 
   const requiredSlDistanceUsd = Math.max(base.requiredSlDistanceUsd!, structuralDistanceUsd, brokerMinRaw);
   if (requiredSlDistanceUsd > config.slMaxUsd) {
@@ -179,27 +230,51 @@ export function initialDynamicLevels(input: {
     };
   }
 
-  const tpDistanceUsd = Math.max(base.tpDistanceUsd!, brokerMinRaw);
-  if (tpDistanceUsd > config.tpMaxUsd) {
+  const requestedTpDistanceUsd = Math.max(base.tpDistanceUsd!, brokerMinRaw);
+  if (requestedTpDistanceUsd > config.tpMaxUsd) {
     return {
       ...empty("tp_distance_above_max"),
       requiredSlDistanceUsd,
-      tpDistanceUsd,
+      tpDistanceUsd: requestedTpDistanceUsd,
     };
   }
 
-  const stopLoss = input.direction === "BUY"
+  const rawStopLoss = input.direction === "BUY"
     ? input.entry - requiredSlDistanceUsd
     : input.entry + requiredSlDistanceUsd;
-  const takeProfit = input.direction === "BUY"
-    ? input.entry + tpDistanceUsd
-    : input.entry - tpDistanceUsd;
+  const rawTakeProfit = input.direction === "BUY"
+    ? input.entry + requestedTpDistanceUsd
+    : input.entry - requestedTpDistanceUsd;
+
+  const stopLoss = normalizeLevelToTick({
+    direction: input.direction,
+    kind: "stopLoss",
+    value: rawStopLoss,
+    tickSizeUsd,
+  });
+  const takeProfit = normalizeLevelToTick({
+    direction: input.direction,
+    kind: "takeProfit",
+    value: rawTakeProfit,
+    tickSizeUsd,
+  });
+  if (stopLoss === null || takeProfit === null) return empty("invalid_market_data");
+
+  const slDistanceUsd = input.direction === "BUY" ? input.entry - stopLoss : stopLoss - input.entry;
+  const tpDistanceUsd = input.direction === "BUY" ? takeProfit - input.entry : input.entry - takeProfit;
+  if (slDistanceUsd < brokerMinRaw || tpDistanceUsd < brokerMinRaw) return empty("invalid_market_data");
+  if (slDistanceUsd > config.slMaxUsd + tickSizeUsd + 1e-9) {
+    return { ...empty("sl_distance_above_max"), requiredSlDistanceUsd, slDistanceUsd };
+  }
+  if (tpDistanceUsd > config.tpMaxUsd + tickSizeUsd + 1e-9) {
+    return { ...empty("tp_distance_above_max"), requiredSlDistanceUsd, tpDistanceUsd };
+  }
 
   return {
     valid: true,
     rejectReason: null,
     requiredSlDistanceUsd,
-    slDistanceUsd: requiredSlDistanceUsd,
+    slDistanceUsd,
     tpDistanceUsd,
     trailDistanceUsd: base.trailDistanceUsd,
     stopLoss,
@@ -208,8 +283,13 @@ export function initialDynamicLevels(input: {
 }
 
 export type DynamicStopAction =
-  | { kind: "trail"; stopLoss: number }
-  | { kind: "hold"; stopLoss: number; reason: "invalid_market_data" | "invalid_config" | "not_improved" };
+  | { kind: "trail"; stopLoss: number; minImprovementUsd: number }
+  | {
+      kind: "hold";
+      stopLoss: number;
+      reason: "invalid_market_data" | "invalid_config" | "not_improved" | "rate_limited";
+      minImprovementUsd?: number;
+    };
 
 /**
  * Paper/backtest-only dynamic SL with no minimum profit objective.
@@ -224,7 +304,12 @@ export function dynamicProfitProtection(input: {
   atrM1: number;
   spreadUsd: number;
   brokerMinDistanceUsd?: number;
+  tickSizeUsd?: number;
   minImprovementUsd?: number;
+  minImprovementFloorUsd?: number;
+  nowMs?: number;
+  lastUpdateAtMs?: number | null;
+  minUpdateIntervalMs?: number;
   config?: DynamicProtectionConfig;
 }): DynamicStopAction {
   const config = input.config ?? dynamicProtectionConfig();
@@ -232,29 +317,65 @@ export function dynamicProfitProtection(input: {
   if (!distances.valid) {
     return { kind: "hold", stopLoss: input.currentStopLoss, reason: distances.rejectReason! };
   }
-  if (![input.entry, input.currentPrice, input.currentStopLoss].every(Number.isFinite)
-    || input.entry <= 0 || input.currentPrice <= 0 || input.currentStopLoss <= 0) {
+  if (![input.entry, input.currentPrice, input.currentStopLoss].every(validPositive)) {
     return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
   }
 
   const brokerMinRaw = input.brokerMinDistanceUsd ?? 0;
-  const minImprovementRaw = input.minImprovementUsd ?? 0.01;
-  if (!Number.isFinite(brokerMinRaw) || brokerMinRaw < 0
-    || !Number.isFinite(minImprovementRaw) || minImprovementRaw < 0) {
+  const tickSizeUsd = input.tickSizeUsd ?? 0.01;
+  const intervalMs = input.minUpdateIntervalMs ?? 350;
+  if (!validNonNegative(brokerMinRaw) || !validPositive(tickSizeUsd)
+    || !validNonNegative(intervalMs)) {
     return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
   }
 
+  const adaptive = adaptiveMinImprovementUsd({
+    spreadUsd: input.spreadUsd,
+    tickSizeUsd,
+    floorUsd: input.minImprovementFloorUsd ?? 0.05,
+  });
+  const minImprovementUsd = input.minImprovementUsd ?? adaptive;
+  if (minImprovementUsd === null || !validNonNegative(minImprovementUsd)) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
+  }
+
+  if (input.lastUpdateAtMs !== undefined && input.lastUpdateAtMs !== null) {
+    const nowMs = input.nowMs ?? Date.now();
+    if (!Number.isFinite(nowMs) || !Number.isFinite(input.lastUpdateAtMs) || nowMs < input.lastUpdateAtMs) {
+      return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data", minImprovementUsd };
+    }
+    if (nowMs - input.lastUpdateAtMs < intervalMs) {
+      return { kind: "hold", stopLoss: input.currentStopLoss, reason: "rate_limited", minImprovementUsd };
+    }
+  }
+
   const trailDistanceUsd = Math.max(distances.trailDistanceUsd!, brokerMinRaw);
-  const candidate = input.direction === "BUY"
+  const rawCandidate = input.direction === "BUY"
     ? input.currentPrice - trailDistanceUsd
     : input.currentPrice + trailDistanceUsd;
+  const candidate = normalizeLevelToTick({
+    direction: input.direction,
+    kind: "stopLoss",
+    value: rawCandidate,
+    tickSizeUsd,
+  });
+  if (candidate === null) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data", minImprovementUsd };
+  }
+
+  const actualDistance = input.direction === "BUY"
+    ? input.currentPrice - candidate
+    : candidate - input.currentPrice;
+  if (actualDistance + 1e-9 < brokerMinRaw) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data", minImprovementUsd };
+  }
+
   const improvement = input.direction === "BUY"
     ? candidate - input.currentStopLoss
     : input.currentStopLoss - candidate;
-
-  if (improvement < minImprovementRaw) {
-    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "not_improved" };
+  if (improvement + 1e-9 < minImprovementUsd) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "not_improved", minImprovementUsd };
   }
 
-  return { kind: "trail", stopLoss: candidate };
+  return { kind: "trail", stopLoss: candidate, minImprovementUsd };
 }
