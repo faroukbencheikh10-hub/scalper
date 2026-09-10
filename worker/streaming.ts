@@ -5,8 +5,13 @@ import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
-import { evaluateScalper, plannedEntryValid, STRATEGY_VERSION } from "../src/lib/server/scalperStrategy";
+import { contextM5M15, evaluateScalper, plannedEntryValid, STRATEGY_VERSION } from "../src/lib/server/scalperStrategy";
 import { aggregateM15, closedBars } from "../src/lib/server/marketStructure";
+import {
+  applyAction, closeReasonFromState, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup,
+  m5CloseAction, openManagedExit, oppositeSignalIgnored, referencePrice, tickAction,
+  type ManagedCloseReason, type ManagedExitState,
+} from "../src/lib/server/positionManager";
 import { riskPerLot } from "../src/lib/server/orderSafety";
 import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
@@ -119,6 +124,13 @@ type ManagedOrder = {
 type FlattenConnection = StreamingConnectionLike & {
   terminalState: StreamingConnectionLike["terminalState"] & { orders?: ManagedOrder[] };
   cancelOrder: (orderId: string) => Promise<Record<string, unknown>>;
+  modifyPosition: (positionId: string, stopLoss?: number, takeProfit?: number) => Promise<Record<string, unknown>>;
+};
+
+/** Motivo di chiusura scritto dalle chiusure forzate: il resto lo deduce il piano di uscita. */
+const FORCED_CLOSE_REASON: Record<string, ManagedCloseReason> = {
+  end_of_session: "flatten",
+  system_stop: "stop",
 };
 
 function sleep(ms: number) {
@@ -242,6 +254,11 @@ async function main() {
   const knownPositionIds = new Set<string>();
   let lastPositionCloseAt = 0;
   let lastReseedAttempt = 0;
+  // Piano di uscita dei setup gestiti, per posizione. Sopravvive ai riavvii via scalper_signals.
+  const managedExits = new Map<string, ManagedExitState>();
+  let managedBusy = false;
+  let lastM5CloseSeen = 0;
+  const breakevenBuffer = envNum("ENTRY_BUFFER_USD", 0.1);
 
   const closedAtMs = (value: unknown) => {
     const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ""));
@@ -251,25 +268,26 @@ async function main() {
   const refreshLossGuards = async () => {
     const start = sessionWindowStart(new Date(), sessionConfig);
     const result = await dbQuery(
-      `SELECT direction,outcome,closed_at FROM scalper_signals
+      `SELECT direction,outcome,close_reason,closed_at FROM scalper_signals
         WHERE outcome IN ('WIN','LOSS','BREAKEVEN') AND mt5_position_id IS NOT NULL
           AND closed_at >= $1::timestamptz
         ORDER BY closed_at DESC LIMIT 50`,
       [start.toISOString()],
     );
-    const rows = result.rows as Array<{ direction?: string; outcome?: string; closed_at?: unknown }>;
+    const rows = result.rows as Array<{ direction?: string; outcome?: string; close_reason?: string; closed_at?: unknown }>;
     lossLockUntil.BUY = 0;
     lossLockUntil.SELL = 0;
     lossPauseUntil = 0;
+    // Solo sl_initial e' una perdita: breakeven, trailing, flatten, stop e watchdog non bloccano nulla.
     for (const row of rows) {
-      if (row.outcome !== "LOSS") continue;
+      if (!countsAsLoss(row.outcome, row.close_reason)) continue;
       const direction = row.direction === "BUY" || row.direction === "SELL" ? row.direction : null;
       if (!direction || lossLockUntil[direction] > 0) continue;
       lossLockUntil[direction] = closedAtMs(row.closed_at) + lossLockMs;
     }
     let streak = 0;
     for (const row of rows) {
-      if (row.outcome !== "LOSS") break;
+      if (!countsAsLoss(row.outcome, row.close_reason)) break;
       streak += 1;
       if (streak >= consecLossCount) {
         lossPauseUntil = closedAtMs(rows[0]?.closed_at) + consecLossPauseMs;
@@ -347,6 +365,20 @@ async function main() {
     maxOpenPositions,
     maxTradesPerDay,
     tradeDedupSeconds,
+    managed: [...managedExits.values()].map((state) => ({
+      positionId: state.positionId,
+      setup: state.setup,
+      direction: state.direction,
+      openPrice: state.openPrice,
+      initialStop: state.initialStop,
+      target1: state.target1,
+      stopLoss: state.stopLoss,
+      target1Hit: state.target1Hit,
+      breakevenPrice: state.breakevenPrice,
+      breakevenAt: state.breakevenAt,
+      trailingActive: state.trailingUpdates > 0,
+      trailingUpdates: state.trailingUpdates,
+    })),
     riskMaxPct,
     riskCapActive: riskMaxPct > 0,
     finalQuoteMaxAgeMs,
@@ -358,6 +390,182 @@ async function main() {
     flattenBeforeEndMin: sessionConfig.flattenBeforeEndMin,
     fridayCloseUtc: sessionConfig.fridayCloseUtc,
   });
+
+  // --- Uscita gestita di m1_short e m1_range ---------------------------------------------------
+  // Nessun TP al broker e nessun limite di durata: l'ordine parte col solo SL, target1 porta lo
+  // stop a breakeven e da li' lo stop segue gli swing M5. Lo stop non torna mai indietro.
+
+  const persistManagedExit = async (state: ManagedExitState) => {
+    const values = [state.breakevenPrice, state.breakevenAt, state.trailingUpdates, state.trailingUpdates > 0, state.stopLoss];
+    if (state.signalId) {
+      await dbQuery(
+        `UPDATE scalper_signals SET breakeven_price=$2,breakeven_at=$3::timestamptz,trailing_updates=$4,
+                trailing_active=$5,final_sl=$6
+          WHERE id=$1`,
+        [state.signalId, ...values],
+      );
+    }
+    // La riga trades nasce alla chiusura: finche' il trade e' aperto questo update non tocca nulla.
+    await dbQuery(
+      `UPDATE trades SET breakeven_price=$2,breakeven_at=$3::timestamptz,trailing_updates=$4,
+              trailing_active=$5,final_sl=$6
+        WHERE source='scalper' AND mt5_position_id=$1`,
+      [state.positionId, ...values],
+    );
+  };
+
+  /** Riprende i piani di uscita aperti: dopo un riavvio il worker ritrova breakeven e trailing. */
+  const restoreManagedExits = async () => {
+    const result = await dbQuery(
+      `SELECT id::text AS id,setup,direction,mt5_position_id,mt5_open_price,entry,stop_loss,target1,take_profit,
+              final_sl,breakeven_price,breakeven_at,trailing_updates
+         FROM scalper_signals
+        WHERE outcome IS NULL AND mt5_position_id IS NOT NULL`,
+    );
+    for (const row of result.rows) {
+      const positionId = String(row.mt5_position_id ?? "");
+      if (!positionId || !isManagedSetup(row.setup) || managedExits.has(positionId)) continue;
+      const openPrice = Number(row.mt5_open_price ?? row.entry);
+      const target1 = Number(row.target1 ?? row.take_profit);
+      const initialStop = Number(row.stop_loss);
+      if (![openPrice, target1, initialStop].every((value) => Number.isFinite(value))) continue;
+      const breakevenAt = row.breakeven_at ? new Date(row.breakeven_at).toISOString() : null;
+      managedExits.set(positionId, {
+        positionId,
+        signalId: String(row.id),
+        setup: String(row.setup),
+        direction: row.direction === "SELL" ? "SELL" : "BUY",
+        openPrice,
+        initialStop,
+        target1,
+        stopLoss: Number.isFinite(Number(row.final_sl)) ? Number(row.final_sl) : initialStop,
+        target1Hit: breakevenAt !== null,
+        breakevenPrice: Number.isFinite(Number(row.breakeven_price)) ? Number(row.breakeven_price) : null,
+        breakevenAt,
+        trailingUpdates: Number(row.trailing_updates ?? 0),
+      });
+    }
+  };
+
+  /** Chiusura confermata da MetaApi: fissa il motivo dedotto dal piano, senza sovrascrivere le forzate. */
+  const finalizeManagedExit = async (state: ManagedExitState) => {
+    const closeReason = closeReasonFromState(state);
+    console.log("[scalper-worker] managed_exit_closed", JSON.stringify({
+      at: new Date().toISOString(),
+      positionId: state.positionId,
+      signalId: state.signalId,
+      setup: state.setup,
+      direction: state.direction,
+      closeReason,
+      finalSl: state.stopLoss,
+      breakevenAt: state.breakevenAt,
+      trailingUpdates: state.trailingUpdates,
+    }));
+    if (!state.signalId) return;
+    await dbQuery(
+      `UPDATE scalper_signals
+          SET close_reason=COALESCE(close_reason,$2),final_sl=COALESCE(final_sl,$3),
+              trailing_updates=$4,trailing_active=$5,breakeven_price=$6,breakeven_at=$7::timestamptz
+        WHERE id=$1`,
+      [state.signalId, closeReason, state.stopLoss, state.trailingUpdates, state.trailingUpdates > 0,
+        state.breakevenPrice, state.breakevenAt],
+    );
+  };
+
+  const driveManagedExits = async (openPositions: ManagedPosition[], quote: Quote) => {
+    if (managedBusy) return;
+    const closedM5 = closedBars(m5, 5, Date.now()) ?? [];
+    const lastM5At = closedM5.length > 0 ? Date.parse(closedM5.at(-1)!.datetime) : 0;
+    // Senza posizioni gestite si tiene solo il segnaposto: il trailing partira' dalla prossima M5.
+    if (managedExits.size === 0 || stopped || flattenBusy) {
+      if (managedExits.size === 0 && Number.isFinite(lastM5At)) lastM5CloseSeen = lastM5At;
+      return;
+    }
+    managedBusy = true;
+    const freshM5Close = Number.isFinite(lastM5At) && lastM5At > lastM5CloseSeen;
+    try {
+      for (const position of openPositions) {
+        const state = managedExits.get(position.id);
+        if (!state) continue;
+        let current = state;
+
+        // 1. Primo tick che tocca target1 (BID sui long, ASK sugli short): stop a breakeven.
+        const breakeven = tickAction(current, quote, Date.now(), breakevenBuffer);
+        if (breakeven && breakeven.kind === "breakeven") {
+          try {
+            await retryTrade(`Breakeven posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, breakeven.stopLoss));
+            current = applyAction(current, breakeven);
+            managedExits.set(position.id, current);
+            console.log("[scalper-worker] breakeven_set", JSON.stringify({
+              at: breakeven.at,
+              positionId: position.id,
+              signalId: current.signalId,
+              setup: current.setup,
+              direction: current.direction,
+              openPrice: current.openPrice,
+              target1: current.target1,
+              price: referencePrice(current.direction, quote),
+              stopLoss: breakeven.stopLoss,
+              previousStopLoss: state.stopLoss,
+            }));
+            await persistManagedExit(current);
+            void sendTelegram(
+              `\u{1f512} SCALPER ${symbol()} \u00b7 breakeven ${current.direction} ${setupLabel(current.setup)}:`
+              + ` target1 ${money(current.target1)} raggiunto, SL a ${money(breakeven.stopLoss)}`
+              + ` (${breakeven.at.slice(11, 19)} UTC).`,
+            );
+          } catch (error) {
+            await setSetting("stream_last_error", `${new Date().toISOString()} Breakeven ${position.id}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        // 2. Trailing sulla struttura M5: solo dopo il breakeven e solo a M5 chiusa.
+        if (!freshM5Close) continue;
+        const trailing = m5CloseAction(current, closedM5);
+        if (!trailing || trailing.kind !== "trailing") continue;
+        try {
+          await retryTrade(`Trailing posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, trailing.to));
+          current = applyAction(current, trailing);
+          managedExits.set(position.id, current);
+          console.log("[scalper-worker] trailing_update", JSON.stringify({
+            at: new Date().toISOString(),
+            positionId: position.id,
+            signalId: current.signalId,
+            setup: current.setup,
+            direction: current.direction,
+            from: trailing.from,
+            to: trailing.to,
+            swingAt: trailing.swingAt,
+            trailingUpdates: current.trailingUpdates,
+          }));
+          await persistManagedExit(current);
+        } catch (error) {
+          await setSetting("stream_last_error", `${new Date().toISOString()} Trailing ${position.id}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (freshM5Close) lastM5CloseSeen = lastM5At;
+    } finally {
+      managedBusy = false;
+    }
+  };
+
+  let lastOppositeKey = "";
+  let lastOppositeAt = 0;
+  /** Segnale contrario con una posizione aperta: non chiude e non inverte, resta solo a log. */
+  const logIgnoredOppositeSignal = (signal: ScalperSignal, quote: Quote, openDirection: string) => {
+    const key = `${signal.setup ?? "-"}|${signal.direction}|${openDirection}`;
+    const now = Date.now();
+    if (key === lastOppositeKey && now - lastOppositeAt < tickLogMs) return;
+    lastOppositeKey = key;
+    lastOppositeAt = now;
+    console.log("[scalper-worker] ignored_opposite_signal", JSON.stringify({
+      at: new Date(now).toISOString(),
+      setup: signal.setup,
+      direction: signal.direction,
+      openDirection,
+      mid: quote.mid,
+    }));
+  };
 
   const findSignalForPosition = async (position: ManagedPosition) => {
     let result = await dbQuery(
@@ -415,11 +623,13 @@ async function main() {
       const risk = Math.abs(open - Number(signal.stop_loss));
       const signed = Number(signal.entry) < Number(signal.stop_loss) ? open - close : close - open;
       const resultR = risk > 0 ? Number((signed / risk).toFixed(2)) : 0;
+      // Chiusura forzata: il motivo e' noto e sovrascrive quello dedotto dal piano di uscita.
+      const closeReason = FORCED_CLOSE_REASON[reason] ?? reason;
       await dbQuery(
         `UPDATE scalper_signals
             SET mt5_position_id=COALESCE(mt5_position_id,$2),mt5_open_price=COALESCE(mt5_open_price,$3),
                 mt5_close_price=$4,mt5_profit=$5,outcome=$6,result_r=$7,closed_at=COALESCE($8::timestamptz,now()),
-                mt5_volume=COALESCE(mt5_volume,$9)
+                mt5_volume=COALESCE(mt5_volume,$9),close_reason=$10,final_sl=COALESCE(final_sl,stop_loss)
           WHERE id=$1`,
         [
           signal.id,
@@ -431,16 +641,18 @@ async function main() {
           resultR,
           out.time ?? null,
           Number(position.volume ?? inn?.volume ?? lots()),
+          closeReason,
         ],
       );
       await dbQuery(
-        `UPDATE trades SET reason=$2,payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason',$2)
+        `UPDATE trades SET reason=$2,close_reason=$3,
+                payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason',$3)
           WHERE source='scalper' AND mt5_position_id=$1`,
-        [position.id, reason],
+        [position.id, reason, closeReason],
       );
       const outcome = profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN";
       void sendTelegram(
-        `${profit > 0 ? "\u2705" : profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${outcome} (${reason})`
+        `${profit > 0 ? "\u2705" : profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${outcome} (${closeReason})`
         + `\nprofitto ${money(profit)} · ${money(open)} \u2192 ${money(close)} · ${resultR >= 0 ? "+" : ""}${resultR}R`
         + `\n${balanceLine()}`,
       );
@@ -506,6 +718,7 @@ async function main() {
       }
 
       for (const position of positions.filter((item) => closed.includes(item.id))) {
+        managedExits.delete(position.id);
         try {
           await recordClosedPosition(position, reason);
         } catch (error) {
@@ -610,9 +823,7 @@ async function main() {
       return;
     }
 
-    if (m1.length < 35 || m5.length < 30) return;
-    if (decisionBusy || Date.now() < signalLockUntil || Date.now() < orderErrorUntil || flattenBusy) return;
-
+    // Le posizioni si leggono da terminalState: una posizione e' chiusa solo dopo conferma MetaApi.
     const openPositions = (tradingConnection.terminalState.positions ?? [])
       .filter((position) => position.symbol === symbol()) as ManagedPosition[];
 
@@ -621,11 +832,30 @@ async function main() {
       if (openIds.has(id)) continue;
       knownPositionIds.delete(id);
       lastPositionCloseAt = Date.now();
+      const closing = managedExits.get(id);
+      if (!closing) continue;
+      managedExits.delete(id);
+      void finalizeManagedExit(closing).catch((error) => console.error(error));
     }
     for (const id of openIds) knownPositionIds.add(id);
 
-    if (openPositions.length >= maxOpenPositions) {
-      latestDecision = noTradeDecision(`Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`, quote);
+    // Breakeven e trailing girano anche mentre un ingresso e' in corso: sono gestione, non ingresso.
+    await driveManagedExits(openPositions, quote);
+
+    if (m1.length < 35 || m5.length < 30) return;
+    if (decisionBusy || Date.now() < signalLockUntil || Date.now() < orderErrorUntil || flattenBusy) return;
+
+    if (entryBlockedByOpenPositions(openPositions.length, maxOpenPositions)) {
+      // In posizione nessun setup viene valutato per l'ingresso: la valutazione resta diagnostica e
+      // serve solo a registrare i segnali contrari, che non chiudono e non invertono mai.
+      const watching = evaluateScalper({ quote, m1, m5 });
+      const reason = `Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`;
+      latestDecision = noTradeDecision(reason, quote, { setup: watching.setup, evaluations: watching.evaluations });
+      const openDirections = openPositions.map(positionDirection).filter((value): value is "BUY" | "SELL" => value !== null);
+      if (oppositeSignalIgnored(openDirections, watching.direction)) {
+        logIgnoredOppositeSignal(watching, quote, openDirections.join("/"));
+      }
+      logTick(watching, quote, reason);
       return;
     }
 
@@ -718,6 +948,10 @@ async function main() {
         return;
       }
 
+      // Contesto M5/M15 dell'ingresso: viaggia con il segnale e finisce in trades.context_json.
+      const entryContext = isManagedSetup(signal.setup)
+        ? contextM5M15(closedBars(m5, 5, Date.now()) ?? [], Date.now())
+        : null;
       const reservation = await reserveStreamingSignal({
         setupKey: signal.setupKey!,
         direction: signal.direction,
@@ -728,6 +962,11 @@ async function main() {
         riskReward: signal.riskReward!,
         reasoning: signal.reasoning,
         openPositionCount: openPositions.length,
+        context: entryContext === null ? null : {
+          biasM5: entryContext.biasM5,
+          m15State: entryContext.m15State,
+          m15BreakoutRecent: entryContext.m15BreakoutRecent,
+        },
       });
 
       if (!reservation.ok) {
@@ -799,7 +1038,8 @@ async function main() {
 
       await dbQuery(
         `UPDATE scalper_signals
-            SET entry=$2,stop_loss=$3,take_profit=$4,risk_reward=$5,reasoning=$6
+            SET entry=$2,stop_loss=$3,take_profit=$4,risk_reward=$5,reasoning=$6,
+                target1=$4,final_sl=$3
           WHERE id=$1 AND outcome IS NULL AND mt5_order_id IS NULL`,
         [
           signalId,
@@ -835,10 +1075,16 @@ async function main() {
         return;
       }
       const riskPct = balanceKnown && perLot !== null ? (riskMoney / balance) * 100 : null;
+      // Sui setup gestiti il livello calcolato e' target1, non un TP: al broker non viene inviato.
+      const managedExit = isManagedSetup(finalSignal.setup);
+      const target1 = finalSignal.takeProfit!;
       const riskPlan = {
         lots: orderLots,
         requestedLots: activeLots,
         lotsCapped,
+        managedExit,
+        target1,
+        target1Distance: Number(Math.abs(target1 - finalSignal.entry!).toFixed(2)),
         slDistance: Number(slDistance.toFixed(2)),
         tpDistance: Number(Math.abs(finalSignal.takeProfit! - finalSignal.entry!).toFixed(2)),
         riskReward: finalSignal.riskReward,
@@ -903,7 +1149,8 @@ async function main() {
         direction: finalSignal.direction,
         entry: finalSignal.entry,
         stopLoss: finalSignal.stopLoss,
-        takeProfit: finalSignal.takeProfit,
+        // Nessun take profit sui setup gestiti: resta solo target1, che sposta lo stop a breakeven.
+        takeProfit: managedExit ? null : finalSignal.takeProfit,
         finalPreflight: {
           quoteAgeMs: sendAgeMs,
           entryDrift: Number(entryDrift.toFixed(2)),
@@ -917,7 +1164,7 @@ async function main() {
         signalId,
         finalSignal.direction,
         finalSignal.stopLoss!,
-        finalSignal.takeProfit!,
+        managedExit ? null : finalSignal.takeProfit!,
         tradingConnection,
         { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: sendQuote.mid },
       );
@@ -941,12 +1188,29 @@ async function main() {
         dupDirectionUntil[finalSignal.direction] = sentAt + dupCooldownMs;
         if (finalSignal.setup) dupSetupUntilBucket.set(finalSignal.setup, bucketStart(sentAt, 1) + dupSetupBars * 60_000);
         lastNotifiedBlock = null;
+        if (managedExit && execution.status === "opened" && execution.positionId) {
+          const openPrice = Number(execution.openPrice ?? finalSignal.entry);
+          const state = openManagedExit({
+            positionId: String(execution.positionId),
+            signalId,
+            setup: finalSignal.setup!,
+            direction: finalSignal.direction,
+            openPrice: Number.isFinite(openPrice) ? openPrice : finalSignal.entry!,
+            initialStop: finalSignal.stopLoss!,
+            target1,
+          });
+          managedExits.set(state.positionId, state);
+          knownPositionIds.add(state.positionId);
+          await persistManagedExit(state).catch((error) => console.error(error));
+        }
+        const targetLabel = managedExit ? "target1" : "TP";
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${finalSignal.direction}`
           + `\nlotti ${orderLots}${lotsCapped ? ` (ridotti da ${activeLots} per il cap rischio)` : ""}`
-          + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · TP ${money(finalSignal.takeProfit)}`
-          + `\nSL ${money(riskPlan.slDistance)}$ · TP ${money(riskPlan.tpDistance)}$ a ${finalSignal.riskReward}R`
+          + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · ${targetLabel} ${money(target1)}`
+          + `\nSL ${money(riskPlan.slDistance)}$ · ${targetLabel} ${money(riskPlan.target1Distance)}$ a ${finalSignal.riskReward}R`
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
+          + `${managedExit ? "\nuscita gestita: nessun TP al broker, breakeven a target1 poi trailing sulla struttura M5" : ""}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error" || execution.status === "pending_confirmation") {
@@ -1029,7 +1293,13 @@ async function main() {
       WHERE outcome IS NULL AND mt5_position_id IS NULL AND mt5_order_id IS NULL AND client_id IS NULL`,
   );
   await refreshLossGuards();
-  console.log("[scalper-worker] synchronized", { symbol: symbol(), purgedSignals: purged.rowCount, lossGuards: lossGuards() });
+  await restoreManagedExits().catch((error) => console.error(error));
+  console.log("[scalper-worker] synchronized", {
+    symbol: symbol(),
+    purgedSignals: purged.rowCount,
+    lossGuards: lossGuards(),
+    managedExits: managedExits.size,
+  });
 
   const subscribe = async () => {
     ready = false;
@@ -1132,9 +1402,9 @@ async function main() {
         }
         for (const closure of result.closures ?? []) {
           void sendTelegram(
-            `${closure.profit > 0 ? "\u2705" : closure.profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${closure.outcome} (SL/TP)`
+            `${closure.profit > 0 ? "\u2705" : closure.profit < 0 ? "\u274c" : "\u2796"} SCALPER ${symbol()} · chiusura ${closure.outcome} (${closure.closeReason ?? "SL/TP"})`
             + `\nprofitto ${money(closure.profit)} · ${money(closure.openPrice)} \u2192 ${money(closure.closePrice)} · ${closure.resultR >= 0 ? "+" : ""}${closure.resultR}R`
-            + `${closure.outcome === "LOSS" ? `\n${lossGuardLine()}` : ""}`
+            + `${countsAsLoss(closure.outcome, closure.closeReason) ? `\n${lossGuardLine()}` : ""}`
             + `\n${balanceLine()}`,
           );
         }
@@ -1173,6 +1443,8 @@ async function main() {
 
   const lossLockTimer = setInterval(() => {
     void refreshLossGuards().catch((error) => console.error(error));
+    // Riprende i piani di uscita non ancora in memoria (ordine collegato in ritardo, worker riavviato).
+    void restoreManagedExits().catch((error) => console.error(error));
   }, lossLockRefreshMs);
 
   const heartbeatTimer = setInterval(() => {

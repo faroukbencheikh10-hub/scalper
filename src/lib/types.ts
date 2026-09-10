@@ -20,11 +20,30 @@ export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_r
 
 /** Diagnostica di un singolo tick: cosa e' stato valutato e perche' e' stato scartato. */
 export type SetupEvaluation = {
-  /** Setup valutato, "m15_gate" per il contesto M15/M5 o "filtri" per i blocchi di protezione a monte. */
-  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate";
+  /**
+   * Setup valutato, "m15_gate" per il contesto M15/M5 della mtf, "context_gate" per il contesto
+   * M5/M15 di m1_short e m1_range o "filtri" per i blocchi di protezione a monte.
+   */
+  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate" | "context_gate";
   status: "triggered" | "rejected";
   direction?: "BUY" | "SELL";
   reason: string;
+};
+
+/** Bias M5 e stato M15 letti a ogni tick prima di valutare m1_short e m1_range. */
+export type MarketContext = {
+  biasM5: "up" | "down" | "flat";
+  m15State: "trend_up" | "trend_down" | "range";
+  m15BreakoutRecent: boolean;
+  /** EMA20 M5 sull'ultima M5 chiusa e cinque candele prima. */
+  ema20M5: number;
+  ema20M5Before: number;
+  closeM5: number;
+  m15BandWidth: number;
+  m15BandAtr: number;
+  atr15: number;
+  /** Riassunto numerico riportato nella voce context_gate. */
+  detail: string;
 };
 
 /** Come e' stata costruita la distanza di stop del segnale. */

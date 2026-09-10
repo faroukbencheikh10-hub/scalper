@@ -1,4 +1,4 @@
-import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../types";
+import type { Candle, MarketContext, Quote, ScalperSignal, SetupEvaluation } from "../types";
 import { atr, emaCloseSeries } from "./indicators";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure";
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
@@ -248,6 +248,113 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
   return reject("M15 " + d + ": attendo un pullback/retest M5 valido con spazio fino al prossimo ostacolo.", evaluations.length ? evaluations : undefined);
 }
 
+// --- Contesto M5/M15 condiviso da m1_short e m1_range -----------------------------------------
+// La mtf non lo usa e non e' stata toccata: qui il contesto viene ricostruito con gli stessi
+// helper (maxHigh/minLow/atr/emaCloseSeries) e la stessa env M15_RANGE_BAND_ATR del suo gate M15,
+// cosi' la misura del range e' identica senza modificare una riga di evaluateMtfContinuation.
+
+const CONTEXT_M5_EMA = 20;
+/** Pendenza EMA20 M5: valore attuale contro quello di cinque candele M5 prima. */
+const CONTEXT_EMA_LOOKBACK = 5;
+const CONTEXT_M15_BARS = 12;
+/** Una rottura M15 e' "recente" finche' non sono passati cinque minuti dalla chiusura della candela. */
+const CONTEXT_BREAKOUT_MAX_AGE = 5 * MINUTE;
+
+/**
+ * Swing con conferma a una candela per lato: il massimo (minimo) deve battere sia la candela
+ * precedente sia la successiva. La candela in formazione non arriva mai qui: si lavora su chiuse.
+ */
+export function swingPoints(bars: Candle[], kind: "high" | "low"): Candle[] {
+  const out: Candle[] = [];
+  for (let i = 1; i < bars.length - 1; i++) {
+    if (kind === "high" && bars[i].high > bars[i - 1].high && bars[i].high > bars[i + 1].high) out.push(bars[i]);
+    if (kind === "low" && bars[i].low < bars[i - 1].low && bars[i].low < bars[i + 1].low) out.push(bars[i]);
+  }
+  return out;
+}
+
+/**
+ * Contesto letto a ogni tick prima di m1_short e m1_range, solo da candele CHIUSE.
+ * Restituisce null quando lo storico M5/M15 non basta: in quel caso i due setup non entrano.
+ */
+export function contextM5M15(m5: Candle[], nowMs: number): MarketContext | null {
+  if (m5.length < CONTEXT_M5_EMA + CONTEXT_EMA_LOOKBACK) return null;
+  const emaSeries = emaCloseSeries(m5, CONTEXT_M5_EMA);
+  const ema20M5 = emaSeries.at(-1), ema20M5Before = emaSeries.at(-1 - CONTEXT_EMA_LOOKBACK);
+  if (ema20M5 == null || ema20M5Before == null) return null;
+  const closeM5 = m5.at(-1)!.close;
+  const biasM5: MarketContext["biasM5"] = closeM5 > ema20M5 && ema20M5 > ema20M5Before ? "up"
+    : closeM5 < ema20M5 && ema20M5 < ema20M5Before ? "down" : "flat";
+
+  const m15 = aggregateM15(m5);
+  if (m15.length < CONTEXT_M15_BARS + 1) return null;
+  const atr15 = atr(m15, 14, true);
+  if (!atr15 || !(atr15 > 0)) return null;
+
+  // Range M15: stessa misura del gate M15 della mtf, banda delle ultime 12 M15 in ATR15.
+  const band = m15.slice(-CONTEXT_M15_BARS);
+  const m15BandWidth = maxHigh(band) - minLow(band);
+  const m15BandAtr = m15BandWidth / atr15;
+  const maxBandAtr = env("M15_RANGE_BAND_ATR", 3, 0.5, 20);
+  const highs = swingPoints(band, "high"), lows = swingPoints(band, "low");
+  const higherHighs = highs.length >= 2 && highs.at(-1)!.high > highs.at(-2)!.high;
+  const higherLows = lows.length >= 2 && lows.at(-1)!.low > lows.at(-2)!.low;
+  const lowerLows = lows.length >= 2 && lows.at(-1)!.low < lows.at(-2)!.low;
+  const lowerHighs = highs.length >= 2 && highs.at(-1)!.high < highs.at(-2)!.high;
+  // Senza struttura chiara in nessuna delle due direzioni il contesto resta range.
+  const m15State: MarketContext["m15State"] = m15BandAtr <= maxBandAtr ? "range"
+    : higherHighs && higherLows ? "trend_up"
+      : lowerLows && lowerHighs ? "trend_down" : "range";
+
+  const last15 = m15.at(-1)!, previous15 = m15.slice(-1 - CONTEXT_M15_BARS, -1);
+  const brokeUp = last15.close > maxHigh(previous15), brokeDown = last15.close < minLow(previous15);
+  const closedAgo = nowMs - (Date.parse(last15.datetime) + 15 * MINUTE);
+  const m15BreakoutRecent = (brokeUp || brokeDown) && closedAgo >= 0 && closedAgo < CONTEXT_BREAKOUT_MAX_AGE;
+
+  const detail = "bias_m5=" + biasM5 + " (M5 " + closeM5.toFixed(2) + " vs EMA20 M5 " + ema20M5.toFixed(2)
+    + ", EMA20 " + CONTEXT_EMA_LOOKBACK + " candele prima " + ema20M5Before.toFixed(2) + ")"
+    + ", m15_state=" + m15State + " (banda " + CONTEXT_M15_BARS + " M15 " + m15BandWidth.toFixed(2) + "$ = "
+    + m15BandAtr.toFixed(2) + " ATR15, range sotto " + maxBandAtr.toFixed(2) + ", ATR15 " + atr15.toFixed(2) + "$)"
+    + ", m15_breakout_recent=" + m15BreakoutRecent
+    + " (ultima M15 " + last15.datetime + " chiusa " + last15.close.toFixed(2)
+    + " vs " + minLow(previous15).toFixed(2) + "-" + maxHigh(previous15).toFixed(2)
+    + ", chiusa da " + Math.round(closedAgo / 1000) + " s)";
+
+  return { biasM5, m15State, m15BreakoutRecent, ema20M5, ema20M5Before, closeM5,
+    m15BandWidth: Number(m15BandWidth.toFixed(2)), m15BandAtr: Number(m15BandAtr.toFixed(2)),
+    atr15: Number(atr15.toFixed(2)), detail };
+}
+
+function rejectContext(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+  const evaluation: SetupEvaluation = direction
+    ? { setup: "context_gate", status: "rejected", direction, reason }
+    : { setup: "context_gate", status: "rejected", reason };
+  return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
+    takeProfit: null, riskReward: null, slPlan: null, reasoning: reason, evaluations: [evaluation] };
+}
+
+/**
+ * Contesto obbligatorio per m1_short: si opera solo nella direzione del bias M5, con l'M15 dalla
+ * stessa parte, mai in range e mai subito dopo una rottura M15.
+ */
+function shortContextGate(label: string, context: MarketContext | null) {
+  if (!context) return { allowed: null, blocked: rejectContext(label + ": contesto M5/M15 non disponibile, storico M5/M15 insufficiente.") };
+  const allowed: "BUY" | "SELL" | null = context.biasM5 === "up" ? "BUY" : context.biasM5 === "down" ? "SELL" : null;
+  const detail = " (" + context.detail + ")";
+  if (!allowed) return { allowed: null, blocked: rejectContext(label + ": bias_m5=flat" + detail + ".") };
+  const contrary = allowed === "BUY" ? "trend_down" : "trend_up";
+  if (context.m15State === contrary) {
+    return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_state=" + contrary + " contrario al bias M5" + detail + ".", allowed) };
+  }
+  if (context.m15State === "range") {
+    return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_state=range" + detail + ".", allowed) };
+  }
+  if (context.m15BreakoutRecent) {
+    return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_breakout_recent=true" + detail + ".", allowed) };
+  }
+  return { allowed, blocked: null };
+}
+
 export const SHORT_STRATEGY_VERSION = "m1-short-v1";
 
 /** Margine oltre il livello che il prezzo live deve superare perche' il trigger sia valido. */
@@ -278,7 +385,7 @@ function commonPreflight(input: EvaluateInput, nowMs: number): ScalperSignal | n
   return null;
 }
 
-function rejectShort(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+function rejectShortGate(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
   const evaluation: SetupEvaluation = direction
     ? { setup: "m1_gate", status: "rejected", direction, reason }
     : { setup: "m1_gate", status: "rejected", reason };
@@ -291,8 +398,18 @@ function rejectShort(reason: string, direction?: "BUY" | "SELL"): ScalperSignal 
  * Rottura del range delle ultime SHORT_RANGE_BARS candele M1 nella direzione dell'EMA20 M1,
  * SL dimensionato sull'ATR e TP fisso indipendente dallo SL. Nessun breakeven, nessun quick profit.
  */
-function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
+function evaluateM1Short(input: EvaluateInput, nowMs: number, context: MarketContext | null): ScalperSignal {
   const { quote } = input;
+  // Contesto prima di tutto: si opera solo con il bias M5 e l'M15 dalla stessa parte.
+  const gate = shortContextGate("m1_short", context);
+  if (gate.blocked) return gate.blocked;
+  const allowed = gate.allowed!, ctx = context!;
+  const contextEval: SetupEvaluation = { setup: "context_gate", status: "triggered", direction: allowed,
+    reason: "m1_short: contesto ok, solo " + allowed + " (" + ctx.detail + ")." };
+  const rejectShort = (reason: string, direction?: "BUY" | "SELL"): ScalperSignal => {
+    const signal = rejectShortGate(reason, direction);
+    return { ...signal, evaluations: [contextEval, ...signal.evaluations] };
+  };
   const m1 = closedBars(input.m1, 1, nowMs);
   if (!m1) return rejectShort("m1_short: candele M1 non valide.");
   const bars = Math.floor(env("SHORT_RANGE_BARS", 8, 3, 40));
@@ -329,6 +446,10 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
   const brokeUp = quote.bid >= high + buffer, brokeDown = quote.ask <= low - buffer;
   if (!brokeUp && !brokeDown) return rejectShort("m1_short: prezzo dentro il range delle ultime " + bars + " M1 chiuse (" + detail + ").");
   const direction: "BUY" | "SELL" = brokeUp ? "BUY" : "SELL";
+  if (direction !== allowed) {
+    return rejectContext("m1_short " + direction + ": bias_m5=" + ctx.biasM5 + " ammette solo " + allowed
+      + " (" + ctx.detail + ").", direction);
+  }
   const reference = direction === "BUY" ? quote.bid : quote.ask;
   if (direction === "BUY" ? reference <= ema20 : reference >= ema20) {
     return rejectShort("m1_short: rottura " + direction + " contro l'EMA20 M1 (" + detail + ").", direction);
@@ -355,7 +476,7 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
     entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
     slPlan: { structural: Number(slAtr.toFixed(2)), atr: Number(slAtr.toFixed(2)), applied: Number(risk.toFixed(2)),
       minUsd: slMin, maxUsd: slMax, rr: Number(rr.toFixed(2)), tpMinUsd: tpMin, tpMaxUsd: tpMax },
-    evaluations: [{ setup: "m1_gate", status: "triggered", direction, reason }],
+    evaluations: [contextEval, { setup: "m1_gate", status: "triggered", direction, reason }],
     reasoning: SHORT_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
       + ". SL " + risk.toFixed(2) + "$, TP " + reward.toFixed(2)
       + "$ (" + rr.toFixed(2) + "R), TP indipendente dallo SL. [shadow-score:" + score + "]",
@@ -364,12 +485,15 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
 
 export const RANGE_STRATEGY_VERSION = "m1-range-v1";
 
+/** Candele M5 chiuse che devono contenere il range M1 perche' il laterale sia credibile. */
+const RANGE_M5_CONTAINER_BARS = 6;
+
 function rangeEnabled() {
   const raw = process.env.RANGE_ENABLED?.trim().toLowerCase();
   return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
 }
 
-function rejectRange(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+function rejectRangeGate(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
   const evaluation: SetupEvaluation = direction
     ? { setup: "range_gate", status: "rejected", direction, reason }
     : { setup: "range_gate", status: "rejected", reason };
@@ -382,8 +506,24 @@ function rejectRange(reason: string, direction?: "BUY" | "SELL"): ScalperSignal 
  * delle ultime RANGE_BARS candele chiuse. Ingresso su tick, SL appena oltre il bordo e TP sul lato
  * opposto del range. L'anti-accumulo non si applica: qui il range e' il setup, non un ostacolo.
  */
-function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
+function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketContext | null): ScalperSignal {
   const { quote } = input;
+  // Il rientro dal bordo vive solo nel mercato laterale: bias M5 fermo, nessuna rottura M15 fresca
+  // e il range M1 tutto dentro l'escursione delle ultime M5.
+  if (!context) return rejectContext("m1_range: contesto M5/M15 non disponibile, storico M5/M15 insufficiente.");
+  const ctx = context, ctxDetail = " (" + ctx.detail + ")";
+  // La rottura M15 fresca si valuta per prima: porta sempre con se' un bias direzionale, quindi
+  // controllandola dopo il bias resterebbe invisibile nei log anche quando e' lei a fermare il trade.
+  if (ctx.m15BreakoutRecent) return rejectContext("m1_range: m15_breakout_recent=true" + ctxDetail + ".");
+  if (ctx.biasM5 !== "flat") return rejectContext("m1_range: bias_m5=" + ctx.biasM5 + ", il mercato non e' laterale" + ctxDetail + ".");
+  const contextEval: SetupEvaluation = { setup: "context_gate", status: "triggered",
+    reason: "m1_range: contesto ok" + ctxDetail + "." };
+  const rejectRange = (reason: string, direction?: "BUY" | "SELL"): ScalperSignal => {
+    const signal = rejectRangeGate(reason, direction);
+    return { ...signal, evaluations: [contextEval, ...signal.evaluations] };
+  };
+  const m5 = closedBars(input.m5, 5, nowMs);
+  if (!m5 || m5.length < RANGE_M5_CONTAINER_BARS) return rejectRange("m1_range: storico M5 insufficiente, servono " + RANGE_M5_CONTAINER_BARS + " candele chiuse.");
   const m1 = closedBars(input.m1, 1, nowMs);
   if (!m1) return rejectRange("m1_range: candele M1 non valide.");
   const bars = Math.floor(env("RANGE_BARS", 8, 3, 40));
@@ -410,8 +550,15 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
   const slAtrMult = env("RANGE_SL_ATR", 2, 0.1, 10), slMinUsd = env("RANGE_SL_MIN_USD", 2, 0.1, 50);
   const slMaxUsd = env("RANGE_SL_MAX_USD", 8, 0.1, 100), slMaxPct = env("RANGE_SL_MAX_PCT", 50, 5, 100) / 100;
   const tpMinUsd = env("RANGE_TP_MIN_USD", 1.5, 0.1, 50);
+  const container = m5.slice(-RANGE_M5_CONTAINER_BARS);
+  const containerHigh = maxHigh(container), containerLow = minLow(container);
   const base = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
     + " (" + width.toFixed(2) + "$ = " + (width / atr1).toFixed(2) + " ATR), ATR M1 " + atr1.toFixed(2) + "$";
+  // Se il range M1 sborda dall'escursione delle ultime M5 non e' un laterale: e' l'inizio di un movimento.
+  if (high > containerHigh || low < containerLow) {
+    return rejectContext("m1_range: range M1 " + low.toFixed(2) + "-" + high.toFixed(2) + " fuori dalle ultime "
+      + RANGE_M5_CONTAINER_BARS + " M5 " + containerLow.toFixed(2) + "-" + containerHigh.toFixed(2) + ctxDetail + ".");
+  }
   if (width < atr1 * minAtr || width < minUsd) {
     return rejectRange("m1_range: range troppo stretto, servono " + Math.max(atr1 * minAtr, minUsd).toFixed(2) + "$ (" + base + ").");
   }
@@ -469,7 +616,7 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
     entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
     slPlan: { structural: Number(structural.toFixed(2)), atr: Number((atr1 * slAtrMult).toFixed(2)), applied: Number(appliedRisk.toFixed(2)),
       minUsd: slMinUsd, maxUsd: slMaxUsd, rr: Number(rr.toFixed(2)), tpMinUsd },
-    evaluations: [{ setup: "range_gate", status: "triggered", direction, reason }],
+    evaluations: [contextEval, { setup: "range_gate", status: "triggered", direction, reason }],
     reasoning: RANGE_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
       + ". SL " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R). [shadow-score:" + score + "]",
   };
@@ -486,13 +633,17 @@ export function evaluateScalper(input: EvaluateInput): ScalperSignal {
   const mtf = evaluateMtfContinuation(input);
   if (mtf.direction !== "NO_TRADE") return mtf;
   let evaluations = [...mtf.evaluations];
+  // Contesto M5/M15 letto una volta sola e condiviso dai due setup che lo usano.
+  const context = shortEnabled() || rangeEnabled()
+    ? contextM5M15(closedBars(input.m5, 5, nowMs) ?? [], nowMs)
+    : null;
   if (shortEnabled()) {
-    const short = evaluateM1Short(input, nowMs);
+    const short = evaluateM1Short(input, nowMs, context);
     evaluations = [...evaluations, ...short.evaluations];
     if (short.direction !== "NO_TRADE") return { ...short, evaluations };
   }
   if (rangeEnabled()) {
-    const ranged = evaluateM1Range(input, nowMs);
+    const ranged = evaluateM1Range(input, nowMs, context);
     evaluations = [...evaluations, ...ranged.evaluations];
     if (ranged.direction !== "NO_TRADE") return { ...ranged, evaluations };
   }

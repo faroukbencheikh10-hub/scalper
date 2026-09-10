@@ -45,6 +45,15 @@ export async function ensureSchema() {
       ON scalper_signals(setup_key)
       WHERE setup_key IS NOT NULL AND COALESCE(outcome,'') NOT IN ('ERROR','SKIPPED');
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS mt5_volume numeric;
+    -- Uscita gestita (m1_short, m1_range): target1 al posto del TP, breakeven e trailing sulla M5.
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS context_json jsonb;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS target1 numeric;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS breakeven_price numeric;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS breakeven_at timestamptz;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS trailing_updates integer NOT NULL DEFAULT 0;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS trailing_active boolean NOT NULL DEFAULT false;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS final_sl numeric;
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS close_reason text;
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
     CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)
       WHERE outcome IS NULL AND direction IN ('BUY','SELL');
@@ -111,6 +120,14 @@ export async function ensureSchema() {
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS opened_at timestamptz;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS closed_at timestamptz DEFAULT now();
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS payload jsonb;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS context_json jsonb;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS target1 numeric;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS breakeven_price numeric;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS breakeven_at timestamptz;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_updates integer NOT NULL DEFAULT 0;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS trailing_active boolean NOT NULL DEFAULT false;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS final_sl numeric;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason text;
     CREATE INDEX IF NOT EXISTS trades_closed_at_idx ON trades(closed_at DESC);
 
     CREATE OR REPLACE FUNCTION sync_scalper_signal_trade() RETURNS trigger AS $$
@@ -128,16 +145,30 @@ export async function ensureSchema() {
           result_r=NEW.result_r,
           opened_at=NEW.created_at,
           closed_at=COALESCE(NEW.closed_at,now()),
-          payload=jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score)
+          context_json=NEW.context_json,
+          target1=NEW.target1,
+          breakeven_price=NEW.breakeven_price,
+          breakeven_at=NEW.breakeven_at,
+          trailing_updates=COALESCE(NEW.trailing_updates,0),
+          trailing_active=COALESCE(NEW.trailing_active,false),
+          final_sl=COALESCE(NEW.final_sl,NEW.stop_loss),
+          close_reason=COALESCE(NEW.close_reason,close_reason),
+          payload=jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score,
+                                     'closeReason',NEW.close_reason,'target1',NEW.target1)
         WHERE source='scalper' AND mt5_position_id=NEW.mt5_position_id;
         IF NOT FOUND THEN
           INSERT INTO trades(
             source,scalper_signal_id,symbol,mt5_position_id,direction,setup,lot,open_price,close_price,
-            profit,result_r,reason,opened_at,closed_at,payload
+            profit,result_r,reason,opened_at,closed_at,payload,
+            context_json,target1,breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason
           ) VALUES (
             'scalper',NEW.id::text,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.setup,NEW.mt5_volume,NEW.mt5_open_price,
             NEW.mt5_close_price,NEW.mt5_profit,NEW.result_r,'normal',NEW.created_at,
-            COALESCE(NEW.closed_at,now()),jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score)
+            COALESCE(NEW.closed_at,now()),
+            jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score,
+                               'closeReason',NEW.close_reason,'target1',NEW.target1),
+            NEW.context_json,NEW.target1,NEW.breakeven_price,NEW.breakeven_at,COALESCE(NEW.trailing_updates,0),
+            COALESCE(NEW.trailing_active,false),COALESCE(NEW.final_sl,NEW.stop_loss),NEW.close_reason
           );
         END IF;
       END IF;
@@ -147,7 +178,9 @@ export async function ensureSchema() {
 
     DROP TRIGGER IF EXISTS scalper_signal_trade_sync ON scalper_signals;
     CREATE TRIGGER scalper_signal_trade_sync
-      AFTER INSERT OR UPDATE OF outcome,mt5_close_price,mt5_profit,result_r,closed_at ON scalper_signals
+      AFTER INSERT OR UPDATE OF outcome,mt5_close_price,mt5_profit,result_r,closed_at,
+        breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason,target1,context_json
+        ON scalper_signals
       FOR EACH ROW EXECUTE FUNCTION sync_scalper_signal_trade();
 
     UPDATE trades t

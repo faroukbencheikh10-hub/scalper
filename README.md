@@ -11,13 +11,27 @@ Progetto standalone XAUUSD, completamente separato da `soldi-trend`.
 
 Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto come fallback opzionale.
 
-## Due setup in cascata
+## Tre setup in cascata
 
-A ogni tick i setup vengono valutati in cascata — **mtf-continuation-v1** → **`m1_short`** → **`m1_range`** — e vince il primo che produce un ordine; la posizione aperta resta comunque una sola. Prima viene valutata la mtf (M15 → M5 → M1, descritta sotto). Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda soltanto l'M1:
+A ogni tick i setup vengono valutati in cascata — **mtf-continuation-v1** → **`m1_short`** → **`m1_range`** — e vince il primo che produce un ordine; la posizione aperta resta comunque una sola. Prima viene valutata la mtf (M15 → M5 → M1, descritta sotto). Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda l'M1 per il trigger ma solo dopo aver letto il contesto M5/M15:
+
+### Contesto M5/M15 (`context_gate`)
+
+`m1_short` e `m1_range` non entrano più al buio. A ogni tick una sola funzione, `contextM5M15`, legge da candele **chiuse**:
+
+- **`bias_m5`** — `up` se l'ultima M5 chiusa chiude sopra la EMA20 M5 **e** la EMA20 è più alta di cinque candele M5 prima; `down` speculare; `flat` in tutti gli altri casi.
+- **`m15_state`** — `range` se l'ampiezza delle ultime 12 M15 chiuse sta sotto `M15_RANGE_BAND_ATR` × ATR15 (la stessa misura del gate M15 della mtf); altrimenti `trend_up` con massimi e minimi crescenti, `trend_down` con minimi e massimi calanti, `range` se nessuna delle due strutture è chiara. Gli swing usano una candela di conferma per lato e non guardano mai la candela in formazione.
+- **`m15_breakout_recent`** — l'ultima M15 chiusa ha chiuso oltre il massimo o il minimo delle 12 precedenti e sono passati meno di 5 minuti dalla sua chiusura.
+
+`m1_short` entra **solo** nella direzione del bias M5 (`flat` → scarto), con l'M15 non contrario, mai con `m15_state=range` e mai su una rottura M15 fresca. `m1_range` entra **solo** con `bias_m5=flat`, mai su una rottura M15 fresca, e solo se il range delle 8 M1 sta interamente dentro il minimo/massimo delle ultime 6 M5 chiuse. Il controllo sulla rottura M15 precede quello sul bias perché una rottura fresca porta sempre con sé un bias direzionale: valutandola dopo resterebbe invisibile nei log anche quando è lei a fermare il trade.
+
+Ogni scarto produce una voce `context_gate` in `stream_last_decision.evaluations` con i numeri (bias, EMA20 M5 attuale e di cinque candele prima, stato M15, rottura recente) e il motivo esatto, per esempio `m1_short BUY: bias_m5=flat (…)`. La card **Setup valutati** della dashboard la mostra come gli altri gate.
+
+### `m1_short`
 
 - **Entry (su tick):** il prezzo live supera di `ENTRY_BUFFER_USD` il range delle ultime `SHORT_RANGE_BARS` (8) candele M1 **chiuse**, nella direzione dell'EMA20 M1 — prezzo sopra l'EMA20 solo BUY, sotto solo SELL. Non serve la chiusura della candela in corso.
 - **SL:** `SHORT_SL_ATR` (2.0) × ATR M1, alzato a `SHORT_SL_MIN_USD` (3$); se la distanza richiesta supera `SHORT_SL_MAX_USD` (8$) il trade viene **scartato**, non stretto.
-- **TP:** `SHORT_TP_ATR` (0.6) × ATR M1 dentro `SHORT_TP_MIN_USD`–`SHORT_TP_MAX_USD` (1.5–3$), **indipendente dallo SL**: il rapporto R:R è quindi minore di 1 per costruzione. Nessun breakeven e nessun quick profit.
+- **target1:** `SHORT_TP_ATR` (0.6) × ATR M1 dentro `SHORT_TP_MIN_USD`–`SHORT_TP_MAX_USD` (1.5–3$), **indipendente dallo SL**. Non è un take profit: al broker non viene inviato nulla, target1 serve solo a spostare lo stop a breakeven (vedi *Uscita gestita*).
 - **Comuni alla mtf e invariati:** spread massimo, candela shock, ATR M1 dentro i limiti, pausa re-entry 120 s, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, una sola posizione aperta, flatten di fine sessione, STOP, watchdog, Telegram e lotti da `exec_lots` senza cap di rischio.
 - I suoi trade finiscono con `setup = "m1_short"` in `scalper_signals` e in `trades`; la valutazione con i numeri (range, EMA20, ATR, SL, TP) compare in `stream_last_decision.evaluations` come voce `m1_gate`, accanto a `m15_gate`, e la card **Setup valutati** della dashboard mostra entrambe.
 - `SHORT_ENABLED=false` lascia attiva solo la mtf.
@@ -27,11 +41,25 @@ Se nemmeno il `m1_short` produce un ordine viene valutato il terzo setup **`m1_r
 - **Range:** massimo/minimo delle ultime `RANGE_BARS` (8) candele M1 **chiuse**. Il setup è attivo solo se l'ampiezza vale almeno `RANGE_MIN_ATR` (1.5) × ATR M1 **e** almeno `RANGE_MIN_USD` (3$): un range stretto non è un setup.
 - **Entry (su tick):** BUY quando il prezzo live è dentro il range ed entro `RANGE_EDGE_PCT` (20%) dell'ampiezza dal minimo, con l'ultima M1 chiusa **verde**; SELL speculare vicino al massimo con l'ultima M1 chiusa **rossa**. Il confronto usa il prezzo che pagheresti (ask sui long, bid sugli short) e non aspetta la chiusura della candela in corso.
 - **SL:** oltre il bordo del range più `SL_BUFFER_USD` (0.30$), ma mai più stretto di `RANGE_SL_ATR` (2.0) × ATR M1 né di `RANGE_SL_MIN_USD` (2$): sul bordo lo stop strutturale è quasi sempre rumore, questi due pavimenti gli danno respiro. Il trade viene **scartato** se lo SL risultante supera `RANGE_SL_MAX_USD` (8$) oppure `RANGE_SL_MAX_PCT` (50%) dell'ampiezza del range — uno stop che vale mezzo range non è un rientro dal bordo. Il motivo nel `range_gate` riporta struttura, pavimento ATR, pavimento in dollari e il massimo consentito.
-- **TP:** lato opposto del range meno `TP_BUFFER_USD` (0.30$). Se la distanza disponibile è sotto `RANGE_TP_MIN_USD` (1.5$) il trade viene **scartato**, invece di spostare il target oltre il range. Nessun breakeven, nessun quick profit.
+- **target1:** lato opposto del range meno `TP_BUFFER_USD` (0.30$). Se la distanza disponibile è sotto `RANGE_TP_MIN_USD` (1.5$) il trade viene **scartato**, invece di spostare il target oltre il range. Come per `m1_short` non è un take profit inviato al broker (vedi *Uscita gestita*).
 - **Anti-accumulo:** non si applica a questo setup, qui il range è il setup e non un ostacolo. Spread, candela shock, ATR M1 e tutti i blocchi comuni restano.
 - Un tentativo per bordo: `setup_key` porta bordo e ultima M1 chiusa (`level_used`), quindi il bordo si riarma solo quando chiude una nuova M1 e nasce un nuovo range.
 - I trade escono con `setup = "m1_range"` e la valutazione numerica (range, ATR, distanza dal bordo, SL, TP) compare come voce `range_gate` in `stream_last_decision.evaluations` e nella card **Setup valutati**.
 - `RANGE_ENABLED=false` lo spegne.
+
+### Uscita gestita di `m1_short` e `m1_range`
+
+Questi due setup non fanno più scalping puro: **nessun take profit al broker e nessun limite di durata**. L'ordine parte con il solo SL iniziale e da lì lo gestisce il worker.
+
+1. **target1** è il livello che il codice calcolava come TP: viene salvato (`scalper_signals.target1`, `trades.target1`) e usato ovunque al posto del TP in log, dashboard e Telegram, ma non raggiunge mai il broker. Lo scarto di `m1_range` sotto `RANGE_TP_MIN_USD` continua ad applicarsi a target1.
+2. **Breakeven.** Al primo tick in cui il prezzo raggiunge target1 — **BID** sui long, **ASK** sugli short — lo stop va a `open + ENTRY_BUFFER_USD` (0.10$) sui long, `open − ENTRY_BUFFER_USD` sugli short, con una sola `modifyPosition`. Log `breakeven_set`, una riga su Telegram, valori salvati in `scalper_signals` e `trades`.
+3. **Trailing sulla struttura M5.** Attivo **solo dopo** il breakeven e valutato **solo alla chiusura di ogni M5**: nuovo SL = minimo dell'ultimo swing low M5 chiuso − 0.20$ sui long, massimo dell'ultimo swing high + 0.20$ sugli short. Lo stop si muove solo a favore, **mai indietro**. Ogni aggiornamento è una `modifyPosition`, un log `trailing_update` con vecchio e nuovo SL, `trailing_active = true` e il contatore `trailing_updates` +1.
+4. **Prima del breakeven** lo SL iniziale resta fermo: nessun trailing anticipato, nessun parziale.
+5. **Mai invertire.** Con una posizione aperta nessun setup viene valutato per l'ingresso — e la posizione è considerata chiusa solo dopo la conferma di MetaApi. Un segnale nella direzione opposta non chiude e non inverte: resta a log come `ignored_opposite_signal`. Dopo qualsiasi chiusura vale la pausa re-entry di 120 s.
+6. **Chiusure ammesse:** `sl_initial`, `sl_breakeven`, `sl_trailing`, `flatten`, `stop`, `watchdog`, salvate in `close_reason`. Il flatten di fine fascia resta l'unica chiusura a orario e chiude anche i trade in trailing. Il watchdog non chiude **mai** per età o durata di una posizione: le sue soglie misurano solo da quanto il worker non risponde.
+7. **Cosa conta come perdita.** Solo `sl_initial` conta per `LOSS_LOCK_MINUTES` e per il contatore di `CONSEC_LOSS_PAUSE_MINUTES`. `sl_breakeven`, `sl_trailing`, `flatten`, `stop` e `watchdog` non contano mai, anche con P&L leggermente negativo. Un trade senza `close_reason` (la mtf, che mantiene il TP al broker) continua a contare come prima.
+
+La mtf non è toccata: mantiene il proprio TP inviato al broker e la propria uscita.
 
 ### Ingressi su tick e un solo tentativo per livello
 

@@ -5,6 +5,7 @@ import { requiredMargin } from "@/lib/lots";
 import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
 import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
+import { closeReasonFromState, countsAsLoss, isManagedSetup } from "./positionManager";
 
 type StreamPosition = {
   id: string;
@@ -60,10 +61,13 @@ type ReserveSignalInput = {
   setup: string | null;
   entry: number;
   stopLoss: number;
+  /** Livello obiettivo: TP inviato al broker per la mtf, target1 interno per i setup gestiti. */
   takeProfit: number;
   riskReward: number;
   reasoning: string;
   openPositionCount: number;
+  /** Contesto M5/M15 letto all'ingresso, salvato con il segnale. */
+  context?: unknown;
 };
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
@@ -76,6 +80,8 @@ export type StreamClosure = {
   openPrice: number;
   closePrice: number;
   resultR: number;
+  /** sl_initial | sl_breakeven | sl_trailing per i setup gestiti, null per la mtf. */
+  closeReason: string | null;
 };
 
 const historyAttemptAt = new Map<string, number>();
@@ -209,7 +215,7 @@ async function limits() {
               (SELECT COALESCE(SUM(mt5_profit),0) FROM scalper_signals WHERE closed_at >= $1::timestamptz) profit`,
       [start.toISOString(), tradeDedupSec()],
     ),
-    dbQuery(`SELECT outcome,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
+    dbQuery(`SELECT outcome,close_reason,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
   ]);
 
   const trades = Number(daily.rows[0]?.trades ?? 0);
@@ -217,13 +223,14 @@ async function limits() {
   if (trades >= envN("MAX_TRADES_PER_DAY", 12, 1)) return { ok: false, reason: "max_trades_per_day" };
   if (profit <= -envN("MAX_DAILY_LOSS", 150, 0)) return { ok: false, reason: "max_daily_loss" };
 
-  const losses = last.rows.filter((row: { outcome?: string }) => row.outcome === "LOSS");
+  // Le uscite gestite (breakeven, trailing, flatten, stop, watchdog) non sono perdite.
+  const losses = last.rows.filter((row: { outcome?: string; close_reason?: string }) => countsAsLoss(row.outcome, row.close_reason));
   if (losses.length >= 3 && last.rows[0]?.closed_at) {
     const t = Date.parse(last.rows[0].closed_at);
     if (Date.now() - t < envN("SCALPER_THREE_LOSS_COOLDOWN_MIN", 30, 1) * 60_000) {
       return { ok: false, reason: "three_loss_cooldown" };
     }
-  } else if (last.rows[0]?.outcome === "LOSS" && last.rows[0]?.closed_at) {
+  } else if (countsAsLoss(last.rows[0]?.outcome, last.rows[0]?.close_reason) && last.rows[0]?.closed_at) {
     const t = Date.parse(last.rows[0].closed_at);
     if (Date.now() - t < envN("SCALPER_LOSS_COOLDOWN_MIN", 5, 1) * 60_000) {
       return { ok: false, reason: "loss_cooldown" };
@@ -269,15 +276,17 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
         WHERE closed_at IS NOT NULL AND mt5_position_id IS NOT NULL
      ),
      recent AS MATERIALIZED (
-       SELECT outcome,closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
+       -- Conta come perdita solo lo stop iniziale: breakeven, trailing, flatten, stop e watchdog no.
+       SELECT (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial') AS is_loss,
+              closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
          FROM scalper_signals
         WHERE outcome IS NOT NULL
         ORDER BY closed_at DESC
         LIMIT 3
      ),
      recent_summary AS (
-       SELECT COUNT(*) FILTER (WHERE outcome='LOSS')::int AS recent_losses,
-              MAX(outcome) FILTER (WHERE rn=1) AS latest_outcome,
+       SELECT COUNT(*) FILTER (WHERE is_loss)::int AS recent_losses,
+              bool_or(is_loss) FILTER (WHERE rn=1) AS latest_is_loss,
               MAX(closed_at) FILTER (WHERE rn=1) AS latest_closed_at
          FROM recent
      ),
@@ -306,7 +315,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
               AND recent_summary.latest_closed_at IS NOT NULL
               AND EXTRACT(EPOCH FROM (now() - recent_summary.latest_closed_at)) < $10::float8 * 60
            THEN 'three_loss_cooldown'
-         WHEN recent_summary.latest_outcome='LOSS'
+         WHEN recent_summary.latest_is_loss
               AND recent_summary.latest_closed_at IS NOT NULL
               AND EXTRACT(EPOCH FROM (now() - recent_summary.latest_closed_at)) < $11::float8 * 60
            THEN 'loss_cooldown'
@@ -318,8 +327,9 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
        FROM daily,recent_summary,control,last_close
      ),
      inserted AS (
-       INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$15 FROM decision WHERE reason IS NULL
+       INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key,
+                                   target1,context_json,final_sl)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4 FROM decision WHERE reason IS NULL
        ON CONFLICT DO NOTHING
        RETURNING id::text AS id
      )
@@ -342,6 +352,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       minReentrySec(),
       tradeDedupSec(),
       input.setupKey,
+      input.context === undefined || input.context === null ? null : JSON.stringify(input.context),
     ],
   );
 
@@ -375,7 +386,8 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
   }
 
   const rows = await dbQuery(
-    `SELECT id,mt5_position_id,mt5_open_price,entry,stop_loss,created_at
+    `SELECT id,setup,mt5_position_id,mt5_open_price,entry,stop_loss,final_sl,breakeven_at,trailing_updates,
+            close_reason,created_at
        FROM scalper_signals
       WHERE outcome IS NULL AND mt5_position_id IS NOT NULL
       ORDER BY created_at ASC`,
@@ -408,10 +420,20 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
     const signed = Number(signal.entry) < Number(signal.stop_loss) ? open - close : close - open;
     const resultR = risk > 0 ? Number((signed / risk).toFixed(2)) : 0;
 
+    // Lo stop e' stato eseguito dal broker: il motivo dipende da dove era arrivato lo stop gestito.
+    const closeReason = signal.close_reason
+      ? String(signal.close_reason)
+      : isManagedSetup(signal.setup)
+        ? closeReasonFromState({
+          trailingUpdates: Number(signal.trailing_updates ?? 0),
+          breakevenAt: signal.breakeven_at ? String(signal.breakeven_at) : null,
+        })
+        : null;
     await dbQuery(
       `UPDATE scalper_signals
           SET mt5_close_price=$2,mt5_profit=$3,outcome=$4,result_r=$5,closed_at=COALESCE($6::timestamptz,now()),
-              mt5_open_price=COALESCE(mt5_open_price,$7),mt5_volume=COALESCE(mt5_volume,$8)
+              mt5_open_price=COALESCE(mt5_open_price,$7),mt5_volume=COALESCE(mt5_volume,$8),
+              close_reason=COALESCE(close_reason,$9),final_sl=COALESCE(final_sl,stop_loss)
         WHERE id=$1`,
       [
         signal.id,
@@ -422,6 +444,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
         out.time ?? null,
         open,
         Number(inn?.volume ?? out.volume ?? lots()),
+        closeReason,
       ],
     );
     historyAttemptAt.delete(positionId);
@@ -433,6 +456,7 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
       openPrice: open,
       closePrice: close,
       resultR,
+      closeReason,
     });
     closed++;
   }
@@ -444,7 +468,8 @@ export async function executeStreaming(
   signalId: string,
   direction: "BUY" | "SELL",
   stopLoss: number,
-  takeProfit: number,
+  /** Take profit da inviare al broker: null sui setup a uscita gestita, che partono col solo SL. */
+  takeProfit: number | null,
   connection: StreamingConnectionLike,
   options: ExecuteOptions = {},
 ) {
@@ -519,12 +544,16 @@ export async function executeStreaming(
     positionLimit,
   });
 
+  // Senza take profit l'ordine parte con il solo stop: e' il caso normale dei setup gestiti,
+  // non un errore. MetaApi accetta undefined e non imposta alcun TP sulla posizione.
+  const orderTakeProfit = takeProfit === null ? undefined : takeProfit;
+
   let result: Record<string, unknown>;
   try {
     const orderOptions = { clientId: orderClientId };
     result = direction === "BUY"
-      ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions)
-      : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions);
+      ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, orderTakeProfit, orderOptions)
+      : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, orderTakeProfit, orderOptions);
     if (![10008, 10009, 10010].includes(Number(result.numericCode))
       && !["TRADE_RETCODE_PLACED", "TRADE_RETCODE_DONE", "TRADE_RETCODE_DONE_PARTIAL"].includes(String(result.stringCode))) {
       throw Object.assign(new Error("Esito ordine non confermato: " + JSON.stringify(result)), { numericCode: result.numericCode });
