@@ -233,3 +233,17 @@ Usare le stesse `DATABASE_URL`, `METAAPI_TOKEN`, `METAAPI_ACCOUNT_ID` e impostaz
 
 `AUTO_EXEC=false` resta il default di sicurezza. Attivarlo solo dopo verifica completa su conto demo.
 
+
+
+## Auto-riparazione quote MetaApi
+
+Il worker controlla la salute delle quote ogni 30 secondi solo dentro `SCALPER_HOURS_UTC`. Il silenzio normale fuori fascia o nel weekend non conta; alla riapertura il conteggio riparte dalla sessione corrente. Se una quote valida non arriva entro la prima soglia, il worker chiude la vecchia streaming connection MetaApi, ne crea una nuova, rifà `waitSynchronized()` e risottoscrive XAUUSD. Se il flusso non torna entro la soglia di uscita, salva `stream_worker_status=stale_exit`, invia Telegram con `worker riavviato per quote ferme` ed esce con codice 1, così Railway con restart policy `ALWAYS` può avviare un processo pulito.
+
+Environment del recovery:
+
+- `STALE_QUOTE_SEC` — secondi senza quote prima del reconnect; default `120`.
+- `STALE_QUOTE_EXIT_SEC` — secondi senza quote prima di `process.exit(1)`; default `300`. Per sicurezza resta almeno 30 secondi sopra la soglia reconnect.
+- `RAILWAY_API_TOKEN` — opzionale e server-only; il watchdog lo usa per il riavvio via Railway GraphQL. Se manca, manda solo l'alert Telegram.
+- `RAILWAY_SERVICE_ID` — ID del servizio Railway da riavviare (`scalper-worker`). Il watchdog risolve l'environment del servizio, prova `serviceInstanceRedeploy` e usa `deploymentRestart` come fallback.
+
+`stream_worker_detail` include `quoteAgeSec` e `quoteReceivedAt`. `stream_last_quote.receivedAt` è il timestamp reale dell'ultima quote valida ricevuta e non viene più avanzato artificialmente dal timer di persistenza. In fascia il watchdog considera quote stale oltre 180 secondi, limita il relativo alert Telegram a uno ogni 10 minuti e prova il restart Railway solo se entrambe le variabili Railway sono presenti.

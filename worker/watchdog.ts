@@ -13,10 +13,15 @@ import { money, sendTelegram } from "../src/lib/server/notify";
 import { lots } from "../src/lib/server/tradingConfig";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { watchdogClosePosition, watchdogPositions, type WatchdogPosition } from "../src/lib/server/watchdogMetaApi";
+import { effectiveQuoteAgeSec } from "../src/lib/server/staleQuoteGuard";
 
 const ALERT_INTERVAL_MS = 30 * 60_000;
+const STALE_QUOTE_ALERT_INTERVAL_MS = 10 * 60_000;
+const STALE_QUOTE_SEC = 180;
 const SESSION_END_GUARD_MIN = 15;
 const ALERT_SETTING_KEY = "watchdog_last_alert";
+const STALE_QUOTE_ALERT_SETTING_KEY = "watchdog_last_stale_quote_alert";
+const RAILWAY_API_URL = "https://backboard.railway.com/graphql/v2";
 
 function envInt(name: string, fallback: number, min: number) {
   const value = Number(process.env[name]);
@@ -116,12 +121,102 @@ async function recordClosure(position: WatchdogPosition, reason: string) {
   return { profit, close, outcome: profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN" };
 }
 
-async function alertThrottled(text: string, lastAlert: string | undefined) {
+async function alertThrottled(
+  text: string,
+  lastAlert: string | undefined,
+  settingKey = ALERT_SETTING_KEY,
+  intervalMs = ALERT_INTERVAL_MS,
+) {
   const previous = lastAlert ? Date.parse(lastAlert) : Number.NaN;
-  if (Number.isFinite(previous) && Date.now() - previous < ALERT_INTERVAL_MS) return false;
-  await setSetting(ALERT_SETTING_KEY, new Date().toISOString());
+  if (Number.isFinite(previous) && Date.now() - previous < intervalMs) return false;
+  await setSetting(settingKey, new Date().toISOString());
   await sendTelegram(text);
   return true;
+}
+
+function parsedObject(raw: string | undefined) {
+  if (!raw) return null;
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === "object" ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+async function railwayGraphql<T>(token: string, query: string, variables: Record<string, string>) {
+  const response = await fetch(RAILWAY_API_URL, {
+    method: "POST",
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+    body: JSON.stringify({ query, variables }),
+  });
+  const payload = await response.json() as { data?: T; errors?: Array<{ message?: string }> };
+  if (!response.ok || payload.errors?.length) {
+    const graphError = payload.errors?.map((item) => item.message ?? "GraphQL error").join(" | ");
+    throw new Error(`Railway GraphQL ${response.status}: ${graphError || response.statusText}`);
+  }
+  if (!payload.data) throw new Error("Railway GraphQL: risposta senza data");
+  return payload.data;
+}
+
+type RailwayServiceData = {
+  service: {
+    serviceInstances: {
+      edges: Array<{
+        node: {
+          environmentId?: string | null;
+          latestDeployment?: { id?: string | null; createdAt?: string | null } | null;
+        };
+      }>;
+    };
+  } | null;
+};
+
+async function restartRailwayService(token: string, serviceId: string) {
+  const lookup = await railwayGraphql<RailwayServiceData>(
+    token,
+    `query StaleQuoteService($serviceId: String!) {
+      service(id: $serviceId) {
+        serviceInstances { edges { node { environmentId latestDeployment { id createdAt } } } }
+      }
+    }`,
+    { serviceId },
+  );
+  const instances = lookup.service?.serviceInstances.edges.map((edge) => edge.node) ?? [];
+  const preferredEnvironmentId = process.env.RAILWAY_ENVIRONMENT_ID?.trim();
+  const candidates = instances
+    .filter((node) => node.latestDeployment?.id)
+    .sort((a, b) => {
+      const bAt = Date.parse(b.latestDeployment?.createdAt ?? "");
+      const aAt = Date.parse(a.latestDeployment?.createdAt ?? "");
+      return (Number.isFinite(bAt) ? bAt : 0) - (Number.isFinite(aAt) ? aAt : 0);
+    });
+  const target = (preferredEnvironmentId
+    ? candidates.find((node) => node.environmentId === preferredEnvironmentId)
+    : null) ?? candidates[0];
+  if (!target?.latestDeployment?.id) throw new Error(`Railway: nessun deployment trovato per service ${serviceId}`);
+
+  if (target.environmentId) {
+    try {
+      await railwayGraphql<{ serviceInstanceRedeploy: boolean }>(
+        token,
+        `mutation StaleQuoteRedeploy($environmentId: String!, $serviceId: String!) {
+          serviceInstanceRedeploy(environmentId: $environmentId, serviceId: $serviceId)
+        }`,
+        { environmentId: target.environmentId, serviceId },
+      );
+      return { method: "serviceInstanceRedeploy", deploymentId: target.latestDeployment.id };
+    } catch (error) {
+      console.warn("[scalper-watchdog] serviceInstanceRedeploy fallita, provo deploymentRestart", errorText(error));
+    }
+  }
+
+  await railwayGraphql<{ deploymentRestart: boolean }>(
+    token,
+    `mutation StaleQuoteRestart($id: String!) { deploymentRestart(id: $id) }`,
+    { id: target.latestDeployment.id },
+  );
+  return { method: "deploymentRestart", deploymentId: target.latestDeployment.id };
 }
 
 async function main() {
@@ -131,7 +226,10 @@ async function main() {
     "stream_worker_status",
     "system_stop",
     "stream_last_error",
+    "stream_worker_detail",
+    "stream_last_quote",
     ALERT_SETTING_KEY,
+    STALE_QUOTE_ALERT_SETTING_KEY,
   ]);
 
   if (settings.get("system_stop") === "true") {
@@ -141,6 +239,50 @@ async function main() {
 
   const maxAgeSec = envInt("WATCHDOG_MAX_AGE_SEC", 180, 30);
   const closeAfterSec = envInt("WATCHDOG_CLOSE_AFTER_SEC", 600, 60);
+  const nowMs = Date.now();
+  const sessionStatus = getSessionStatus(new Date(nowMs), sessionConfigFromEnv());
+  const sessionStartAtMs = sessionStatus.sessionStartAt ? Date.parse(sessionStatus.sessionStartAt) : Number.NaN;
+  const sessionAgeSec = Number.isFinite(sessionStartAtMs)
+    ? Math.max(0, Math.floor((nowMs - sessionStartAtMs) / 1000))
+    : null;
+  const detail = parsedObject(settings.get("stream_worker_detail"));
+  const detailAgeRaw = Number(detail?.quoteAgeSec);
+  const detailAgeSec = Number.isFinite(detailAgeRaw) && detailAgeRaw >= 0
+    ? sessionAgeSec === null ? Math.floor(detailAgeRaw) : Math.min(Math.floor(detailAgeRaw), sessionAgeSec)
+    : null;
+  const lastQuote = parsedObject(settings.get("stream_last_quote"));
+  const receivedAtMs = lastQuote?.receivedAt ? Date.parse(String(lastQuote.receivedAt)) : Number.NaN;
+  const storedAgeSec = effectiveQuoteAgeSec(
+    nowMs,
+    Number.isFinite(receivedAtMs) ? receivedAtMs : null,
+    Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : null,
+    Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : nowMs,
+  );
+  const quoteAges = [detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
+  const quoteAgeSec = quoteAges.length > 0 ? Math.max(...quoteAges) : null;
+
+  if (sessionStatus.inside && quoteAgeSec !== null && quoteAgeSec > STALE_QUOTE_SEC) {
+    console.warn("[scalper-watchdog] quote ferme", { quoteAgeSec, thresholdSec: STALE_QUOTE_SEC });
+    const alerted = await alertThrottled(
+      `🚨 SCALPER ${symbol()} · quote MetaApi ferme da ${quoteAgeSec} s (soglia ${STALE_QUOTE_SEC} s)`,
+      settings.get(STALE_QUOTE_ALERT_SETTING_KEY),
+      STALE_QUOTE_ALERT_SETTING_KEY,
+      STALE_QUOTE_ALERT_INTERVAL_MS,
+    );
+    const railwayToken = process.env.RAILWAY_API_TOKEN?.trim();
+    const railwayServiceId = process.env.RAILWAY_SERVICE_ID?.trim();
+    if (alerted && railwayToken && railwayServiceId) {
+      try {
+        const restart = await restartRailwayService(railwayToken, railwayServiceId);
+        console.warn("[scalper-watchdog] railway_restart", restart);
+      } catch (error) {
+        const message = `Railway restart fallito: ${errorText(error)}`;
+        console.error("[scalper-watchdog]", message);
+        await setSetting("stream_last_error", `${new Date().toISOString()} ${message}`).catch(() => undefined);
+      }
+    }
+  }
+
   const heartbeat = settings.get("stream_worker_heartbeat");
   const heartbeatMs = heartbeat ? Date.parse(heartbeat) : Number.NaN;
   const ageSec = Number.isFinite(heartbeatMs) ? Math.max(0, Math.floor((Date.now() - heartbeatMs) / 1000)) : null;

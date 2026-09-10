@@ -13,6 +13,7 @@ import {
   type ManagedCloseReason, type ManagedExitState,
 } from "../src/lib/server/positionManager";
 import { riskPerLot } from "../src/lib/server/orderSafety";
+import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
 import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
 import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../src/lib/types";
@@ -214,12 +215,15 @@ async function main() {
   const tradeDedupSeconds = envNum("TRADE_DEDUP_SECONDS", 30);
   const reentryMs = envInt("SCALPER_MIN_REENTRY_SEC", 120, 0, 3600) * 1000;
   const finalQuoteMaxAgeMs = envInt("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);
+  const staleQuoteSec = envInt("STALE_QUOTE_SEC", 120, 30, 3600);
+  const staleQuoteExitSec = Math.max(staleQuoteSec + 30, envInt("STALE_QUOTE_EXIT_SEC", 300, 60, 7200));
   const sessionConfig = sessionConfigFromEnv();
+  const workerStartedAtMs = Date.now();
 
   const api = new MetaApi(token);
   const account = await api.metatraderAccountApi.getAccount(accountId);
-  const connection = account.getStreamingConnection();
-  const tradingConnection = connection as unknown as FlattenConnection;
+  let connection = account.getStreamingConnection();
+  let tradingConnection = connection as unknown as FlattenConnection;
 
   let subscribed = false;
   let ready = false;
@@ -235,6 +239,8 @@ async function main() {
   let m1: Candle[] = [];
   let m5: Candle[] = [];
   let latestQuote: Quote | null = null;
+  let lastQuoteReceivedAtMs = 0;
+  let quoteWatchStartedAtMs = workerStartedAtMs;
   let latestDecision: Record<string, unknown> | null = null;
   let latestPreview: Record<string, unknown> | null = null;
   let decisionBusy = false;
@@ -244,6 +250,8 @@ async function main() {
   let quotePersistBusy = false;
   let decisionPersistBusy = false;
   let flattenBusy = false;
+  let staleReconnectBusy = false;
+  let staleExitBusy = false;
   let signalLockUntil = 0;
   let orderErrorUntil = 0;
   let lastEmptyFlattenMarker: string | null = null;
@@ -382,6 +390,10 @@ async function main() {
     riskMaxPct,
     riskCapActive: riskMaxPct > 0,
     finalQuoteMaxAgeMs,
+    quoteAgeSec: Math.max(0, Math.floor((Date.now() - (lastQuoteReceivedAtMs || quoteWatchStartedAtMs)) / 1000)),
+    quoteReceivedAt: lastQuoteReceivedAtMs > 0 ? new Date(lastQuoteReceivedAtMs).toISOString() : null,
+    staleQuoteSec,
+    staleQuoteExitSec,
     ...lossGuards(),
     m1: m1.length,
     m5: m5.length,
@@ -797,6 +809,7 @@ async function main() {
     if (!quote) return;
     if (quote.quotedAt! > Date.now() + 500 || Date.now() - quote.quotedAt! > finalQuoteMaxAgeMs
       || (latestQuote?.quotedAt && quote.quotedAt! < latestQuote.quotedAt)) return;
+    lastQuoteReceivedAtMs = Date.now();
     const previousQuoteAt = latestQuote?.quotedAt ?? 0;
     if (previousQuoteAt > 0 && quote.quotedAt! - previousQuoteAt > 60_000 && Date.now() - lastReseedAttempt > 30_000) {
       lastReseedAttempt = Date.now();
@@ -1301,8 +1314,9 @@ async function main() {
     managedExits: managedExits.size,
   });
 
-  const subscribe = async () => {
+  const subscribe = async (resetQuoteWatch = true) => {
     ready = false;
+    if (resetQuoteWatch) quoteWatchStartedAtMs = Date.now();
     const seeded = await seedCandles(m1Max, m5Max);
     m1 = seeded.m1;
     m5 = seeded.m5;
@@ -1310,6 +1324,40 @@ async function main() {
     subscribed = true;
     ready = true;
     await markWorker("streaming", workerDetail());
+  };
+
+  const reconnectStaleQuotes = async (quoteAgeSec: number | null) => {
+    if (staleReconnectBusy || staleExitBusy || stopped) return;
+    staleReconnectBusy = true;
+    ready = false;
+    subscribed = false;
+    latestQuote = null;
+    console.warn("[scalper-worker] stale_quote_reconnect", JSON.stringify({
+      at: new Date().toISOString(), quoteAgeSec, staleQuoteSec, staleQuoteExitSec,
+    }));
+    await markWorker("stale_reconnect", { ...workerDetail(), quoteAgeSec, reason: "quote ferme" })
+      .catch((error) => console.error(error));
+    try {
+      connection.removeSynchronizationListener(listener);
+      await connection.close().catch((error) => console.warn("[scalper-worker] stale close", error));
+      connection = account.getStreamingConnection();
+      tradingConnection = connection as unknown as FlattenConnection;
+      connection.addSynchronizationListener(listener);
+      await connection.connect();
+      await connection.waitSynchronized();
+      if (stopped || staleExitBusy) return;
+      await subscribe(false);
+      console.log("[scalper-worker] stale_quote_reconnected", JSON.stringify({
+        at: new Date().toISOString(), quoteAgeSec,
+      }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn("[scalper-worker] stale_quote_reconnect_failed", message);
+      await setSetting("stream_last_error", `${new Date().toISOString()} stale quote reconnect: ${message}`)
+        .catch((settingError) => console.error(settingError));
+    } finally {
+      staleReconnectBusy = false;
+    }
   };
 
   void sendTelegram(
@@ -1324,6 +1372,45 @@ async function main() {
     await flattenSymbol("system_stop", "startup-system-stop").catch(() => undefined);
     await markWorker("paused", { ...workerDetail(), reason: "STOP TUTTO" });
   }
+
+  const staleQuoteTimer = setInterval(() => {
+    const now = Date.now();
+    const status = getSessionStatus(new Date(now), sessionConfig);
+    if (stopped || !status.inside) return;
+    const sessionStartAtMs = status.sessionStartAt ? Date.parse(status.sessionStartAt) : Number.NaN;
+    const decision = staleQuoteDecision({
+      active: true,
+      nowMs: now,
+      lastQuoteReceivedAtMs: lastQuoteReceivedAtMs || null,
+      sessionStartAtMs: Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : null,
+      fallbackStartAtMs: quoteWatchStartedAtMs,
+      staleQuoteSec,
+      staleQuoteExitSec,
+    });
+    if (decision.action === "exit") {
+      if (staleExitBusy) return;
+      staleExitBusy = true;
+      ready = false;
+      subscribed = false;
+      console.error("[scalper-worker] stale_quote_exit", JSON.stringify({
+        at: new Date(now).toISOString(), quoteAgeSec: decision.quoteAgeSec, staleQuoteExitSec,
+      }));
+      void (async () => {
+        await markWorker("stale_exit", {
+          ...workerDetail(), quoteAgeSec: decision.quoteAgeSec, reason: "quote ferme",
+        }).catch((error) => console.error(error));
+        await sendTelegram(
+          `🚨 SCALPER ${symbol()} · worker riavviato per quote ferme`
+          + `
+nessuna quote valida da ${decision.quoteAgeSec ?? "?"} s`,
+        ).catch((error) => console.error(error));
+      })().finally(() => process.exit(1));
+      return;
+    }
+    if (decision.action === "reconnect" && !staleReconnectBusy) {
+      void reconnectStaleQuotes(decision.quoteAgeSec);
+    }
+  }, 30_000);
 
   const controlTimer = setInterval(() => {
     if (controlBusy) return;
@@ -1419,7 +1506,8 @@ async function main() {
     if (quotePersistBusy || !latestQuote) return;
     quotePersistBusy = true;
     const snapshot = latestQuote;
-    void setSetting("stream_last_quote", JSON.stringify({ ...snapshot, receivedAt: new Date().toISOString() }))
+    const receivedAt = lastQuoteReceivedAtMs > 0 ? new Date(lastQuoteReceivedAtMs).toISOString() : null;
+    void setSetting("stream_last_quote", JSON.stringify({ ...snapshot, receivedAt }))
       .catch((error) => console.error(error))
       .finally(() => {
         quotePersistBusy = false;
@@ -1458,6 +1546,7 @@ async function main() {
   }, heartbeatMs);
 
   const shutdown = async (reason: string) => {
+    clearInterval(staleQuoteTimer);
     clearInterval(controlTimer);
     clearInterval(sessionTimer);
     clearInterval(syncTimer);
