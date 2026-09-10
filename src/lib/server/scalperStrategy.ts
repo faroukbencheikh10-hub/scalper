@@ -2,6 +2,17 @@ import type { Candle, MarketContext, Quote, ScalperSignal, SetupEvaluation } fro
 import { atr, emaCloseSeries } from "./indicators";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure";
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
+import { safetyTakeProfit } from "./positionManager";
+
+/**
+ * TP di sicurezza dei setup a uscita gestita: non e' l'obiettivo del trade (quello resta target1,
+ * gestito dal worker) ma la rete che chiude la posizione se worker o MetaApi smettono di rispondere.
+ * Va tenuto lontano abbastanza da non interferire con breakeven e trailing.
+ */
+function brokerSafetyTp(direction: "BUY" | "SELL", entry: number, target1: number, atrM1: number) {
+  return safetyTakeProfit(direction, entry, target1, atrM1,
+    env("SAFETY_TP_ATR", 4, 0.5, 50), env("SAFETY_TP_MIN_R", 3, 1, 20));
+}
 
 export const STRATEGY_VERSION = "mtf-continuation-v1";
 
@@ -473,7 +484,8 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number, context: MarketCon
     direction, setup: "m1_short",
     // level_used: livello e ultima M1 chiusa nella chiave, un solo tentativo finche' non chiude una nuova M1.
     setupKey: [SHORT_STRATEGY_VERSION, direction, level.toFixed(2), trigger.datetime].join(":"),
-    entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
+    entry, stopLoss: sl, takeProfit: tp, tpBroker: brokerSafetyTp(direction, entry, tp, atr1),
+    riskReward: Number(rr.toFixed(2)),
     slPlan: { structural: Number(slAtr.toFixed(2)), atr: Number(slAtr.toFixed(2)), applied: Number(risk.toFixed(2)),
       minUsd: slMin, maxUsd: slMax, rr: Number(rr.toFixed(2)), tpMinUsd: tpMin, tpMaxUsd: tpMax },
     evaluations: [contextEval, { setup: "m1_gate", status: "triggered", direction, reason }],
@@ -613,7 +625,8 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketCon
     direction, setup: "m1_range",
     // level_used: bordo e ultima M1 chiusa nella chiave, un tentativo per bordo finche' non nasce un nuovo range.
     setupKey: [RANGE_STRATEGY_VERSION, direction, edgeLevel.toFixed(2), trigger.datetime].join(":"),
-    entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
+    entry, stopLoss: sl, takeProfit: tp, tpBroker: brokerSafetyTp(direction, entry, tp, atr1),
+    riskReward: Number(rr.toFixed(2)),
     slPlan: { structural: Number(structural.toFixed(2)), atr: Number((atr1 * slAtrMult).toFixed(2)), applied: Number(appliedRisk.toFixed(2)),
       minUsd: slMinUsd, maxUsd: slMaxUsd, rr: Number(rr.toFixed(2)), tpMinUsd },
     evaluations: [contextEval, { setup: "range_gate", status: "triggered", direction, reason }],

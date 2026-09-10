@@ -72,6 +72,12 @@ export type ScalperSignal = {
   entry: number | null;
   stopLoss: number | null;
   takeProfit: number | null;
+  /**
+   * TP di sicurezza da mandare al broker sui setup a uscita gestita: il worker gestisce comunque
+   * l'uscita, questo scatta solo se worker o MetaApi muoiono. Assente sulla mtf, che manda al
+   * broker il proprio takeProfit.
+   */
+  tpBroker?: number | null;
   riskReward: number | null;
   setup: ScalperSetup | null;
   slPlan: ScalperSlPlan | null;

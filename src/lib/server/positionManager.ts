@@ -12,7 +12,20 @@ import type { Candle, Quote } from "../types";
 /** Distanza fissa dallo swing M5 usata dal trailing. */
 export const TRAILING_BUFFER_USD = 0.2;
 
-export type ManagedCloseReason = "sl_initial" | "sl_breakeven" | "sl_trailing" | "flatten" | "stop" | "watchdog";
+export type ManagedCloseReason =
+  | "sl_initial" | "sl_breakeven" | "sl_trailing" | "tp_broker" | "target1"
+  | "flatten" | "stop" | "watchdog" | "manual";
+
+/** Tick del simbolo: la granularita' con cui si riconosce "chiuso su quel livello". */
+export const PRICE_TICK_USD = 0.01;
+
+/**
+ * Tolleranza con cui una chiusura viene attribuita a un livello. E' piu' larga di un tick perche'
+ * uno stop o un TP eseguiti dal broker slittano quasi sempre di qualche centesimo: con un tick
+ * secco ogni stop slittato finirebbe etichettato "manual". Resta stretta rispetto alle distanze
+ * in gioco (SL 3-8$), quindi due livelli distinti non si confondono mai.
+ */
+export const CLOSE_LEVEL_TOLERANCE_USD = 0.1;
 
 /** I due setup a uscita gestita. La mtf mantiene il TP al broker e non passa mai di qui. */
 export function isManagedSetup(setup: string | null | undefined) {
@@ -28,11 +41,17 @@ export type ManagedExitState = {
   initialStop: number;
   /** Il livello che il codice calcolava come TP: resta un obiettivo interno, non va al broker. */
   target1: number;
+  /** TP di sicurezza inviato al broker: scatta solo se worker o MetaApi muoiono. Non si muove mai. */
+  brokerTp: number | null;
   stopLoss: number;
   target1Hit: boolean;
   breakevenPrice: number | null;
   breakevenAt: string | null;
   trailingUpdates: number;
+  /** Distanza target1-entry del piano, per ricalcolare target1 sul prezzo di fill reale. */
+  target1Distance: number;
+  /** true finche' si sta usando l'entry teorica invece del fill reale. */
+  fillPending: boolean;
 };
 
 export type ManagedAction =
@@ -47,15 +66,62 @@ export function openManagedExit(input: {
   openPrice: number;
   initialStop: number;
   target1: number;
+  brokerTp?: number | null;
+  target1Distance?: number;
+  fillPending?: boolean;
 }): ManagedExitState {
+  const target1Distance = input.target1Distance
+    ?? Math.abs(input.target1 - input.openPrice);
   return {
-    ...input,
+    positionId: input.positionId,
+    signalId: input.signalId,
+    setup: input.setup,
+    direction: input.direction,
+    openPrice: input.openPrice,
+    initialStop: input.initialStop,
+    target1: input.target1,
+    brokerTp: input.brokerTp ?? null,
     stopLoss: input.initialStop,
     target1Hit: false,
     breakevenPrice: null,
     breakevenAt: null,
     trailingUpdates: 0,
+    target1Distance,
+    fillPending: input.fillPending ?? false,
   };
+}
+
+/**
+ * Prezzo di fill reale arrivato: target1 si rimisura dal fill, non dall'entry teorica.
+ * Lo stop iniziale non si tocca — e' quello che ha davvero il broker. Dopo il breakeven la
+ * gestione e' gia' partita e non si riscrive piu' nulla.
+ */
+export function retargetOnFill(state: ManagedExitState, fillPrice: number): ManagedExitState {
+  if (!Number.isFinite(fillPrice) || fillPrice <= 0) return state;
+  if (state.target1Hit || fillPrice === state.openPrice) {
+    return { ...state, openPrice: state.target1Hit ? state.openPrice : fillPrice, fillPending: false };
+  }
+  const target1 = state.direction === "BUY"
+    ? Math.floor((fillPrice + state.target1Distance) * 100) / 100
+    : Math.ceil((fillPrice - state.target1Distance) * 100) / 100;
+  return { ...state, openPrice: fillPrice, target1, fillPending: false };
+}
+
+/**
+ * TP di sicurezza al broker: abbastanza lontano da non interferire con la gestione del worker,
+ * ma sempre presente perche' se worker o MetaApi muoiono la posizione non resti senza uscita.
+ */
+export function safetyTakeProfit(
+  direction: "BUY" | "SELL",
+  entry: number,
+  target1: number,
+  atrM1: number,
+  atrMult: number,
+  minR: number,
+) {
+  const distance = Math.max(atrM1 * atrMult, Math.abs(target1 - entry) * minR);
+  const raw = direction === "BUY" ? entry + distance : entry - distance;
+  return direction === "BUY" ? Math.floor(raw * 100) / 100 : Math.ceil(raw * 100) / 100;
 }
 
 /** Prezzo di riferimento sul tick: BID per un long, ASK per uno short. */
@@ -127,14 +193,78 @@ export function applyAction(state: ManagedExitState, action: ManagedAction): Man
   return { ...state, stopLoss: action.to, trailingUpdates: state.trailingUpdates + 1 };
 }
 
+/** Livelli noti di una posizione, usati per leggere il motivo dal prezzo di chiusura reale. */
+export type CloseLevels = {
+  initialStop: number | null;
+  breakevenStop: number | null;
+  trailingStop: number | null;
+  brokerTp: number | null;
+  target1: number | null;
+};
+
+function near(price: number, level: number | null | undefined) {
+  return level !== null && level !== undefined && Number.isFinite(level)
+    && Math.abs(price - level) <= CLOSE_LEVEL_TOLERANCE_USD;
+}
+
 /**
- * Motivo di chiusura quando e' scattato lo stop: solo sl_initial e' una perdita vera, gli altri
- * sono uscite gestite e non contano per il loss lock.
+ * Motivo di chiusura letto dal prezzo di chiusura REALE del deal, mai dedotto dallo stato interno.
+ * Lo stato interno puo' essere in ritardo o sbagliato (una falsa sparizione dal terminal state
+ * scriveva "sl_initial" su un trade chiuso in profitto): il prezzo no.
+ *
+ * Ordine: prima gli stop, dal piu' avanzato al piu' arretrato, cosi' un breakeven che coincide con
+ * lo stop iniziale non viene mai contato come perdita; poi il TP di sicurezza, poi target1.
  */
-export function closeReasonFromState(state: Pick<ManagedExitState, "trailingUpdates" | "breakevenAt">): ManagedCloseReason {
-  if (state.trailingUpdates > 0) return "sl_trailing";
-  if (state.breakevenAt) return "sl_breakeven";
-  return "sl_initial";
+export function closeReasonFromPrice(
+  closePrice: number,
+  profit: number,
+  levels: CloseLevels,
+): ManagedCloseReason {
+  if (!Number.isFinite(closePrice)) return "manual";
+  if (near(closePrice, levels.trailingStop)) return "sl_trailing";
+  if (near(closePrice, levels.breakevenStop)) return "sl_breakeven";
+  // sl_initial solo se e' davvero lo stop iniziale ad aver perso: in profitto non e' una perdita.
+  if (near(closePrice, levels.initialStop) && Number.isFinite(profit) && profit < 0) return "sl_initial";
+  if (near(closePrice, levels.brokerTp)) return "tp_broker";
+  if (near(closePrice, levels.target1)) return "target1";
+  return "manual";
+}
+
+/**
+ * Livelli attivi di un piano di uscita. Lo stop corrente vale come trailing solo se il trailing e'
+ * davvero scattato, e come breakeven solo dopo che il breakeven e' stato impostato.
+ */
+export function closeLevelsFromState(state: Pick<ManagedExitState,
+  "initialStop" | "stopLoss" | "breakevenPrice" | "brokerTp" | "target1" | "trailingUpdates">): CloseLevels {
+  return {
+    initialStop: state.initialStop,
+    breakevenStop: state.breakevenPrice,
+    trailingStop: state.trailingUpdates > 0 ? state.stopLoss : null,
+    brokerTp: state.brokerTp,
+    target1: state.target1,
+  };
+}
+
+/** Una posizione sparita dal terminal state: da quanti tick e da quanto tempo non si vede. */
+export type MissingPosition = { since: number; ticks: number };
+
+export function trackMissing(previous: MissingPosition | undefined, nowMs: number): MissingPosition {
+  return previous ? { since: previous.since, ticks: previous.ticks + 1 } : { since: nowMs, ticks: 1 };
+}
+
+/**
+ * L'assenza dal terminal state non basta: MetaApi la perde per qualche tick subito dopo
+ * l'apertura. Serve che manchi da abbastanza tempo E su abbastanza tick consecutivi; in
+ * alternativa la conferma arriva da un deal di chiusura in history.
+ */
+export function closeConfirmedByAbsence(
+  missing: MissingPosition | undefined,
+  nowMs: number,
+  confirmMs: number,
+  minTicks: number,
+) {
+  if (!missing) return false;
+  return missing.ticks >= minTicks && nowMs - missing.since >= confirmMs;
 }
 
 /** Con una posizione aperta nessun setup viene valutato per l'ingresso. */
@@ -152,7 +282,18 @@ export function oppositeSignalIgnored(openDirections: Array<"BUY" | "SELL">, sig
     && !openDirections.includes(signalDirection);
 }
 
-/** Solo lo stop iniziale conta come perdita per loss lock e pausa perdite consecutive. */
-export function countsAsLoss(outcome: string | null | undefined, closeReason: string | null | undefined) {
-  return outcome === "LOSS" && (closeReason ?? "sl_initial") === "sl_initial";
+/**
+ * Conta come perdita solo lo stop iniziale chiuso in perdita. Le uscite gestite (breakeven,
+ * trailing, TP di sicurezza, target1, flatten, stop, watchdog, chiusura manuale) non bloccano mai
+ * una direzione. I trade senza close_reason (la mtf, che tiene il TP al broker) contano come prima.
+ */
+export function countsAsLoss(
+  outcome: string | null | undefined,
+  closeReason: string | null | undefined,
+  profit?: unknown,
+) {
+  if (outcome !== "LOSS") return false;
+  const value = Number(profit);
+  if (Number.isFinite(value) && value >= 0) return false;
+  return (closeReason ?? "sl_initial") === "sl_initial";
 }

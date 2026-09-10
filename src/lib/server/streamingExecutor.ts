@@ -5,7 +5,7 @@ import { requiredMargin } from "@/lib/lots";
 import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
 import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
-import { closeReasonFromState, countsAsLoss, isManagedSetup } from "./positionManager";
+import { closeReasonFromPrice, countsAsLoss, isManagedSetup } from "./positionManager";
 
 type StreamPosition = {
   id: string;
@@ -68,6 +68,8 @@ type ReserveSignalInput = {
   openPositionCount: number;
   /** Contesto M5/M15 letto all'ingresso, salvato con il segnale. */
   context?: unknown;
+  /** TP di sicurezza mandato al broker, distinto da takeProfit/target1. */
+  tpBroker?: number | null;
 };
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
@@ -215,7 +217,7 @@ async function limits() {
               (SELECT COALESCE(SUM(mt5_profit),0) FROM scalper_signals WHERE closed_at >= $1::timestamptz) profit`,
       [start.toISOString(), tradeDedupSec()],
     ),
-    dbQuery(`SELECT outcome,close_reason,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
+    dbQuery(`SELECT outcome,close_reason,mt5_profit,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
   ]);
 
   const trades = Number(daily.rows[0]?.trades ?? 0);
@@ -224,13 +226,14 @@ async function limits() {
   if (profit <= -envN("MAX_DAILY_LOSS", 150, 0)) return { ok: false, reason: "max_daily_loss" };
 
   // Le uscite gestite (breakeven, trailing, flatten, stop, watchdog) non sono perdite.
-  const losses = last.rows.filter((row: { outcome?: string; close_reason?: string }) => countsAsLoss(row.outcome, row.close_reason));
+  const losses = last.rows.filter((row: { outcome?: string; close_reason?: string; mt5_profit?: unknown }) =>
+    countsAsLoss(row.outcome, row.close_reason, row.mt5_profit));
   if (losses.length >= 3 && last.rows[0]?.closed_at) {
     const t = Date.parse(last.rows[0].closed_at);
     if (Date.now() - t < envN("SCALPER_THREE_LOSS_COOLDOWN_MIN", 30, 1) * 60_000) {
       return { ok: false, reason: "three_loss_cooldown" };
     }
-  } else if (countsAsLoss(last.rows[0]?.outcome, last.rows[0]?.close_reason) && last.rows[0]?.closed_at) {
+  } else if (countsAsLoss(last.rows[0]?.outcome, last.rows[0]?.close_reason, last.rows[0]?.mt5_profit) && last.rows[0]?.closed_at) {
     const t = Date.parse(last.rows[0].closed_at);
     if (Date.now() - t < envN("SCALPER_LOSS_COOLDOWN_MIN", 5, 1) * 60_000) {
       return { ok: false, reason: "loss_cooldown" };
@@ -276,8 +279,9 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
         WHERE closed_at IS NOT NULL AND mt5_position_id IS NOT NULL
      ),
      recent AS MATERIALIZED (
-       -- Conta come perdita solo lo stop iniziale: breakeven, trailing, flatten, stop e watchdog no.
-       SELECT (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial') AS is_loss,
+       -- Conta come perdita solo lo stop iniziale chiuso in perdita: le uscite gestite no.
+       SELECT (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial'
+               AND COALESCE(mt5_profit,-1) < 0) AS is_loss,
               closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
          FROM scalper_signals
         WHERE outcome IS NOT NULL
@@ -328,8 +332,8 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      ),
      inserted AS (
        INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key,
-                                   target1,context_json,final_sl)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4 FROM decision WHERE reason IS NULL
+                                   target1,context_json,final_sl,tp_broker)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4,$17 FROM decision WHERE reason IS NULL
        ON CONFLICT DO NOTHING
        RETURNING id::text AS id
      )
@@ -353,6 +357,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       tradeDedupSec(),
       input.setupKey,
       input.context === undefined || input.context === null ? null : JSON.stringify(input.context),
+      input.tpBroker ?? null,
     ],
   );
 
@@ -386,8 +391,8 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
   }
 
   const rows = await dbQuery(
-    `SELECT id,setup,mt5_position_id,mt5_open_price,entry,stop_loss,final_sl,breakeven_at,trailing_updates,
-            close_reason,created_at
+    `SELECT id,setup,direction,mt5_position_id,mt5_open_price,entry,stop_loss,take_profit,target1,tp_broker,
+            final_sl,breakeven_price,breakeven_at,trailing_updates,close_reason,created_at
        FROM scalper_signals
       WHERE outcome IS NULL AND mt5_position_id IS NOT NULL
       ORDER BY created_at ASC`,
@@ -420,13 +425,19 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
     const signed = Number(signal.entry) < Number(signal.stop_loss) ? open - close : close - open;
     const resultR = risk > 0 ? Number((signed / risk).toFixed(2)) : 0;
 
-    // Lo stop e' stato eseguito dal broker: il motivo dipende da dove era arrivato lo stop gestito.
+    // Il motivo si legge dal prezzo di chiusura reale del deal, mai dallo stato interno del worker:
+    // lo stato puo' essere in ritardo, il prezzo no.
+    const number = (value: unknown) => (Number.isFinite(Number(value)) ? Number(value) : null);
+    const trailingUpdates = Number(signal.trailing_updates ?? 0);
     const closeReason = signal.close_reason
       ? String(signal.close_reason)
       : isManagedSetup(signal.setup)
-        ? closeReasonFromState({
-          trailingUpdates: Number(signal.trailing_updates ?? 0),
-          breakevenAt: signal.breakeven_at ? String(signal.breakeven_at) : null,
+        ? closeReasonFromPrice(close, profit, {
+          initialStop: number(signal.stop_loss),
+          breakevenStop: number(signal.breakeven_price),
+          trailingStop: trailingUpdates > 0 ? number(signal.final_sl) : null,
+          brokerTp: number(signal.tp_broker),
+          target1: number(signal.target1 ?? signal.take_profit),
         })
         : null;
     await dbQuery(
@@ -468,8 +479,11 @@ export async function executeStreaming(
   signalId: string,
   direction: "BUY" | "SELL",
   stopLoss: number,
-  /** Take profit da inviare al broker: null sui setup a uscita gestita, che partono col solo SL. */
-  takeProfit: number | null,
+  /**
+   * Take profit inviato al broker: sempre presente. Sui setup a uscita gestita e' il TP di
+   * sicurezza (lontano), non l'obiettivo del trade: quello resta target1 e lo gestisce il worker.
+   */
+  takeProfit: number,
   connection: StreamingConnectionLike,
   options: ExecuteOptions = {},
 ) {
@@ -544,16 +558,19 @@ export async function executeStreaming(
     positionLimit,
   });
 
-  // Senza take profit l'ordine parte con il solo stop: e' il caso normale dei setup gestiti,
-  // non un errore. MetaApi accetta undefined e non imposta alcun TP sulla posizione.
-  const orderTakeProfit = takeProfit === null ? undefined : takeProfit;
+  // Nessun ordine parte senza rete: se worker o MetaApi muoiono, SL e TP restano al broker.
+  if (!Number.isFinite(stopLoss) || !Number.isFinite(takeProfit)) {
+    const reason = `SL/TP non validi per l'ordine: sl=${stopLoss} tp=${takeProfit}`;
+    await dbQuery(`UPDATE scalper_signals SET mt5_error=$2,outcome='ERROR',closed_at=now() WHERE id=$1`, [signalId, reason]);
+    return { status: "error" as const, error: reason };
+  }
 
   let result: Record<string, unknown>;
   try {
     const orderOptions = { clientId: orderClientId };
     result = direction === "BUY"
-      ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, orderTakeProfit, orderOptions)
-      : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, orderTakeProfit, orderOptions);
+      ? await connection.createMarketBuyOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions)
+      : await connection.createMarketSellOrder(symbol(), orderLots, stopLoss, takeProfit, orderOptions);
     if (![10008, 10009, 10010].includes(Number(result.numericCode))
       && !["TRADE_RETCODE_PLACED", "TRADE_RETCODE_DONE", "TRADE_RETCODE_DONE_PARTIAL"].includes(String(result.stringCode))) {
       throw Object.assign(new Error("Esito ordine non confermato: " + JSON.stringify(result)), { numericCode: result.numericCode });
@@ -587,22 +604,29 @@ export async function executeStreaming(
     return { status: "opened" as const, orderId, positionId: responsePositionId, openPrice: position?.openPrice ?? null, clientId: orderClientId };
   }
 
-  for (let i = 0; i < 20; i++) {
+  // Il prezzo di fill vero arriva col terminal state, non con la risposta all'ordine: si aspetta
+  // fino a FILL_POLL_MAX_MS perche' target1, breakeven e trailing vanno misurati sul fill reale.
+  const fillPollMs = envN("FILL_POLL_INTERVAL_MS", 500, 50);
+  const fillPollMax = envN("FILL_POLL_MAX_MS", 15_000, 1000);
+  const deadline = Date.now() + fillPollMax;
+  while (Date.now() < deadline) {
     const position = (connection.terminalState.positions ?? []).find((p) =>
       p.symbol === symbol()
       && !positionIdsBeforeOrder.has(p.id)
       && (!p.clientId || p.clientId === orderClientId),
     );
-    if (position) {
+    if (position && Number.isFinite(Number(position.openPrice)) && Number(position.openPrice) > 0) {
       await dbQuery(
         `UPDATE scalper_signals SET mt5_position_id=$2,mt5_open_price=$3,mt5_volume=$4 WHERE id=$1`,
         [signalId, position.id, position.openPrice, position.volume ?? orderLots],
       );
-      return { status: "opened" as const, orderId, positionId: position.id, openPrice: position.openPrice, clientId: orderClientId };
+      return { status: "opened" as const, orderId, positionId: position.id, openPrice: Number(position.openPrice), clientId: orderClientId };
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, fillPollMs));
   }
 
-  await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, "Ordine accettato ma posizione streaming non collegata entro 2s"]);
+  const message = `Ordine accettato ma prezzo di fill non disponibile entro ${Math.round(fillPollMax / 1000)}s`;
+  console.warn("[scalper-worker] fill_price_missing", { clientId: orderClientId, orderId, signalId, waitedMs: fillPollMax });
+  await dbQuery(`UPDATE scalper_signals SET mt5_error=$2 WHERE id=$1`, [signalId, message]);
   return { status: "pending_position_link" as const, orderId, clientId: orderClientId };
 }

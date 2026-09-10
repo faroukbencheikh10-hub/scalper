@@ -93,7 +93,7 @@ async function recordClosure(position: WatchdogPosition, reason: string) {
       [signal.id, open, close, profit, profit > 0 ? "WIN" : profit < 0 ? "LOSS" : "BREAKEVEN", resultR, out.time ?? null, volume],
     );
     await dbQuery(
-      `UPDATE trades SET reason=$2,close_reason='watchdog',
+      `UPDATE trades SET reason=$2,close_reason='watchdog',status='closed',
               payload=COALESCE(payload,'{}'::jsonb)||jsonb_build_object('closeReason','watchdog')
         WHERE source='scalper' AND mt5_position_id=$1`,
       [position.id, reason],
@@ -108,14 +108,14 @@ async function recordClosure(position: WatchdogPosition, reason: string) {
   ];
   const updated = await dbQuery(
     `UPDATE trades SET direction=$3,open_price=$4,close_price=$5,profit=$6,reason=$7,opened_at=$8,
-            closed_at=COALESCE($9::timestamptz,now()),payload=$10::jsonb,lot=$11
+            closed_at=COALESCE($9::timestamptz,now()),payload=$10::jsonb,lot=$11,status='closed'
       WHERE source='flatten_external' AND symbol=$1 AND mt5_position_id=$2`,
     params,
   );
   if (updated.rowCount === 0) {
     await dbQuery(
-      `INSERT INTO trades(source,scalper_signal_id,symbol,mt5_position_id,direction,open_price,close_price,profit,result_r,reason,opened_at,closed_at,payload,lot)
-       VALUES('flatten_external',NULL,$1,$2,$3,$4,$5,$6,NULL,$7,$8,COALESCE($9::timestamptz,now()),$10::jsonb,$11)`,
+      `INSERT INTO trades(source,scalper_signal_id,symbol,mt5_position_id,direction,open_price,close_price,profit,result_r,reason,opened_at,closed_at,payload,lot,status)
+       VALUES('flatten_external',NULL,$1,$2,$3,$4,$5,$6,NULL,$7,$8,COALESCE($9::timestamptz,now()),$10::jsonb,$11,'closed')`,
       params,
     );
   }

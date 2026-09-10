@@ -4,8 +4,9 @@ import { evaluateScalper, plannedEntryValid } from "../src/lib/server/scalperStr
 import { definitelyRejected, recoverOrder, riskPerLot } from "../src/lib/server/orderSafety";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "../src/lib/server/marketStructure";
 import {
-  applyAction, closeReasonFromState, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup,
-  m5CloseAction, openManagedExit, oppositeSignalIgnored, stopHit, tickAction,
+  applyAction, closeConfirmedByAbsence, closeLevelsFromState, closeReasonFromPrice, countsAsLoss,
+  entryBlockedByOpenPositions, isManagedSetup, m5CloseAction, openManagedExit, oppositeSignalIgnored,
+  retargetOnFill, safetyTakeProfit, stopHit, tickAction, trackMissing,
 } from "../src/lib/server/positionManager";
 import type { Candle } from "../src/lib/types";
 
@@ -728,7 +729,7 @@ const tick = (bid: number) => ({ bid, ask: bid + 0.12, mid: bid + 0.06, spread: 
 check("uscita: target1 porta a breakeven, poi il trailing M5 sale tre volte e chiude in sl_trailing", () => {
   let state = openManagedExit({
     positionId: "p1", signalId: "s1", setup: "m1_short", direction: "BUY",
-    openPrice: 2200, initialStop: 2197, target1: 2203,
+    openPrice: 2200, initialStop: 2197, target1: 2203, brokerTp: 2212,
   });
   // Prima di target1 nessuna azione e lo stop iniziale resta fermo.
   assert.equal(tickAction(state, tick(2202.5), nowMs, 0.1), null);
@@ -761,14 +762,15 @@ check("uscita: target1 porta a breakeven, poi il trailing M5 sale tre volte e ch
 
   // Il BID rompe l'ultimo stop: uscita in profitto, close_reason sl_trailing, non e' una perdita.
   assert.ok(stopHit(state, tick(2201.2)));
-  assert.equal(closeReasonFromState(state), "sl_trailing");
+  const trailingReason = closeReasonFromPrice(state.stopLoss, 1.3, closeLevelsFromState(state));
+  assert.equal(trailingReason, "sl_trailing");
   assert.ok(state.stopLoss - state.openPrice > 0, "lo stop e' sopra l'apertura, l'uscita e' in profitto");
-  assert.equal(countsAsLoss("LOSS", closeReasonFromState(state)), false);
+  assert.equal(countsAsLoss("LOSS", trailingReason, 1.3), false);
 });
 check("uscita: senza target1 lo stop iniziale chiude in sl_initial e conta come perdita", () => {
   let state = openManagedExit({
     positionId: "p2", signalId: "s2", setup: "m1_short", direction: "BUY",
-    openPrice: 2200, initialStop: 2197, target1: 2203,
+    openPrice: 2200, initialStop: 2197, target1: 2203, brokerTp: 2212,
   });
   for (const bid of [2201, 2199.5, 2198]) {
     assert.equal(tickAction(state, tick(bid), nowMs, 0.1), null);
@@ -777,10 +779,10 @@ check("uscita: senza target1 lo stop iniziale chiude in sl_initial e conta come 
     assert.equal(state.stopLoss, 2197, "prima del breakeven lo stop iniziale resta fermo");
   }
   assert.ok(stopHit(state, tick(2196.9)));
-  assert.equal(closeReasonFromState(state), "sl_initial");
-  assert.equal(countsAsLoss("LOSS", "sl_initial"), true);
+  assert.equal(closeReasonFromPrice(2197, -3, closeLevelsFromState(state)), "sl_initial");
+  assert.equal(countsAsLoss("LOSS", "sl_initial", -3), true);
   state = applyAction(state, { kind: "breakeven", stopLoss: 2200.1, at: new Date(nowMs).toISOString() });
-  assert.equal(closeReasonFromState(state), "sl_breakeven");
+  assert.equal(closeReasonFromPrice(2200.1, 0.1, closeLevelsFromState(state)), "sl_breakeven");
 });
 check("uscita: con un BUY aperto un segnale SELL viene solo loggato, nessun ordine", () => {
   withShort({}, () => {
@@ -797,19 +799,132 @@ check("uscita: con un BUY aperto un segnale SELL viene solo loggato, nessun ordi
   });
 });
 check("uscita: sl_breakeven non blocca la direzione, sl_initial si", () => {
-  assert.equal(countsAsLoss("LOSS", "sl_breakeven"), false);
-  assert.equal(countsAsLoss("LOSS", "sl_trailing"), false);
-  assert.equal(countsAsLoss("LOSS", "flatten"), false);
-  assert.equal(countsAsLoss("LOSS", "stop"), false);
-  assert.equal(countsAsLoss("LOSS", "watchdog"), false);
-  assert.equal(countsAsLoss("LOSS", "sl_initial"), true);
+  assert.equal(countsAsLoss("LOSS", "sl_breakeven", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "sl_trailing", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "flatten", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "stop", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "watchdog", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "tp_broker", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "manual", -0.2), false);
+  assert.equal(countsAsLoss("LOSS", "sl_initial", -3), true);
+  // Uno sl_initial chiuso in profitto non e' una perdita: e' il caso che rompeva il loss lock.
+  assert.equal(countsAsLoss("LOSS", "sl_initial", 5.49), false);
   // La mtf non scrive close_reason: le sue perdite continuano a bloccare la direzione come prima.
-  assert.equal(countsAsLoss("LOSS", null), true);
-  assert.equal(countsAsLoss("WIN", "sl_initial"), false);
+  assert.equal(countsAsLoss("LOSS", null, -3), true);
+  assert.equal(countsAsLoss("WIN", "sl_initial", 2), false);
   // Solo m1_short e m1_range hanno l'uscita gestita: la mtf tiene il TP al broker.
   assert.equal(isManagedSetup("m1_short"), true);
   assert.equal(isManagedSetup("m1_range"), true);
   assert.equal(isManagedSetup("micro_pullback"), false);
   assert.equal(isManagedSetup("breakout_retest"), false);
+});
+
+// --- Rete di sicurezza al broker, conferma della chiusura, fill reale, motivo dal prezzo -------
+check("sicurezza: ogni ordine m1_short/m1_range parte con SL e TP non nulli", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput());
+    assert.equal(s.setup, "m1_short", JSON.stringify(s));
+    assert.ok(Number.isFinite(s.stopLoss!), "SL sempre presente");
+    assert.ok(s.tpBroker !== null && s.tpBroker !== undefined && Number.isFinite(s.tpBroker),
+      "nessun ordine gestito puo' partire senza TP al broker");
+    // Il TP di sicurezza sta oltre target1 e non ci finisce mai sopra per caso.
+    assert.ok(s.tpBroker! > s.takeProfit!, JSON.stringify({ tpBroker: s.tpBroker, target1: s.takeProfit }));
+    const atrM1 = s.slPlan!.atr / 2;
+    const expected = Math.max(atrM1 * 4, Math.abs(s.takeProfit! - s.entry!) * 3);
+    assert.ok(Math.abs(Math.abs(s.tpBroker! - s.entry!) - expected) <= 0.011, JSON.stringify(s));
+  });
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput());
+    assert.equal(s.setup, "m1_range", JSON.stringify(s));
+    assert.ok(s.tpBroker !== null && s.tpBroker !== undefined && Number.isFinite(s.tpBroker));
+    assert.ok(s.tpBroker! > s.takeProfit!);
+  });
+  // La mtf non usa il TP di sicurezza: manda al broker il proprio take profit.
+  const mtf = evaluateScalper(fixture());
+  assert.equal(mtf.setup, "micro_pullback", JSON.stringify(mtf));
+  assert.ok(mtf.tpBroker === undefined || mtf.tpBroker === null, "la mtf resta invariata");
+});
+check("sicurezza: SELL ha il TP di sicurezza sotto l'ingresso e rispetta il minimo in R", () => {
+  const tp = safetyTakeProfit("SELL", 2200, 2198.5, 0.2, 4, 3);
+  // 3 x la distanza target1 (1.5$) batte 4 x ATR (0.8$).
+  assert.ok(Math.abs(tp - (2200 - 4.5)) <= 0.011, String(tp));
+  const wideAtr = safetyTakeProfit("BUY", 2200, 2200.5, 3, 4, 3);
+  // Qui comanda l'ATR: 4 x 3$ = 12$ contro 3 x 0.5$ = 1.5$.
+  assert.ok(Math.abs(wideAtr - (2200 + 12)) <= 0.011, String(wideAtr));
+});
+check("chiusura: una posizione sparita per pochi tick non e' chiusa", () => {
+  const start = nowMs;
+  let missing = trackMissing(undefined, start);
+  assert.equal(missing.ticks, 1);
+  // Un solo tick, zero tempo: nessuna conferma.
+  assert.equal(closeConfirmedByAbsence(missing, start, 10_000, 3), false);
+  missing = trackMissing(missing, start + 1_000);
+  missing = trackMissing(missing, start + 2_000);
+  assert.equal(missing.ticks, 3);
+  // Tre tick ma solo 2 s: ancora niente, e' il buco del terminal state dopo l'apertura.
+  assert.equal(closeConfirmedByAbsence(missing, start + 2_000, 10_000, 3), false);
+  // Tempo sufficiente ma pochi tick: nemmeno.
+  assert.equal(closeConfirmedByAbsence(trackMissing(undefined, start), start + 60_000, 10_000, 3), false);
+  // Tre tick e dieci secondi: chiusura confermata.
+  assert.equal(closeConfirmedByAbsence(missing, start + 10_000, 10_000, 3), true);
+  // Nessuna traccia = nessuna conferma.
+  assert.equal(closeConfirmedByAbsence(undefined, start + 60_000, 10_000, 3), false);
+});
+check("fill: target1 si rimisura sul prezzo reale, lo stop iniziale resta quello del broker", () => {
+  const planned = openManagedExit({
+    positionId: "p3", signalId: "s3", setup: "m1_range", direction: "BUY",
+    openPrice: 2200, initialStop: 2197, target1: 2203, brokerTp: 2212, fillPending: true,
+  });
+  assert.equal(planned.target1Distance, 3);
+  // Fill peggiore di 0.40$: target1 si sposta della stessa distanza, lo stop no.
+  const filled = retargetOnFill(planned, 2200.4);
+  assert.equal(filled.openPrice, 2200.4);
+  assert.ok(Math.abs(filled.target1 - 2203.4) <= 0.011, String(filled.target1));
+  assert.equal(filled.initialStop, 2197, "lo stop e' quello mandato al broker, non si ricalcola");
+  assert.equal(filled.stopLoss, 2197);
+  assert.equal(filled.brokerTp, 2212, "il TP di sicurezza non si muove mai");
+  assert.equal(filled.fillPending, false);
+  // Il breakeven parte dal fill reale, non dall'entry teorica.
+  const breakeven = tickAction(filled, tick(2203.5), nowMs, 0.1)!;
+  assert.equal(breakeven.kind === "breakeven" && breakeven.stopLoss, 2200.5);
+  // Dopo il breakeven un fill tardivo non riscrive piu' nulla.
+  const after = applyAction(filled, breakeven);
+  assert.equal(retargetOnFill(after, 2199).target1, after.target1);
+  // SELL speculare.
+  const short = retargetOnFill(openManagedExit({
+    positionId: "p4", signalId: "s4", setup: "m1_short", direction: "SELL",
+    openPrice: 2200, initialStop: 2203, target1: 2198.5, brokerTp: 2188, fillPending: true,
+  }), 2199.6);
+  assert.ok(Math.abs(short.target1 - 2198.1) <= 0.011, String(short.target1));
+});
+check("motivo: si legge dal prezzo di chiusura reale, mai dallo stato interno", () => {
+  // Il caso reale: SELL con breakeven a 4410.68, chiuso a 4408.74 con +5,49.
+  // Lo stato interno diceva sl_initial; il prezzo dice che lo stop iniziale non e' stato toccato.
+  const levels = { initialStop: 4414, breakevenStop: 4410.68, trailingStop: null, brokerTp: 4398, target1: 4409.28 };
+  assert.equal(closeReasonFromPrice(4408.74, 5.49, levels), "manual");
+  assert.equal(countsAsLoss("WIN", closeReasonFromPrice(4408.74, 5.49, levels), 5.49), false);
+  // Ogni livello viene riconosciuto per quello che e'.
+  assert.equal(closeReasonFromPrice(4414, -6, levels), "sl_initial");
+  assert.equal(closeReasonFromPrice(4410.68, 0.2, levels), "sl_breakeven");
+  assert.equal(closeReasonFromPrice(4409.28, 3, levels), "target1");
+  assert.equal(closeReasonFromPrice(4398, 20, levels), "tp_broker");
+  assert.equal(closeReasonFromPrice(4412.5, -3, levels), "manual");
+  // Chiudere sullo stop iniziale ma in profitto non e' una perdita: non e' sl_initial.
+  assert.notEqual(closeReasonFromPrice(4414, 2, levels), "sl_initial");
+  // Il trailing ha la precedenza sul breakeven quando lo stop e' stato mosso.
+  const trailed = { ...levels, trailingStop: 4409.9 };
+  assert.equal(closeReasonFromPrice(4409.9, 2, trailed), "sl_trailing");
+  // Lo slittamento di qualche centesimo resta attribuito al livello giusto.
+  assert.equal(closeReasonFromPrice(4410.72, 0.1, levels), "sl_breakeven");
+  // I livelli attivi si leggono dal piano: senza trailing lo stop corrente non e' un trailing stop.
+  const state = openManagedExit({
+    positionId: "p5", signalId: "s5", setup: "m1_short", direction: "SELL",
+    openPrice: 4410.87, initialStop: 4414, target1: 4409.28, brokerTp: 4398,
+  });
+  assert.equal(closeLevelsFromState(state).trailingStop, null);
+  const withBreakeven = applyAction(state, { kind: "breakeven", stopLoss: 4410.68, at: new Date(nowMs).toISOString() });
+  assert.equal(closeLevelsFromState(withBreakeven).breakevenStop, 4410.68);
+  assert.equal(closeLevelsFromState(withBreakeven).trailingStop, null);
+  assert.equal(closeReasonFromPrice(4408.74, 5.49, closeLevelsFromState(withBreakeven)), "manual");
 });
 console.log(passed + " scenari superati.");

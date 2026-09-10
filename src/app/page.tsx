@@ -7,9 +7,9 @@ import { setupLabel } from "@/lib/setups";
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
-type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
+type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
 /** Piano di uscita del trade aperto: nessun TP al broker, breakeven a target1 e trailing sulla M5. */
-type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
+type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
 type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[]; risk?: RiskPlan | null };
 type StreamError = { message: string; at: string | null };
 type Flatten = { at?: string; closed?: string[]; canceled?: string[]; reason?: string; failures?: string[] };
@@ -155,16 +155,24 @@ export default function Home() {
   const riskText = risk && Number.isFinite(risk.risk)
     ? `${money(Number(risk.risk))} ${risk.currency ?? "EUR"}${Number.isFinite(risk.riskPct) ? ` · ${money(Number(risk.riskPct))}% del saldo` : ""}${risk.lotsCapped ? ` · lotti ridotti a ${risk.lots}` : ""}`
     : "—";
-  const targetLabel = risk?.managedExit ? "target1" : "TP";
+  const targetLabel = risk?.managedExit ? "Target1" : "TP";
   const slTpText = risk && Number.isFinite(risk.slDistance)
     ? `SL ${money(Number(risk.slDistance))}$ · ${targetLabel} ${money(Number(risk.target1Distance ?? risk.tpDistance))}$${Number.isFinite(risk.riskReward) ? ` (${risk.riskReward}R)` : ""}`
     : "—";
+  // Il TP al broker e' la rete di sicurezza: distinto da Target1, che lo gestisce il worker.
+  const brokerTpText = risk?.managedExit && Number.isFinite(risk?.tpBroker)
+    ? `${money(Number(risk?.tpBroker))} · ${money(Number(risk?.tpBrokerDistance))}$ dall'ingresso`
+    : risk && !risk.managedExit && Number.isFinite(risk.tpDistance)
+      ? `TP strategia · ${money(Number(risk.tpDistance))}$`
+      : "—";
   const managed = data?.stream?.detail?.managed ?? [];
   const openExit = managed[0] ?? null;
   const openExitText = openExit
-    ? `SL ${money(Number(openExit.stopLoss))} · target1 ${money(Number(openExit.target1))} raggiunto: ${openExit.target1Hit ? "sì" : "no"}`
+    ? `SL ${money(Number(openExit.stopLoss))} · Target1 ${money(Number(openExit.target1))} raggiunto: ${openExit.target1Hit ? "sì" : "no"}`
+      + ` · TP broker ${Number.isFinite(openExit.tpBroker) ? money(Number(openExit.tpBroker)) : "—"}`
       + ` · trailing ${openExit.trailingActive ? `attivo (${openExit.trailingUpdates ?? 0} aggiornamenti)` : "non attivo"}`
       + `${openExit.breakevenAt ? ` · breakeven ${money(Number(openExit.breakevenPrice))} alle ${formatTime(openExit.breakevenAt)}` : ""}`
+      + `${openExit.fillPending ? " · fill non confermato" : ""}`
     : "nessun trade gestito aperto";
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
@@ -276,6 +284,7 @@ export default function Home() {
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
             <div><dt>SL / {targetLabel} ultimo ordine</dt><dd className="mt5-value">{slTpText}</dd></div>
+            <div><dt>TP broker (sicurezza)</dt><dd className="mt5-value">{brokerTpText}</dd></div>
             <div><dt>Uscita trade aperto</dt><dd className="mt5-value">{openExitText}</dd></div>
             <div><dt>Rischio ultimo ordine</dt><dd className={`mt5-value${risk?.overCap ? " negative" : ""}`}>{riskText}</dd></div>
             <div><dt>Re-entry bloccato</dt><dd className="mt5-value">{lossLockText}</dd></div>
