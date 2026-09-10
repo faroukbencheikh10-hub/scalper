@@ -197,6 +197,47 @@ export function applyAction(state: ManagedExitState, action: ManagedAction): Man
   return { ...state, stopLoss: action.to, trailingUpdates: state.trailingUpdates + 1 };
 }
 
+/** Posizione live MetaApi: solo i campi che servono a recuperare un TP altrimenti sconosciuto. */
+export type BrokerPositionLike = { takeProfit?: number | null };
+
+/**
+ * TP corrente da ripassare a OGNI modifyPosition di breakeven/trailing, mai omesso: un TP omesso
+ * viene letto dal broker come "cancellalo", non "lascialo com'era" (vedi trade MT5 #220522199, TP
+ * sparito dopo un breakeven che mandava solo lo stopLoss). Preferisce lo stato interno (gia' noto
+ * e persistito in tp_broker); se assente ripiega sul TP live della posizione MetaApi, l'unica
+ * altra fonte di verita' disponibile senza aggiungere colonne nuove. Restituisce null solo se
+ * nessuna delle due fonti ha un valore: in quel caso il chiamante NON deve inviare la modifica.
+ */
+export function resolveBrokerTp(brokerTp: number | null | undefined, position: BrokerPositionLike): number | null {
+  // Number(null) === 0, che e' finito: senza il controllo esplicito su null/undefined uno stato
+  // "TP sconosciuto" verrebbe letto come "TP a zero" invece di ripiegare sul TP live.
+  if (brokerTp !== null && brokerTp !== undefined && Number.isFinite(Number(brokerTp)) && Number(brokerTp) > 0) {
+    return Number(brokerTp);
+  }
+  if (Number.isFinite(Number(position.takeProfit)) && Number(position.takeProfit) > 0) return Number(position.takeProfit);
+  return null;
+}
+
+/**
+ * Comando completo da mandare a modifyPosition per un'azione di breakeven/trailing: SEMPRE sia sl
+ * sia tp espliciti, mai un campo omesso. `blocked` e' true quando il TP non e' risolvibile da
+ * nessuna fonte: il chiamante deve saltare la modifica invece di mandarla con un tp mancante.
+ */
+export type ModifyPositionCommand =
+  | { blocked: false; sl: number; tp: number }
+  | { blocked: true; reason: "tp_unknown" };
+
+export function buildModifyPositionCommand(
+  action: ManagedAction,
+  currentBrokerTp: number | null | undefined,
+  position: BrokerPositionLike,
+): ModifyPositionCommand {
+  const tp = resolveBrokerTp(currentBrokerTp, position);
+  if (tp === null) return { blocked: true, reason: "tp_unknown" };
+  const sl = action.kind === "breakeven" ? action.stopLoss : action.to;
+  return { blocked: false, sl, tp };
+}
+
 /** Livelli noti di una posizione, usati per leggere il motivo dal prezzo di chiusura reale. */
 export type CloseLevels = {
   initialStop: number | null;

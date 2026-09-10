@@ -4,9 +4,10 @@ import { evaluateScalper, plannedEntryValid } from "../src/lib/server/scalperStr
 import { definitelyRejected, recoverOrder, riskPerLot } from "../src/lib/server/orderSafety";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "../src/lib/server/marketStructure";
 import {
-  applyAction, closeConfirmedByAbsence, closeLevelsFromState, closeReasonFromPrice, countsAsLoss,
-  entryBlockedByOpenPositions, isManagedSetup, m5CloseAction, openManagedExit, oppositeSignalIgnored,
-  retargetOnFill, safetyTakeProfit, stopHit, tickAction, trackMissing,
+  applyAction, buildModifyPositionCommand, closeConfirmedByAbsence, closeLevelsFromState,
+  closeReasonFromPrice, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup, m5CloseAction,
+  openManagedExit, oppositeSignalIgnored, resolveBrokerTp, retargetOnFill, safetyTakeProfit,
+  stopHit, tickAction, trackMissing,
 } from "../src/lib/server/positionManager";
 import type { Candle } from "../src/lib/types";
 
@@ -766,6 +767,56 @@ check("uscita: target1 porta a breakeven, poi il trailing M5 sale tre volte e ch
   assert.equal(trailingReason, "sl_trailing");
   assert.ok(state.stopLoss - state.openPrice > 0, "lo stop e' sopra l'apertura, l'uscita e' in profitto");
   assert.equal(countsAsLoss("LOSS", trailingReason, 1.3), false);
+});
+
+// Regressione trade MT5 #220522199: un breakeven che manda solo lo stopLoss a modifyPosition
+// viene letto dal broker come "cancella il TP", non "lascialo com'era". Ogni comando di modifica
+// deve sempre portare sia sl sia tp, mai un campo omesso.
+check("breakeven: il comando di modifica porta sempre anche il TP originale, mai omesso", () => {
+  const state = openManagedExit({
+    positionId: "p-220522199", signalId: "s1", setup: "m1_short", direction: "SELL",
+    openPrice: 4337.0, initialStop: 4335.64, target1: 4319.37, brokerTp: 4319.37,
+  });
+  assert.equal(state.brokerTp, 4319.37);
+  // Per uno short e' l'ASK a toccare target1 (scendendo): stop a breakeven.
+  const breakeven = tickAction(state, { bid: 4319.18, ask: 4319.3, mid: 4319.24, spread: 0.12, quotedAt: nowMs }, nowMs, 0.1);
+  assert.ok(breakeven && breakeven.kind === "breakeven", JSON.stringify(breakeven));
+  const command = buildModifyPositionCommand(breakeven!, state.brokerTp, { takeProfit: undefined });
+  assert.equal(command.blocked, false, JSON.stringify(command));
+  assert.ok(!command.blocked);
+  if (!command.blocked) {
+    // Il TP nel comando di modifica e' IDENTICO a quello originale: non sparisce, non cambia.
+    assert.equal(command.tp, 4319.37);
+    assert.equal(command.sl, breakeven!.kind === "breakeven" ? breakeven!.stopLoss : NaN);
+  }
+});
+
+check("trailing: il comando di modifica porta sempre anche il TP corrente, mai omesso", () => {
+  let state = openManagedExit({
+    positionId: "p2", signalId: "s2", setup: "m1_range", direction: "BUY",
+    openPrice: 2200, initialStop: 2197, target1: 2203, brokerTp: 2212,
+  });
+  const breakeven = tickAction(state, tick(2203.1), nowMs, 0.1)!;
+  state = applyAction(state, breakeven);
+  const bars = [2202.0, 2200.5, 2202.0, 2201.0, 2203.0].map((low, i) => swingBar(i, low));
+  const trailing = m5CloseAction(state, bars)!;
+  assert.equal(trailing.kind, "trailing", JSON.stringify(trailing));
+  const command = buildModifyPositionCommand(trailing, state.brokerTp, {});
+  assert.ok(!command.blocked, JSON.stringify(command));
+  if (!command.blocked) {
+    assert.equal(command.tp, 2212, "il TP non deve mai sparire durante il trailing");
+    assert.equal(command.sl, trailing.kind === "trailing" ? trailing.to : NaN);
+  }
+});
+
+check("resolveBrokerTp: senza stato interno ripiega sul TP live della posizione, mai su un comando senza TP", () => {
+  assert.equal(resolveBrokerTp(2212, {}), 2212);
+  assert.equal(resolveBrokerTp(null, { takeProfit: 2219.5 }), 2219.5);
+  assert.equal(resolveBrokerTp(undefined, { takeProfit: 0 }), null, "un TP live a 0 non e' un livello valido");
+  assert.equal(resolveBrokerTp(null, {}), null, "nessuna fonte disponibile: il chiamante deve saltare la modifica");
+  const blocked = buildModifyPositionCommand({ kind: "trailing", from: 2200, to: 2201, swingAt: "2026-01-01T00:00:00.000Z" }, null, {});
+  assert.equal(blocked.blocked, true);
+  assert.ok(blocked.blocked && blocked.reason === "tp_unknown");
 });
 check("uscita: senza target1 lo stop iniziale chiude in sl_initial e conta come perdita", () => {
   let state = openManagedExit({
