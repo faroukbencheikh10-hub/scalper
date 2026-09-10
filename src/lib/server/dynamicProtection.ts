@@ -11,8 +11,6 @@ export type DynamicProtectionConfig = {
   tpMinUsd: number;
   tpMaxUsd: number;
   spreadMult: number;
-  protectAtEur: number;
-  trailAtEur: number;
   trailAtrMult: number;
   trailMinUsd: number;
   trailMaxUsd: number;
@@ -37,8 +35,6 @@ export function dynamicProtectionConfig(): DynamicProtectionConfig {
     tpMinUsd: envNumber("QUICK_TP_MIN_USD", 1.5, 0.1, 100),
     tpMaxUsd: envNumber("QUICK_TP_MAX_USD", 4, 0.1, 100),
     spreadMult: envNumber("QUICK_SPREAD_MULT", 3, 1, 20),
-    protectAtEur: envNumber("QUICK_PROTECT_AT_EUR", 2, 0, 1000),
-    trailAtEur: envNumber("QUICK_TRAIL_AT_EUR", 3, 0, 1000),
     trailAtrMult: envNumber("QUICK_TRAIL_ATR_MULT", 0.35, 0.05, 5),
     trailMinUsd: envNumber("QUICK_TRAIL_MIN_USD", 0.3, 0.05, 50),
     trailMaxUsd: envNumber("QUICK_TRAIL_MAX_USD", 1.2, 0.05, 50),
@@ -64,7 +60,7 @@ export function dynamicDistances(
     config.tpMaxUsd,
   );
   const trailDistanceUsd = clamp(
-    atr * config.trailAtrMult,
+    Math.max(atr * config.trailAtrMult, spread * config.spreadMult),
     config.trailMinUsd,
     config.trailMaxUsd,
   );
@@ -91,54 +87,38 @@ export function initialDynamicLevels(input: {
   return { ...distances, stopLoss, takeProfit };
 }
 
-export type ProfitProtectionAction =
-  | { kind: "hold"; stopLoss: number }
-  | { kind: "protect"; stopLoss: number }
-  | { kind: "trail"; stopLoss: number };
+export type DynamicStopAction = {
+  kind: "trail";
+  stopLoss: number;
+};
 
 /**
- * Paper/backtest-only SL movement model.
- * - profit < protectAtEur: keep the existing SL.
- * - profit >= protectAtEur (default +2 EUR): move SL immediately to at least breakeven.
- * - profit >= trailAtEur (default +3 EUR): trail behind the live price using ATR, never loosening SL.
+ * Paper/backtest-only dynamic SL model with NO minimum profit objective.
  *
- * profitEur is the actual position P&L supplied by the simulator/test harness. This avoids assuming
- * that a fixed XAUUSD price move always equals the same euro profit when lots change.
+ * The SL is recalculated on every price update from ATR M1 + spread and can tighten immediately.
+ * It never loosens: a BUY stop can only move upward; a SELL stop can only move downward.
+ * There is no +2 EUR / +3 EUR activation threshold and no fixed profit target required before
+ * protection begins. If the computed trailing level is not better than the existing SL, it stays put.
  */
 export function dynamicProfitProtection(input: {
   direction: TradeDirection;
   entry: number;
   currentPrice: number;
   currentStopLoss: number;
-  profitEur: number;
   atrM1: number;
   spreadUsd: number;
   config?: DynamicProtectionConfig;
-}): ProfitProtectionAction {
+}): DynamicStopAction {
   const config = input.config ?? dynamicProtectionConfig();
   const { trailDistanceUsd } = dynamicDistances(input.atrM1, input.spreadUsd, config);
-
-  if (!(input.profitEur >= config.protectAtEur)) {
-    return { kind: "hold", stopLoss: input.currentStopLoss };
-  }
-
-  if (input.profitEur < config.trailAtEur) {
-    const breakeven = input.entry;
-    const next = input.direction === "BUY"
-      ? Math.max(input.currentStopLoss, breakeven)
-      : Math.min(input.currentStopLoss, breakeven);
-    return { kind: "protect", stopLoss: next };
-  }
 
   const candidate = input.direction === "BUY"
     ? input.currentPrice - trailDistanceUsd
     : input.currentPrice + trailDistanceUsd;
-  const protectedCandidate = input.direction === "BUY"
-    ? Math.max(input.entry, candidate)
-    : Math.min(input.entry, candidate);
+
   const next = input.direction === "BUY"
-    ? Math.max(input.currentStopLoss, protectedCandidate)
-    : Math.min(input.currentStopLoss, protectedCandidate);
+    ? Math.max(input.currentStopLoss, candidate)
+    : Math.min(input.currentStopLoss, candidate);
 
   return { kind: "trail", stopLoss: next };
 }
