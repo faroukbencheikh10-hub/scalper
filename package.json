@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit",
     "worker": "tsx worker/streaming.ts",
     "watchdog": "tsx worker/watchdog.ts",
-    "scenarios": "tsx scripts/strategy-scenarios.ts && tsx scripts/stale-quote-scenarios.ts"
+    "scenarios": "tsx scripts/strategy-scenarios.ts && tsx scripts/stale-quote-scenarios.ts && tsx scripts/dynamic-protection-scenarios.ts"
   },
   "dependencies": {
     "metaapi.cloud-sdk": "^29.3.3",
