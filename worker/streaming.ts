@@ -9,9 +9,10 @@ import { contextM5M15, evaluateScalper, m15GateMode, plannedEntryValid, STRATEGY
 import { aggregateM15, closedBars } from "../src/lib/server/marketStructure";
 import { atr } from "../src/lib/server/indicators";
 import {
-  applyAction, closeConfirmedByAbsence, countsAsLoss, entryBlockedByOpenPositions, isManagedSetup,
-  m5CloseAction, openManagedExit, oppositeSignalIgnored, referencePrice, retargetOnFill, tickAction,
-  trackMissing, type ManagedCloseReason, type ManagedExitState, type MissingPosition,
+  applyAction, buildModifyPositionCommand, closeConfirmedByAbsence, countsAsLoss,
+  entryBlockedByOpenPositions, isManagedSetup, m5CloseAction, openManagedExit, oppositeSignalIgnored,
+  referencePrice, retargetOnFill, tickAction, trackMissing,
+  type ManagedCloseReason, type ManagedExitState, type MissingPosition,
 } from "../src/lib/server/positionManager";
 import {
   decideTpBrokerUpdate, initTrailingTp, initialLevels as sltpInitialLevels, recalcTighterStop,
@@ -123,6 +124,10 @@ type ManagedPosition = {
   clientId?: string;
   type?: string;
   time?: string | Date;
+  // Non popolati dal cast stretto sopra, ma presenti sull'oggetto MetaApi reale: fallback per
+  // recuperare il TP live quando lo stato interno non lo conosce (vedi resolveBrokerTp sotto).
+  stopLoss?: number;
+  takeProfit?: number;
 };
 
 type ManagedOrder = {
@@ -170,6 +175,18 @@ function positionDirection(position: ManagedPosition): "BUY" | "SELL" | null {
   if (type.includes("BUY")) return "BUY";
   if (type.includes("SELL")) return "SELL";
   return null;
+}
+
+/** Log esplicito di ogni modifica posizione inviata a MetaApi: sl e tp esatti, mai solo uno dei due. */
+function logPositionModify(input: { positionId: string; reason: string; sl: number; tp: number; signalId?: string | null }) {
+  console.log("[scalper-worker] position_modify", JSON.stringify({
+    at: new Date().toISOString(),
+    positionId: input.positionId,
+    signalId: input.signalId ?? null,
+    reason: input.reason,
+    sl: input.sl,
+    tp: input.tp,
+  }));
 }
 
 function assertTradeAccepted(result: Record<string, unknown>, label: string) {
@@ -629,6 +646,7 @@ async function main() {
    */
   const applySltpLevels = async (input: {
     positionId: string;
+    signalId?: string | null;
     direction: "BUY" | "SELL";
     stopLoss: number;
     takeProfit: number;
@@ -640,6 +658,7 @@ async function main() {
   }): Promise<{ stopLoss: number; takeProfit: number } | null> => {
     try {
       await retryTrade(input.label, () => tradingConnection.modifyPosition(input.positionId, input.stopLoss, input.takeProfit));
+      logPositionModify({ positionId: input.positionId, signalId: input.signalId, reason: "sltp_update", sl: input.stopLoss, tp: input.takeProfit });
       return { stopLoss: input.stopLoss, takeProfit: input.takeProfit };
     } catch (firstError) {
       if (!(input.stopsLevelMinUsd > 0)) {
@@ -658,6 +677,7 @@ async function main() {
         : Math.min(input.takeProfit, input.currentPrice - input.stopsLevelMinUsd);
       try {
         await retryTrade(`${input.label} (minimo stopsLevel)`, () => tradingConnection.modifyPosition(input.positionId, safeSl, safeTp));
+        logPositionModify({ positionId: input.positionId, signalId: input.signalId, reason: "sltp_update_stopslevel_fallback", sl: safeSl, tp: safeTp });
         return { stopLoss: safeSl, takeProfit: safeTp };
       } catch (secondError) {
         console.warn("[scalper-worker] sltp_rejected", JSON.stringify({
@@ -719,7 +739,7 @@ async function main() {
         const nextSl = slDecision.kind === "update" ? slDecision.stopLoss : state.stopLoss;
         const nextTp = tpDecision?.kind === "update" ? tpDecision.takeProfit : state.currentTp;
         const applied = await applySltpLevels({
-          positionId: position.id, direction: state.direction, stopLoss: nextSl, takeProfit: nextTp,
+          positionId: position.id, signalId: state.signalId, direction: state.direction, stopLoss: nextSl, takeProfit: nextTp,
           previousStopLoss: state.stopLoss, stopsLevelMinUsd, currentPrice: priceRef,
           label: `SL/TP posizione ${position.id}`,
         });
@@ -804,30 +824,42 @@ async function main() {
         // 1. Primo tick che tocca target1 (BID sui long, ASK sugli short): stop a breakeven.
         const breakeven = tickAction(current, quote, Date.now(), breakevenBuffer);
         if (breakeven && breakeven.kind === "breakeven") {
-          try {
-            await retryTrade(`Breakeven posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, breakeven.stopLoss));
-            current = applyAction(current, breakeven);
-            managedExits.set(position.id, current);
-            console.log("[scalper-worker] breakeven_set", JSON.stringify({
-              at: breakeven.at,
-              positionId: position.id,
-              signalId: current.signalId,
-              setup: current.setup,
-              direction: current.direction,
-              openPrice: current.openPrice,
-              target1: current.target1,
-              price: referencePrice(current.direction, quote),
-              stopLoss: breakeven.stopLoss,
-              previousStopLoss: state.stopLoss,
+          // SEMPRE sl e tp espliciti nella stessa modifyPosition: un tp omesso viene letto dal
+          // broker come "cancellalo", non "lascialo com'era" (vedi trade MT5 #220522199).
+          const command = buildModifyPositionCommand(breakeven, current.brokerTp, position);
+          if (command.blocked) {
+            await setSetting("stream_last_error", `${new Date().toISOString()} Breakeven ${position.id}: TP al broker sconosciuto, modifica saltata per non cancellarlo.`);
+            console.error("[scalper-worker] position_modify_skipped", JSON.stringify({
+              at: new Date().toISOString(), positionId: position.id, signalId: current.signalId, reason: "breakeven_tp_unknown",
             }));
-            await persistManagedExit(current);
-            void sendTelegram(
-              `\u{1f512} SCALPER ${symbol()} \u00b7 breakeven ${current.direction} ${setupLabel(current.setup)}:`
-              + ` target1 ${money(current.target1)} raggiunto, SL a ${money(breakeven.stopLoss)}`
-              + ` (${breakeven.at.slice(11, 19)} UTC).`,
-            );
-          } catch (error) {
-            await setSetting("stream_last_error", `${new Date().toISOString()} Breakeven ${position.id}: ${error instanceof Error ? error.message : String(error)}`);
+          } else {
+            try {
+              await retryTrade(`Breakeven posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, command.sl, command.tp));
+              logPositionModify({ positionId: position.id, signalId: current.signalId, reason: "breakeven", sl: command.sl, tp: command.tp });
+              current = { ...applyAction(current, breakeven), brokerTp: command.tp };
+              managedExits.set(position.id, current);
+              console.log("[scalper-worker] breakeven_set", JSON.stringify({
+                at: breakeven.at,
+                positionId: position.id,
+                signalId: current.signalId,
+                setup: current.setup,
+                direction: current.direction,
+                openPrice: current.openPrice,
+                target1: current.target1,
+                price: referencePrice(current.direction, quote),
+                stopLoss: command.sl,
+                previousStopLoss: state.stopLoss,
+                tpBroker: command.tp,
+              }));
+              await persistManagedExit(current);
+              void sendTelegram(
+                `\u{1f512} SCALPER ${symbol()} \u00b7 breakeven ${current.direction} ${setupLabel(current.setup)}:`
+                + ` target1 ${money(current.target1)} raggiunto, SL a ${money(command.sl)}`
+                + ` (${breakeven.at.slice(11, 19)} UTC).`,
+              );
+            } catch (error) {
+              await setSetting("stream_last_error", `${new Date().toISOString()} Breakeven ${position.id}: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
         }
 
@@ -835,9 +867,18 @@ async function main() {
         if (!freshM5Close) continue;
         const trailing = m5CloseAction(current, closedM5);
         if (!trailing || trailing.kind !== "trailing") continue;
+        const trailingCommand = buildModifyPositionCommand(trailing, current.brokerTp, position);
+        if (trailingCommand.blocked) {
+          await setSetting("stream_last_error", `${new Date().toISOString()} Trailing ${position.id}: TP al broker sconosciuto, modifica saltata per non cancellarlo.`);
+          console.error("[scalper-worker] position_modify_skipped", JSON.stringify({
+            at: new Date().toISOString(), positionId: position.id, signalId: current.signalId, reason: "trailing_tp_unknown",
+          }));
+          continue;
+        }
         try {
-          await retryTrade(`Trailing posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, trailing.to));
-          current = applyAction(current, trailing);
+          await retryTrade(`Trailing posizione ${position.id}`, () => tradingConnection.modifyPosition(position.id, trailingCommand.sl, trailingCommand.tp));
+          logPositionModify({ positionId: position.id, signalId: current.signalId, reason: "trailing_m5", sl: trailingCommand.sl, tp: trailingCommand.tp });
+          current = { ...applyAction(current, trailing), brokerTp: trailingCommand.tp };
           managedExits.set(position.id, current);
           console.log("[scalper-worker] trailing_update", JSON.stringify({
             at: new Date().toISOString(),
@@ -849,6 +890,7 @@ async function main() {
             to: trailing.to,
             swingAt: trailing.swingAt,
             trailingUpdates: current.trailingUpdates,
+            tpBroker: trailingCommand.tp,
           }));
           await persistManagedExit(current);
         } catch (error) {
