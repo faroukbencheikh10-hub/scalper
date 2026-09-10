@@ -1,4 +1,4 @@
-// Pure paper/backtest model for dynamic protection in super-scalper mode.
+// Pure paper/backtest model for dynamic protection.
 // IMPORTANT: this module performs no MetaApi calls, no broker orders and no database writes.
 
 export type TradeDirection = "BUY" | "SELL";
@@ -15,6 +15,12 @@ export type DynamicProtectionConfig = {
   trailMinUsd: number;
   trailMaxUsd: number;
 };
+
+export type DynamicRejectReason =
+  | "invalid_market_data"
+  | "invalid_config"
+  | "sl_distance_above_max"
+  | "tp_distance_above_max";
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
@@ -41,33 +47,75 @@ export function dynamicProtectionConfig(): DynamicProtectionConfig {
   };
 }
 
+export function validDynamicProtectionConfig(config: DynamicProtectionConfig) {
+  const values = Object.values(config);
+  return values.every(value => Number.isFinite(value) && value > 0)
+    && config.slMinUsd <= config.slMaxUsd
+    && config.tpMinUsd <= config.tpMaxUsd
+    && config.trailMinUsd <= config.trailMaxUsd;
+}
+
+function validMarketData(atrM1: number, spreadUsd: number) {
+  return Number.isFinite(atrM1) && atrM1 > 0
+    && Number.isFinite(spreadUsd) && spreadUsd >= 0;
+}
+
+export type DynamicDistances = {
+  valid: boolean;
+  rejectReason: "invalid_market_data" | "invalid_config" | null;
+  requiredSlDistanceUsd: number | null;
+  tpDistanceUsd: number | null;
+  trailDistanceUsd: number | null;
+};
+
+/**
+ * Calculates all distances from live market inputs. Invalid ATR/spread/config never fall back to
+ * invented values: the caller must reject/hold instead.
+ */
 export function dynamicDistances(
   atrM1: number,
   spreadUsd: number,
   config = dynamicProtectionConfig(),
-) {
-  const atr = Number.isFinite(atrM1) && atrM1 > 0 ? atrM1 : config.slMinUsd / config.slAtrMult;
-  const spread = Number.isFinite(spreadUsd) && spreadUsd >= 0 ? spreadUsd : 0;
+): DynamicDistances {
+  if (!validDynamicProtectionConfig(config)) {
+    return {
+      valid: false,
+      rejectReason: "invalid_config",
+      requiredSlDistanceUsd: null,
+      tpDistanceUsd: null,
+      trailDistanceUsd: null,
+    };
+  }
+  if (!validMarketData(atrM1, spreadUsd)) {
+    return {
+      valid: false,
+      rejectReason: "invalid_market_data",
+      requiredSlDistanceUsd: null,
+      tpDistanceUsd: null,
+      trailDistanceUsd: null,
+    };
+  }
 
   const requiredSlDistanceUsd = Math.max(
-    atr * config.slAtrMult,
-    spread * config.spreadMult,
+    atrM1 * config.slAtrMult,
+    spreadUsd * config.spreadMult,
     config.slMinUsd,
   );
   const tpDistanceUsd = clamp(
-    Math.max(atr * config.tpAtrMult, spread * config.spreadMult, config.tpMinUsd),
+    Math.max(atrM1 * config.tpAtrMult, spreadUsd * config.spreadMult, config.tpMinUsd),
     config.tpMinUsd,
     config.tpMaxUsd,
   );
   const trailDistanceUsd = clamp(
-    Math.max(atr * config.trailAtrMult, spread * config.spreadMult),
+    Math.max(atrM1 * config.trailAtrMult, spreadUsd * config.spreadMult),
     config.trailMinUsd,
     config.trailMaxUsd,
   );
 
   return {
+    valid: true,
+    rejectReason: null,
     requiredSlDistanceUsd,
-    slDistanceUsd: Math.min(requiredSlDistanceUsd, config.slMaxUsd),
     tpDistanceUsd,
     trailDistanceUsd,
   };
@@ -75,11 +123,11 @@ export function dynamicDistances(
 
 export type InitialDynamicLevels = {
   valid: boolean;
-  rejectReason: "sl_distance_above_max" | null;
-  requiredSlDistanceUsd: number;
-  slDistanceUsd: number;
-  tpDistanceUsd: number;
-  trailDistanceUsd: number;
+  rejectReason: DynamicRejectReason | null;
+  requiredSlDistanceUsd: number | null;
+  slDistanceUsd: number | null;
+  tpDistanceUsd: number | null;
+  trailDistanceUsd: number | null;
   stopLoss: number | null;
   takeProfit: number | null;
 };
@@ -87,8 +135,8 @@ export type InitialDynamicLevels = {
 /**
  * Paper/backtest initial plan.
  * SL is the widest requirement from structure + ATR M1 + spread + configured minimum.
- * If that required SL exceeds slMaxUsd the setup is rejected instead of silently tightening risk.
- * TP is calculated once at entry from ATR M1 + spread and is not moved by the trailing model.
+ * TP is calculated by code from ATR M1 + spread and is fixed after entry.
+ * If inputs/config are invalid, or required SL exceeds its maximum, no plan is produced.
  */
 export function initialDynamicLevels(input: {
   direction: TradeDirection;
@@ -96,24 +144,47 @@ export function initialDynamicLevels(input: {
   atrM1: number;
   spreadUsd: number;
   structuralDistanceUsd?: number | null;
+  brokerMinDistanceUsd?: number;
   config?: DynamicProtectionConfig;
 }): InitialDynamicLevels {
   const config = input.config ?? dynamicProtectionConfig();
   const base = dynamicDistances(input.atrM1, input.spreadUsd, config);
-  const structural = Number(input.structuralDistanceUsd);
-  const structuralDistanceUsd = Number.isFinite(structural) && structural > 0 ? structural : 0;
-  const requiredSlDistanceUsd = Math.max(base.requiredSlDistanceUsd, structuralDistanceUsd);
+  const empty = (rejectReason: DynamicRejectReason): InitialDynamicLevels => ({
+    valid: false,
+    rejectReason,
+    requiredSlDistanceUsd: base.requiredSlDistanceUsd,
+    slDistanceUsd: null,
+    tpDistanceUsd: base.tpDistanceUsd,
+    trailDistanceUsd: base.trailDistanceUsd,
+    stopLoss: null,
+    takeProfit: null,
+  });
 
+  if (!Number.isFinite(input.entry) || input.entry <= 0) return empty("invalid_market_data");
+  if (!base.valid) return empty(base.rejectReason!);
+
+  const structuralRaw = input.structuralDistanceUsd;
+  if (structuralRaw !== undefined && structuralRaw !== null
+    && (!Number.isFinite(structuralRaw) || structuralRaw < 0)) return empty("invalid_market_data");
+  const structuralDistanceUsd = structuralRaw ?? 0;
+
+  const brokerMinRaw = input.brokerMinDistanceUsd ?? 0;
+  if (!Number.isFinite(brokerMinRaw) || brokerMinRaw < 0) return empty("invalid_market_data");
+
+  const requiredSlDistanceUsd = Math.max(base.requiredSlDistanceUsd!, structuralDistanceUsd, brokerMinRaw);
   if (requiredSlDistanceUsd > config.slMaxUsd) {
     return {
-      valid: false,
-      rejectReason: "sl_distance_above_max",
+      ...empty("sl_distance_above_max"),
       requiredSlDistanceUsd,
-      slDistanceUsd: requiredSlDistanceUsd,
-      tpDistanceUsd: base.tpDistanceUsd,
-      trailDistanceUsd: base.trailDistanceUsd,
-      stopLoss: null,
-      takeProfit: null,
+    };
+  }
+
+  const tpDistanceUsd = Math.max(base.tpDistanceUsd!, brokerMinRaw);
+  if (tpDistanceUsd > config.tpMaxUsd) {
+    return {
+      ...empty("tp_distance_above_max"),
+      requiredSlDistanceUsd,
+      tpDistanceUsd,
     };
   }
 
@@ -121,36 +192,29 @@ export function initialDynamicLevels(input: {
     ? input.entry - requiredSlDistanceUsd
     : input.entry + requiredSlDistanceUsd;
   const takeProfit = input.direction === "BUY"
-    ? input.entry + base.tpDistanceUsd
-    : input.entry - base.tpDistanceUsd;
+    ? input.entry + tpDistanceUsd
+    : input.entry - tpDistanceUsd;
 
   return {
     valid: true,
     rejectReason: null,
     requiredSlDistanceUsd,
     slDistanceUsd: requiredSlDistanceUsd,
-    tpDistanceUsd: base.tpDistanceUsd,
+    tpDistanceUsd,
     trailDistanceUsd: base.trailDistanceUsd,
     stopLoss,
     takeProfit,
   };
 }
 
-export type DynamicStopAction = {
-  kind: "trail";
-  stopLoss: number;
-};
+export type DynamicStopAction =
+  | { kind: "trail"; stopLoss: number }
+  | { kind: "hold"; stopLoss: number; reason: "invalid_market_data" | "invalid_config" | "not_improved" };
 
 /**
- * Paper/backtest-only dynamic SL model with NO minimum profit objective.
- *
- * The SL is recalculated on every price update from ATR M1 + spread and can tighten immediately.
- * It never loosens: a BUY stop can only move upward; a SELL stop can only move downward.
- * There is no +2 EUR / +3 EUR activation threshold and no fixed profit target required before
- * protection begins. If the computed trailing level is not better than the existing SL, it stays put.
- *
- * Deliberately this function does not return or alter takeProfit: TP is fixed at the level calculated
- * at entry, so a favourable move cannot keep pushing the target farther away.
+ * Paper/backtest-only dynamic SL with no minimum profit objective.
+ * The SL can tighten immediately and never loosens. TP is deliberately absent from this function:
+ * it remains fixed at the code-calculated entry level.
  */
 export function dynamicProfitProtection(input: {
   direction: TradeDirection;
@@ -159,18 +223,38 @@ export function dynamicProfitProtection(input: {
   currentStopLoss: number;
   atrM1: number;
   spreadUsd: number;
+  brokerMinDistanceUsd?: number;
+  minImprovementUsd?: number;
   config?: DynamicProtectionConfig;
 }): DynamicStopAction {
   const config = input.config ?? dynamicProtectionConfig();
-  const { trailDistanceUsd } = dynamicDistances(input.atrM1, input.spreadUsd, config);
+  const distances = dynamicDistances(input.atrM1, input.spreadUsd, config);
+  if (!distances.valid) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: distances.rejectReason! };
+  }
+  if (![input.entry, input.currentPrice, input.currentStopLoss].every(Number.isFinite)
+    || input.entry <= 0 || input.currentPrice <= 0 || input.currentStopLoss <= 0) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
+  }
 
+  const brokerMinRaw = input.brokerMinDistanceUsd ?? 0;
+  const minImprovementRaw = input.minImprovementUsd ?? 0.01;
+  if (!Number.isFinite(brokerMinRaw) || brokerMinRaw < 0
+    || !Number.isFinite(minImprovementRaw) || minImprovementRaw < 0) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "invalid_market_data" };
+  }
+
+  const trailDistanceUsd = Math.max(distances.trailDistanceUsd!, brokerMinRaw);
   const candidate = input.direction === "BUY"
     ? input.currentPrice - trailDistanceUsd
     : input.currentPrice + trailDistanceUsd;
+  const improvement = input.direction === "BUY"
+    ? candidate - input.currentStopLoss
+    : input.currentStopLoss - candidate;
 
-  const next = input.direction === "BUY"
-    ? Math.max(input.currentStopLoss, candidate)
-    : Math.min(input.currentStopLoss, candidate);
+  if (improvement < minImprovementRaw) {
+    return { kind: "hold", stopLoss: input.currentStopLoss, reason: "not_improved" };
+  }
 
-  return { kind: "trail", stopLoss: next };
+  return { kind: "trail", stopLoss: candidate };
 }
