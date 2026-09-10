@@ -14,6 +14,7 @@ import { lots } from "../src/lib/server/tradingConfig";
 import { getSessionStatus, sessionConfigFromEnv } from "../src/lib/session";
 import { watchdogClosePosition, watchdogPositions, type WatchdogPosition } from "../src/lib/server/watchdogMetaApi";
 import { effectiveQuoteAgeSec } from "../src/lib/server/staleQuoteGuard";
+import { parseWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
 
 const ALERT_INTERVAL_MS = 30 * 60_000;
 const STALE_QUOTE_ALERT_INTERVAL_MS = 10 * 60_000;
@@ -245,6 +246,7 @@ async function main() {
   const sessionAgeSec = Number.isFinite(sessionStartAtMs)
     ? Math.max(0, Math.floor((nowMs - sessionStartAtMs) / 1000))
     : null;
+  const heartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
   const detail = parsedObject(settings.get("stream_worker_detail"));
   const detailAgeRaw = Number(detail?.quoteAgeSec);
   const detailAgeSec = Number.isFinite(detailAgeRaw) && detailAgeRaw >= 0
@@ -258,7 +260,10 @@ async function main() {
     Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : null,
     Number.isFinite(sessionStartAtMs) ? sessionStartAtMs : nowMs,
   );
-  const quoteAges = [detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
+  const heartbeatQuoteAgeSec = heartbeat.quoteAgeSec === null
+    ? null
+    : sessionAgeSec === null ? heartbeat.quoteAgeSec : Math.min(heartbeat.quoteAgeSec, sessionAgeSec);
+  const quoteAges = [heartbeatQuoteAgeSec, detailAgeSec, storedAgeSec].filter((value): value is number => value !== null);
   const quoteAgeSec = quoteAges.length > 0 ? Math.max(...quoteAges) : null;
 
   if (sessionStatus.inside && quoteAgeSec !== null && quoteAgeSec > STALE_QUOTE_SEC) {
@@ -286,9 +291,8 @@ async function main() {
     }
   }
 
-  const heartbeat = settings.get("stream_worker_heartbeat");
-  const heartbeatMs = heartbeat ? Date.parse(heartbeat) : Number.NaN;
-  const ageSec = Number.isFinite(heartbeatMs) ? Math.max(0, Math.floor((Date.now() - heartbeatMs) / 1000)) : null;
+  const heartbeatMs = heartbeat.atMs ?? Number.NaN;
+  const ageSec = heartbeat.atMs !== null ? Math.max(0, Math.floor((Date.now() - heartbeat.atMs) / 1000)) : null;
 
   if (ageSec !== null && ageSec <= maxAgeSec) {
     console.log("[scalper-watchdog] worker vivo", { ageSec });

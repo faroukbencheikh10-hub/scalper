@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { ensureSchema, getSettings } from "@/lib/server/db";
+import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
 
 export const dynamic = "force-dynamic";
 
@@ -11,14 +12,13 @@ export async function GET() {
     const settings = await getSettings(["stream_worker_heartbeat", "stream_worker_status", "system_stop"]);
     const status = settings.get("stream_worker_status") ?? "not_started";
     const stopped = settings.get("system_stop") === "true";
-    const heartbeat = settings.get("stream_worker_heartbeat");
-    const heartbeatMs = heartbeat ? Date.parse(heartbeat) : Number.NaN;
-    const heartbeatAgeSec = Number.isFinite(heartbeatMs)
-      ? Math.max(0, Math.floor((Date.now() - heartbeatMs) / 1000))
+    const heartbeat = parseWorkerHeartbeat(settings.get("stream_worker_heartbeat"));
+    const heartbeatAgeSec = heartbeat.atMs !== null
+      ? Math.max(0, Math.floor((Date.now() - heartbeat.atMs) / 1000))
       : null;
 
     if (stopped || (heartbeatAgeSec !== null && heartbeatAgeSec < MAX_HEARTBEAT_AGE_SEC)) {
-      return NextResponse.json({ ok: true, heartbeatAgeSec, status, systemStopped: stopped });
+      return NextResponse.json({ ok: true, heartbeatAgeSec, quoteAgeSec: heartbeat.quoteAgeSec, status, systemStopped: stopped });
     }
 
     return NextResponse.json({
@@ -27,6 +27,7 @@ export async function GET() {
         ? "heartbeat worker assente"
         : `heartbeat worker vecchio di ${heartbeatAgeSec} s (max ${MAX_HEARTBEAT_AGE_SEC} s)`,
       heartbeatAgeSec,
+      quoteAgeSec: heartbeat.quoteAgeSec,
       status,
     }, { status: 503 });
   } catch (err) {

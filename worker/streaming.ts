@@ -14,6 +14,7 @@ import {
 } from "../src/lib/server/positionManager";
 import { riskPerLot } from "../src/lib/server/orderSafety";
 import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
+import { encodeWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
 import { setupLabel } from "../src/lib/setups";
 import { executeStreaming, reserveStreamingSignal, syncStreamingExecutor, type StreamingConnectionLike } from "../src/lib/server/streamingExecutor";
 import type { Candle, Quote, ScalperSignal, SetupEvaluation } from "../src/lib/types";
@@ -90,9 +91,10 @@ async function seedCandles(m1Max: number, m5Max: number) {
 }
 
 async function markWorker(status: string, extra?: Record<string, unknown>) {
+  const now = new Date();
   await Promise.all([
     setSetting("stream_worker_status", status),
-    setSetting("stream_worker_heartbeat", new Date().toISOString()),
+    setSetting("stream_worker_heartbeat", encodeWorkerHeartbeat(now, extra?.quoteAgeSec)),
     extra ? setSetting("stream_worker_detail", JSON.stringify(extra)) : Promise.resolve(),
   ]);
 }
