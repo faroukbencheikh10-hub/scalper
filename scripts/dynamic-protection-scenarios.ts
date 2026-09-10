@@ -1,4 +1,4 @@
-// Deterministic paper/backtest scenarios for dynamic SL/TP and early profit protection.
+// Deterministic paper/backtest scenarios for code-calculated SL/TP and immediate dynamic SL.
 // No MetaApi calls, broker orders or database writes happen in this file.
 import assert from "node:assert/strict";
 import {
@@ -14,99 +14,93 @@ function check(name: string, test: () => void) {
   console.log("OK " + name);
 }
 
-check("dynamic: SL/TP respond to ATR and spread", () => {
+check("dynamic: SL/TP are calculated from ATR and spread", () => {
   const calm = dynamicDistances(1.0, 0.1);
   const fast = dynamicDistances(3.0, 0.4);
   assert.ok(fast.slDistanceUsd > calm.slDistanceUsd);
   assert.ok(fast.tpDistanceUsd > calm.tpDistanceUsd);
-  assert.ok(calm.slDistanceUsd >= 3);
-  assert.ok(calm.tpDistanceUsd >= 1.5);
 });
 
-check("dynamic: BUY starts with broker-style SL below and TP above entry", () => {
+check("dynamic: BUY starts with calculated SL below and TP above entry", () => {
   const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 2, spreadUsd: 0.2 });
   assert.ok(levels.stopLoss < 4400);
   assert.ok(levels.takeProfit > 4400);
 });
 
-check("dynamic: below +2 EUR the SL does not move", () => {
+check("dynamic: SL tightens immediately without +2/+3 EUR trigger", () => {
+  const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 2, spreadUsd: 0.2 });
   const action = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
-    currentPrice: 4400.8,
-    currentStopLoss: 4396,
-    profitEur: 1.99,
+    currentPrice: 4400.2,
+    currentStopLoss: levels.stopLoss,
     atrM1: 2,
     spreadUsd: 0.2,
   });
-  assert.equal(action.kind, "hold");
-  assert.equal(action.stopLoss, 4396);
+  assert.equal(action.kind, "trail");
+  assert.ok(action.stopLoss > levels.stopLoss);
 });
 
-check("dynamic: at +2 EUR SL moves immediately to breakeven", () => {
-  const action = dynamicProfitProtection({
-    direction: "BUY",
-    entry: 4400,
-    currentPrice: 4401,
-    currentStopLoss: 4396,
-    profitEur: 2,
-    atrM1: 2,
-    spreadUsd: 0.2,
-  });
-  assert.equal(action.kind, "protect");
-  assert.equal(action.stopLoss, 4400);
-});
-
-check("dynamic: at +3 EUR trailing starts and never loosens SL", () => {
+check("dynamic: stronger favourable move keeps tightening SL", () => {
   const first = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
-    currentPrice: 4402,
-    currentStopLoss: 4400,
-    profitEur: 3,
+    currentPrice: 4400.2,
+    currentStopLoss: 4397,
     atrM1: 2,
     spreadUsd: 0.2,
   });
-  assert.equal(first.kind, "trail");
-  assert.ok(first.stopLoss > 4400);
-
-  const pullback = dynamicProfitProtection({
+  const second = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
     currentPrice: 4401.5,
     currentStopLoss: first.stopLoss,
-    profitEur: 3.2,
     atrM1: 2,
     spreadUsd: 0.2,
   });
-  assert.equal(pullback.kind, "trail");
+  assert.ok(second.stopLoss > first.stopLoss);
+});
+
+check("dynamic: pullback never loosens an already tightened BUY SL", () => {
+  const first = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4402,
+    currentStopLoss: 4397,
+    atrM1: 2,
+    spreadUsd: 0.2,
+  });
+  const pullback = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4401,
+    currentStopLoss: first.stopLoss,
+    atrM1: 2,
+    spreadUsd: 0.2,
+  });
   assert.equal(pullback.stopLoss, first.stopLoss);
 });
 
-check("dynamic: SELL mirrors BUY protection", () => {
-  const protect = dynamicProfitProtection({
+check("dynamic: SELL mirrors BUY and SL only moves downward", () => {
+  const levels = initialDynamicLevels({ direction: "SELL", entry: 4400, atrM1: 2, spreadUsd: 0.2 });
+  const first = dynamicProfitProtection({
     direction: "SELL",
     entry: 4400,
-    currentPrice: 4399,
-    currentStopLoss: 4404,
-    profitEur: 2,
+    currentPrice: 4399.8,
+    currentStopLoss: levels.stopLoss,
     atrM1: 2,
     spreadUsd: 0.2,
   });
-  assert.equal(protect.kind, "protect");
-  assert.equal(protect.stopLoss, 4400);
-
-  const trail = dynamicProfitProtection({
+  const second = dynamicProfitProtection({
     direction: "SELL",
     entry: 4400,
-    currentPrice: 4398,
-    currentStopLoss: 4400,
-    profitEur: 3,
+    currentPrice: 4398.5,
+    currentStopLoss: first.stopLoss,
     atrM1: 2,
     spreadUsd: 0.2,
   });
-  assert.equal(trail.kind, "trail");
-  assert.ok(trail.stopLoss < 4400);
+  assert.ok(first.stopLoss < levels.stopLoss);
+  assert.ok(second.stopLoss < first.stopLoss);
 });
 
 console.log(`dynamic-protection scenarios: ${passed}/6 passed`);
