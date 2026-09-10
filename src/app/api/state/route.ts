@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { dbQuery, ensureSchema } from "@/lib/server/db";
 import { lotsMax, lotsMin, resolveLots } from "@/lib/server/tradingConfig";
+import { dynamicProtectionConfig } from "@/lib/server/dynamicProtection";
 import { EXEC_LOTS_SETTING_KEY, LOT_CHOICES } from "@/lib/lots";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
 import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
@@ -88,6 +89,7 @@ export async function GET() {
     const errorIsCurrent = Boolean(parsedError?.atMs !== null && parsedError?.atMs !== undefined && (!Number.isFinite(heartbeatMs) || parsedError.atMs > heartbeatMs));
     const st = stats.rows[0] ?? {};
     const wins = Number(st.wins ?? 0), losses = Number(st.losses ?? 0), decided = wins + losses;
+    const dynamicProtection = dynamicProtectionConfig();
 
     return NextResponse.json({
       ok: true,
@@ -119,6 +121,21 @@ export async function GET() {
       lotsMax: lotsMax(),
       lotChoices: LOT_CHOICES,
       account: workerDetail?.account ?? null,
+      dynamicProtection: {
+        source: "ATR M1 + spread",
+        trailing: "immediate",
+        profitTrigger: null,
+        slAtrMult: dynamicProtection.slAtrMult,
+        slMinUsd: dynamicProtection.slMinUsd,
+        slMaxUsd: dynamicProtection.slMaxUsd,
+        tpAtrMult: dynamicProtection.tpAtrMult,
+        tpMinUsd: dynamicProtection.tpMinUsd,
+        tpMaxUsd: dynamicProtection.tpMaxUsd,
+        spreadMult: dynamicProtection.spreadMult,
+        trailAtrMult: dynamicProtection.trailAtrMult,
+        trailMinUsd: dynamicProtection.trailMinUsd,
+        trailMaxUsd: dynamicProtection.trailMaxUsd,
+      },
       results: { total: Number(st.total ?? 0), wins, losses, breakeven: Number(st.breakeven ?? 0), winRate: decided > 0 ? Number(((wins / decided) * 100).toFixed(1)) : 0, profit: Number(st.profit ?? 0), resultR: Number(st.result_r ?? 0), last: lastClosed.rows[0] ?? null },
       stream: { status: workerStatus, heartbeat: workerHeartbeat.at, heartbeatData: { at: workerHeartbeat.at, quoteAgeSec: workerHeartbeat.quoteAgeSec }, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },
       signals: signals.rows,
