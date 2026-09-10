@@ -202,11 +202,11 @@ check("dynamic: pullback never loosens an already tightened BUY SL", () => {
   assert.equal(pullback.stopLoss, first.stopLoss);
 });
 
-check("dynamic: adaptive threshold suppresses micro updates", () => {
+check("dynamic: adaptive threshold suppresses a small positive SL improvement", () => {
   const action = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
-    currentPrice: 4400.83,
+    currentPrice: 4401.35,
     currentStopLoss: 4400.1,
     atrM1: 2,
     spreadUsd: 0.4,
