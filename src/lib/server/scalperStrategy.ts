@@ -64,12 +64,17 @@ export function plannedEntryValid(signal: ScalperSignal, quote: Quote) {
   const risk = signed(signal.direction, entry - signal.stopLoss);
   const reward = signed(signal.direction, signal.takeProfit - entry);
   const cost = signal.slPlan.estimatedCostPrice ?? 0;
-  return risk > 0 && risk <= signal.slPlan.maxUsd + 0.011
-    && (reward - cost) / (risk + cost) >= (signal.slPlan.minNetR ?? 1.5);
+  if (!(risk > 0 && reward > 0 && risk <= signal.slPlan.maxUsd + 0.011)) return false;
+  if (signal.slPlan.tpMaxUsd !== undefined && reward > signal.slPlan.tpMaxUsd + 0.011) return false;
+  // Setup con TP fisso e indipendente dallo SL (m1_short): nessun vincolo di R:R netto.
+  if (signal.slPlan.minNetR === undefined) return true;
+  return (reward - cost) / (risk + cost) >= signal.slPlan.minNetR;
 }
 
+type EvaluateInput = { quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number };
+
 /** Pure evaluation: a preview or failed preflight never consumes a setup. */
-export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number }): ScalperSignal {
+function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
   const { quote } = input;
   const nowMs = input.nowMs ?? Date.now();
   const quoteMaxAge = env("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);
@@ -233,4 +238,120 @@ export function evaluateScalper(input: { quote: Quote; m1: Candle[]; m5: Candle[
         + " Setup " + key + ". [shadow-score:" + score + "]" };
   }
   return reject("M15 " + d + ": attendo un pullback/retest M5 valido con spazio fino al prossimo ostacolo.", evaluations.length ? evaluations : undefined);
+}
+
+export const SHORT_STRATEGY_VERSION = "m1-short-v1";
+
+function shortEnabled() {
+  const raw = process.env.SHORT_ENABLED?.trim().toLowerCase();
+  return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
+}
+
+/** Blocchi comuni ai due setup: senza questi non si valuta niente, ne' mtf ne' m1_short. */
+function commonPreflight(input: EvaluateInput, nowMs: number): ScalperSignal | null {
+  const { quote } = input;
+  const quoteMaxAge = env("SCALPER_FINAL_QUOTE_MAX_AGE_MS", 2000, 250, 10_000);
+  if (!Number.isFinite(nowMs) || quote.quotedAt === null || !Number.isFinite(quote.quotedAt)
+    || nowMs - quote.quotedAt > quoteMaxAge || quote.quotedAt > nowMs + 500
+    || ![quote.bid, quote.ask, quote.mid, quote.spread].every(Number.isFinite)
+    || quote.bid <= 0 || quote.ask < quote.bid || quote.spread < 0) return reject("Quote assente, vecchia o non valida.");
+  const spread = quote.ask - quote.bid;
+  if (spread > env("SCALPER_MAX_SPREAD", 1.2, 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
+  const sessionConfig = sessionConfigFromEnv();
+  if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
+  const session = getSessionStatus(new Date(nowMs), sessionConfig);
+  if (!session.inside || session.inFlattenWindow) return reject(session.blockReason ?? "Fuori sessione.");
+  if (!closedBars(input.m1, 1, nowMs) || !closedBars(input.m5, 5, nowMs)) return reject("Candele non valide, duplicate o fuori ordine.");
+  return null;
+}
+
+function rejectShort(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+  const evaluation: SetupEvaluation = direction
+    ? { setup: "m1_gate", status: "rejected", direction, reason }
+    : { setup: "m1_gate", status: "rejected", reason };
+  return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
+    takeProfit: null, riskReward: null, slPlan: null, reasoning: reason, evaluations: [evaluation] };
+}
+
+/**
+ * Secondo setup, valutato solo quando la mtf non produce un ordine.
+ * Rottura del range delle ultime SHORT_RANGE_BARS candele M1 nella direzione dell'EMA20 M1,
+ * SL dimensionato sull'ATR e TP fisso indipendente dallo SL. Nessun breakeven, nessun quick profit.
+ */
+function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
+  const { quote } = input;
+  const m1 = closedBars(input.m1, 1, nowMs);
+  if (!m1) return rejectShort("m1_short: candele M1 non valide.");
+  const bars = Math.floor(env("SHORT_RANGE_BARS", 8, 3, 40));
+  if (m1.length < bars + 25) return rejectShort("m1_short: storico M1 insufficiente, servono " + (bars + 25) + " candele chiuse.");
+  if (!latestBarFresh(m1, 1, nowMs, 3 * MINUTE)) return rejectShort("m1_short: ultima M1 chiusa non aggiornata.");
+
+  const atr1 = atr(m1, 14, true);
+  if (!atr1 || !(atr1 > 0)) return rejectShort("m1_short: ATR M1 non disponibile.");
+  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
+    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectShort("m1_short: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+
+  const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
+  const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
+  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) {
+    return rejectShort("m1_short: candela M1 shock, nessun inseguimento.");
+  }
+
+  const window = m1.slice(-1 - bars, -1);
+  const high = maxHigh(window), low = minLow(window);
+  const ema20 = emaCloseSeries(m1, 20).at(-1)!;
+  const slAtr = atr1 * env("SHORT_SL_ATR", 2, 0.2, 10);
+  const slMin = env("SHORT_SL_MIN_USD", 3, 0.1, 50), slMax = env("SHORT_SL_MAX_USD", 8, 0.1, 100);
+  const tpAtr = atr1 * env("SHORT_TP_ATR", 0.6, 0.05, 10);
+  const tpMin = env("SHORT_TP_MIN_USD", 1.5, 0.1, 50), tpMax = env("SHORT_TP_MAX_USD", 3, 0.1, 100);
+  const plannedRisk = Math.max(slAtr, slMin), plannedReward = Math.min(Math.max(tpAtr, tpMin), tpMax);
+  const detail = "range " + bars + " M1 " + low.toFixed(2) + "-" + high.toFixed(2)
+    + ", chiusura " + trigger.close.toFixed(2) + ", EMA20 M1 " + ema20.toFixed(2)
+    + ", ATR M1 " + atr1.toFixed(2) + "$, SL " + plannedRisk.toFixed(2) + "$, TP " + plannedReward.toFixed(2) + "$";
+
+  const brokeUp = trigger.close > high, brokeDown = trigger.close < low;
+  if (!brokeUp && !brokeDown) return rejectShort("m1_short: chiusura M1 dentro il range (" + detail + ").");
+  const direction: "BUY" | "SELL" = brokeUp ? "BUY" : "SELL";
+  if (direction === "BUY" ? trigger.close <= ema20 : trigger.close >= ema20) {
+    return rejectShort("m1_short: rottura " + direction + " contro l'EMA20 M1 (" + detail + ").", direction);
+  }
+  if (slAtr > slMax) {
+    return rejectShort("m1_short: SL richiesto " + slAtr.toFixed(2) + "$ oltre il massimo " + slMax.toFixed(2) + "$ (" + detail + ").", direction);
+  }
+
+  const entry = direction === "BUY" ? quote.ask : quote.bid;
+  const sl = direction === "BUY" ? Math.floor((entry - plannedRisk) * 100) / 100 : Math.ceil((entry + plannedRisk) * 100) / 100;
+  const tp = direction === "BUY" ? Math.floor((entry + plannedReward) * 100) / 100 : Math.ceil((entry - plannedReward) * 100) / 100;
+  const risk = Math.abs(entry - sl), reward = signed(direction, tp - entry);
+  if (!(risk > 0 && reward > 0) || risk > slMax + 0.011) {
+    return rejectShort("m1_short: SL/TP non validi al prezzo corrente (" + detail + ").", direction);
+  }
+  const rr = reward / risk;
+  const score = Math.min(95, Math.round(55 + body(trigger) * 20 + Math.min(1, Math.abs(trigger.close - (direction === "BUY" ? high : low)) / atr1) * 15));
+  const reason = "m1_short " + direction + ": rottura di " + (direction === "BUY" ? high.toFixed(2) : low.toFixed(2)) + " (" + detail + ").";
+  return {
+    direction, setup: "m1_short",
+    setupKey: [SHORT_STRATEGY_VERSION, direction, trigger.datetime].join(":"),
+    entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
+    slPlan: { structural: Number(slAtr.toFixed(2)), atr: Number(slAtr.toFixed(2)), applied: Number(risk.toFixed(2)),
+      minUsd: slMin, maxUsd: slMax, rr: Number(rr.toFixed(2)), tpMinUsd: tpMin, tpMaxUsd: tpMax },
+    evaluations: [{ setup: "m1_gate", status: "triggered", direction, reason }],
+    reasoning: SHORT_STRATEGY_VERSION + ": " + reason + " SL " + risk.toFixed(2) + "$, TP " + reward.toFixed(2)
+      + "$ (" + rr.toFixed(2) + "R), TP indipendente dallo SL. [shadow-score:" + score + "]",
+  };
+}
+
+/**
+ * Priorità: mtf-continuation-v1 e, solo se non produce un ordine, m1_short.
+ * Le valutazioni dei due contesti viaggiano insieme in stream_last_decision.
+ */
+export function evaluateScalper(input: EvaluateInput): ScalperSignal {
+  const nowMs = input.nowMs ?? Date.now();
+  const blocked = commonPreflight(input, nowMs);
+  if (blocked) return blocked;
+  const mtf = evaluateMtfContinuation(input);
+  if (mtf.direction !== "NO_TRADE" || !shortEnabled()) return mtf;
+  const short = evaluateM1Short(input, nowMs);
+  const evaluations = [...mtf.evaluations, ...short.evaluations];
+  return short.direction === "NO_TRADE" ? { ...mtf, evaluations } : { ...short, evaluations };
 }

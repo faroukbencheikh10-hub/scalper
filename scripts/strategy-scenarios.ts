@@ -7,9 +7,19 @@ import type { Candle } from "../src/lib/types";
 
 // Isolate test configuration from deployment/local env.
 for (const key of Object.keys(process.env)) {
-  if (/^(MTF_|SCALPER_|SL_|SHOCK_|M15_)/.test(key)) delete process.env[key];
+  if (/^(MTF_|SCALPER_|SL_|SHOCK_|M15_|SHORT_)/.test(key)) delete process.env[key];
 }
 process.env.SCALPER_HOURS_UTC = "00:00-23:59";
+// Gli scenari mtf girano con il secondo setup spento: ognuno verifica una strategia sola.
+process.env.SHORT_ENABLED = "false";
+function withShort(env: Record<string, string>, test: () => void) {
+  const previous = new Map(Object.keys(env).concat("SHORT_ENABLED").map(k => [k, process.env[k]]));
+  process.env.SHORT_ENABLED = "true";
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  try { test(); } finally {
+    for (const [k, v] of previous) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
 const nowMs = Date.UTC(2026, 8, 9, 10, 6, 1);
 const bar = (ms: number, open: number, close: number, wick = 0.3): Candle => ({
   datetime: new Date(ms).toISOString(), open, close,
@@ -234,5 +244,102 @@ check("Risk uses broker tick value rather than assuming EUR equals USD", () => {
 check("Pivot needs closed candles on both sides", () => {
   const bars = [bar(0, 10, 10), bar(MINUTE, 11, 11), bar(2 * MINUTE, 20, 20)];
   assert.equal(swingLevels(bars, "BUY").length, 0);
+});
+// --- m1_short: secondo setup, valutato solo quando la mtf non produce un ordine ---
+// M5 piatte => contesto M15 in range vero => la mtf non entra mai in questi scenari.
+function shortInput(options: { drift?: number; flatBars?: number; breakout?: number } = {}) {
+  const base = fixture();
+  const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
+  const drift = options.drift ?? 0, flatBars = options.flatBars ?? total - 1, breakout = options.breakout ?? 1.8;
+  const driftBars = total - 1 - flatBars;
+  const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
+  const m1: Candle[] = [];
+  let level = 2200 - driftBars * drift;
+  for (let i = 0; i < total - 1; i++) {
+    if (i < driftBars) level += drift;
+    const up = i % 2 === 0;
+    m1.push(bar(end - (total - 1 - i) * MINUTE, up ? level - 0.5 : level + 0.5, up ? level + 0.5 : level - 0.5, 0.2));
+  }
+  const previous = m1.at(-1)!.close;
+  m1.push(bar(end, previous, previous + breakout, 0.15));
+  const bid = m1.at(-1)!.close + 0.02;
+  return { nowMs: base.nowMs, m1, m5, quote: { bid, ask: bid + 0.12, mid: bid + 0.06, spread: 0.12, quotedAt: base.nowMs } };
+}
+check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla", () => {
+  withShort({}, () => {
+    const input = shortInput();
+    const s = evaluateScalper(input);
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.equal(s.setup, "m1_short");
+    assert.ok(s.setupKey?.startsWith("m1-short-v1:BUY:"), s.setupKey ?? "");
+    // Le due valutazioni convivono: contesto mtf scartato + m1_gate con i numeri.
+    assert.deepEqual(s.evaluations.map(e => e.setup), ["filtri", "m1_gate"]);
+    const gate = s.evaluations.at(-1)!;
+    assert.equal(gate.status, "triggered");
+    assert.match(gate.reason, /range 8 M1 \d+\.\d\d-\d+\.\d\d/);
+    assert.match(gate.reason, /EMA20 M1 \d+\.\d\d/);
+    assert.match(gate.reason, /ATR M1 \d+\.\d\d\$, SL \d+\.\d\d\$, TP \d+\.\d\d\$/);
+    // SL = 2 x ATR con minimo 3$, TP = 0.6 x ATR con minimo 1.5$, indipendente dallo SL.
+    const atrM1 = s.slPlan!.atr / 2;
+    assert.ok(Math.abs(s.stopLoss! - (s.entry! - Math.max(2 * atrM1, 3))) <= 0.011, JSON.stringify(s.slPlan));
+    assert.ok(Math.abs(s.takeProfit! - (s.entry! + Math.min(Math.max(0.6 * atrM1, 1.5), 3))) <= 0.011, JSON.stringify(s.slPlan));
+    assert.ok(s.riskReward! < 1, "il TP e' piu' vicino dello SL per costruzione");
+    assert.ok(plannedEntryValid(s, input.quote), "il piano deve restare valido al preflight finale");
+  });
+});
+check("La mtf ha la precedenza sul m1_short", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(fixture());
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.equal(s.setup, "micro_pullback");
+    assert.ok(!s.evaluations.some(e => e.setup === "m1_gate"), "m1_short non viene valutato se la mtf entra");
+  });
+});
+check("SHORT_ENABLED=false lascia solo la mtf", () => {
+  const s = evaluateScalper(shortInput());
+  assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+  assert.ok(!s.evaluations.some(e => e.setup === "m1_gate"));
+});
+check("m1_short: rottura contro l'EMA20 M1 scartata", () => {
+  withShort({}, () => {
+    // Serie in discesa: l'EMA20 resta sopra, il rimbalzo rompe il range ma non la direzione.
+    const s = evaluateScalper(shortInput({ drift: 1, flatBars: 13, breakout: -1.5 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    const gate = s.evaluations.find(e => e.setup === "m1_gate");
+    assert.match(gate!.reason, /contro l'EMA20 M1/);
+  });
+});
+check("m1_short: SL oltre il massimo scarta il trade", () => {
+  withShort({ SHORT_SL_ATR: "10" }, () => {
+    const s = evaluateScalper(shortInput());
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    const gate = s.evaluations.find(e => e.setup === "m1_gate");
+    assert.match(gate!.reason, /oltre il massimo 8\.00\$/);
+  });
+});
+check("m1_short: il TP resta dentro i limiti indipendentemente dallo SL", () => {
+  withShort({ SHORT_TP_ATR: "5" }, () => {
+    const s = evaluateScalper(shortInput());
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.ok(Math.abs(s.takeProfit! - (s.entry! + 3)) <= 0.011, JSON.stringify(s));
+  });
+  withShort({ SHORT_TP_ATR: "0.01", SHORT_TP_MIN_USD: "1.5" }, () => {
+    const s = evaluateScalper(shortInput());
+    assert.ok(Math.abs(s.takeProfit! - (s.entry! + 1.5)) <= 0.011, JSON.stringify(s));
+  });
+});
+check("m1_short: chiusura dentro il range non entra", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput({ breakout: 0.2 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "m1_gate")!.reason, /dentro il range/);
+  });
+});
+check("m1_short: candela shock esclusa come nella mtf", () => {
+  withShort({}, () => {
+    const s = evaluateScalper(shortInput({ breakout: 12 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "m1_gate")!.reason, /shock/);
+  });
 });
 console.log(passed + " scenari superati.");

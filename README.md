@@ -11,6 +11,17 @@ Progetto standalone XAUUSD, completamente separato da `soldi-trend`.
 
 Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto come fallback opzionale.
 
+## Due setup in cascata
+
+A ogni tick viene valutata prima la strategia **mtf-continuation-v1** (M15 → M5 → M1, descritta sotto). Se produce un ordine si usa quello. Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda soltanto l'M1:
+
+- **Entry:** chiusura M1 fuori dal range delle ultime `SHORT_RANGE_BARS` (8) candele M1, nella direzione dell'EMA20 M1 — chiusura sopra l'EMA20 solo BUY, sotto solo SELL.
+- **SL:** `SHORT_SL_ATR` (2.0) × ATR M1, alzato a `SHORT_SL_MIN_USD` (3$); se la distanza richiesta supera `SHORT_SL_MAX_USD` (8$) il trade viene **scartato**, non stretto.
+- **TP:** `SHORT_TP_ATR` (0.6) × ATR M1 dentro `SHORT_TP_MIN_USD`–`SHORT_TP_MAX_USD` (1.5–3$), **indipendente dallo SL**: il rapporto R:R è quindi minore di 1 per costruzione. Nessun breakeven e nessun quick profit.
+- **Comuni alla mtf e invariati:** spread massimo, candela shock, ATR M1 dentro i limiti, pausa re-entry 120 s, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, una sola posizione aperta, flatten di fine sessione, STOP, watchdog, Telegram e lotti da `exec_lots` senza cap di rischio.
+- I suoi trade finiscono con `setup = "m1_short"` in `scalper_signals` e in `trades`; la valutazione con i numeri (range, EMA20, ATR, SL, TP) compare in `stream_last_decision.evaluations` come voce `m1_gate`, accanto a `m15_gate`, e la card **Setup valutati** della dashboard mostra entrambe.
+- `SHORT_ENABLED=false` lascia attiva solo la mtf.
+
 ## Strategia M15 / M5 / M1
 
 Versione: `mtf-continuation-v1`. Una sola strategia di continuazione, simmetrica BUY/SELL. Il worker decide ed esegue; le API web fanno soltanto analisi e controllo.
@@ -41,6 +52,12 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `M15_RANGE_BAND_ATR` | 3.0 | Banda 12 M15 (in ATR15) sotto cui è range vero |
 | `M15_RANGE_EDGE` | 0.15 | Margine dai bordi della banda per dire "prezzo dentro" |
 | `M15_BIAS_M5_BARS` | 20 | Candele M5 confrontate per la struttura HH/HL o LL/LH |
+| `SHORT_ENABLED` | true | Abilita il secondo setup `m1_short` |
+| `SHORT_RANGE_BARS` | 8 | Candele M1 del range da rompere |
+| `SHORT_SL_ATR` | 2.0 | SL del m1_short in ATR M1 |
+| `SHORT_SL_MIN_USD` / `SHORT_SL_MAX_USD` | 3.0 / 8.0 | SL alzato al minimo; oltre il massimo il trade viene scartato |
+| `SHORT_TP_ATR` | 0.6 | TP del m1_short in ATR M1 |
+| `SHORT_TP_MIN_USD` / `SHORT_TP_MAX_USD` | 1.5 / 3.0 | Limiti del TP, indipendenti dallo SL |
 | `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
 | `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
 | `MTF_M1_BODY_MIN` | 0.45 | Corpo minimo della conferma M1 |
@@ -141,7 +158,7 @@ STOP TUTTO richiede al worker la chiusura delle posizioni XAUUSD e la cancellazi
 
 ## Scenari sintetici
 
-`npm run scenarios` esegue scenari deterministici offline per BUY/SELL, M15 in range, M5 pullback/retest, conferma M1, dati mancanti, costi, stop, ripetizione dei preflight, recupero ordini e rischio con tick value. Non chiama MetaApi né il database.
+`npm run scenarios` esegue scenari deterministici offline (mtf con `SHORT_ENABLED=false`, più un blocco dedicato al `m1_short`) per BUY/SELL, M15 in range, M5 pullback/retest, conferma M1, dati mancanti, costi, stop, ripetizione dei preflight, recupero ordini e rischio con tick value. Non chiama MetaApi né il database.
 
 ## Avvio web
 
