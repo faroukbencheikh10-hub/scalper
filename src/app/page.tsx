@@ -8,7 +8,9 @@ type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
 type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
-/** Piano di uscita del trade aperto: nessun TP al broker, breakeven a target1 e trailing sulla M5. */
+/** Posizione in modalita' quick: solo fill, TP quick al broker (o rifiutato) e chiusura in corso. */
+type QuickExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; tpBroker?: number | null; tpRejected?: boolean; fillPending?: boolean; closing?: { reason?: string; attempts?: number } | null };
+/** Piano di uscita del trade aperto in modalita' trailing: breakeven a target1 e trailing sulla M5. */
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
 type Decision = { at?: string; direction?: string; setup?: string | null; reasoning?: string; evaluations?: SetupEvaluation[]; risk?: RiskPlan | null };
 type StreamError = { message: string; at: string | null };
@@ -45,7 +47,7 @@ type DashboardState = {
   stream?: {
     status?: string;
     heartbeat?: string | null;
-    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; managed?: ManagedExit[]; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; m15?: number } | null;
+    detail?: { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; account?: Account | null; maxOpenPositions?: number; managed?: ManagedExit[]; exitMode?: string; tpQuickUsd?: number; emergencySlUsd?: number; reEntrySec?: number; quick?: QuickExit[]; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; m1?: number; m5?: number; m15?: number } | null;
     lastDecision?: Decision | null;
     lastFlatten?: Flatten | null;
     currentError?: StreamError | null;
@@ -165,7 +167,24 @@ export default function Home() {
     : risk && !risk.managedExit && Number.isFinite(risk.tpDistance)
       ? `TP strategia · ${money(Number(risk.tpDistance))}$`
       : "—";
-  const managed = data?.stream?.detail?.managed ?? [];
+  const detail = data?.stream?.detail;
+  const exitModeQuick = (detail?.exitMode ?? "quick") === "quick";
+  const exitModeText = detail?.exitMode
+    ? exitModeQuick
+      ? `quick · TP +${money(Number(detail.tpQuickUsd))} $ · stop emergenza ${money(Number(detail.emergencySlUsd))} $ · re-entry ${detail.reEntrySec ?? "—"} s`
+      : "trailing · target1 → breakeven → trailing M5 · TP di sicurezza al broker"
+    : "—";
+  const quickOpen = (detail?.quick ?? [])[0] ?? null;
+  const quickDistance = quickOpen && Number.isFinite(quickOpen.openPrice) && quote
+    ? (quickOpen.direction === "BUY" ? Number(quote.bid) - Number(quickOpen.openPrice) : Number(quickOpen.openPrice) - Number(quote.ask))
+    : null;
+  const quickOpenText = quickOpen
+    ? `${quickOpen.direction ?? "—"} ${setupLabel(quickOpen.setup)} · fill ${money(Number(quickOpen.openPrice))}${quickOpen.fillPending ? " (non confermato)" : ""}`
+      + ` · TP broker ${quickOpen.tpRejected ? "rifiutato, chiude il worker" : Number.isFinite(quickOpen.tpBroker) ? money(Number(quickOpen.tpBroker)) : "—"}`
+      + `${quickDistance !== null && Number.isFinite(quickDistance) ? ` · distanza ${quickDistance >= 0 ? "+" : ""}${quickDistance.toFixed(2)} $` : ""}`
+      + `${quickOpen.closing ? ` · chiusura ${quickOpen.closing.reason} in corso (${quickOpen.closing.attempts ?? 0} tentativi)` : ""}`
+    : null;
+  const managed = detail?.managed ?? [];
   const openExit = managed[0] ?? null;
   const openExitText = openExit
     ? `SL ${money(Number(openExit.stopLoss))} · Target1 ${money(Number(openExit.target1))} raggiunto: ${openExit.target1Hit ? "sì" : "no"}`
@@ -173,7 +192,7 @@ export default function Home() {
       + ` · trailing ${openExit.trailingActive ? `attivo (${openExit.trailingUpdates ?? 0} aggiornamenti)` : "non attivo"}`
       + `${openExit.breakevenAt ? ` · breakeven ${money(Number(openExit.breakevenPrice))} alle ${formatTime(openExit.breakevenAt)}` : ""}`
       + `${openExit.fillPending ? " · fill non confermato" : ""}`
-    : "nessun trade gestito aperto";
+    : quickOpenText ?? "nessun trade gestito aperto";
   const livePrice = Number.isFinite(quote?.mid) ? Number(quote?.mid).toFixed(2) : "—";
   const results = data?.results;
   const lastResult = results?.last;
@@ -283,6 +302,7 @@ export default function Home() {
             <div><dt>Margine libero</dt><dd>{money(Number(account?.freeMargin ?? Number.NaN))}</dd></div>
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
+            <div><dt>Modalità uscita</dt><dd className="mt5-value">{exitModeText}</dd></div>
             <div><dt>SL / {targetLabel} ultimo ordine</dt><dd className="mt5-value">{slTpText}</dd></div>
             <div><dt>TP broker (sicurezza)</dt><dd className="mt5-value">{brokerTpText}</dd></div>
             <div><dt>Uscita trade aperto</dt><dd className="mt5-value">{openExitText}</dd></div>

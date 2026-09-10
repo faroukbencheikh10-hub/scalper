@@ -292,6 +292,8 @@ export function countsAsLoss(
   closeReason: string | null | undefined,
   profit?: unknown,
 ) {
+  // Modalita' quick: conta solo lo stop di emergenza del worker, qualunque sia il P&L riportato.
+  if (closeReason === "emergency") return true;
   if (outcome !== "LOSS") return false;
   const value = Number(profit);
   if (Number.isFinite(value) && value >= 0) return false;

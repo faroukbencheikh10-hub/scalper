@@ -47,7 +47,19 @@ Se nemmeno il `m1_short` produce un ordine viene valutato il terzo setup **`m1_r
 - I trade escono con `setup = "m1_range"` e la valutazione numerica (range, ATR, distanza dal bordo, SL, TP) compare come voce `range_gate` in `stream_last_decision.evaluations` e nella card **Setup valutati**.
 - `RANGE_ENABLED=false` lo spegne.
 
-### Uscita gestita di `m1_short` e `m1_range`
+### Modalità di uscita: `EXIT_MODE=quick` (super scalper, default) o `trailing`
+
+Con **`EXIT_MODE=quick`** l'ingresso resta identico (mtf → `m1_short` → `m1_range`, stessa priorità, una posizione alla volta, ingresso su tick) ma i tre setup sono solo **trigger**: l'uscita è rapida a profitto minimo e lo stop di emergenza vive solo nel codice. Tutte le soglie sono **distanze di prezzo in dollari dal fill reale** (`mt5_open_price`), non profitti in euro.
+
+- **Ordine al broker:** `takeProfit = fill ± TP_QUICK_USD` (1.5 $), calcolato sull'entry al momento dell'invio; **nessuno stop loss** (campo non inviato). Se il broker rifiuta il TP (`TRADE_RETCODE_INVALID_STOPS`), l'ordine parte comunque **senza TP**, si logga `tp_rejected` e la chiusura la fa il worker. Nessuna modifica di SL/TP dopo l'apertura: niente breakeven, niente trailing.
+- **Uscita nel worker, a ogni tick** (BID per un BUY, ASK per un SELL, distanza dal fill): (1) a favore ≥ `TP_QUICK_USD` → chiusura a mercato, `close_reason = tp_quick` (ridondante col TP del broker: serve se il TP è stato rifiutato o saltato dallo spread); (2) contraria ≥ `EMERGENCY_SL_USD` (15 $) → chiusura a mercato, `close_reason = emergency`; (3) nessun'altra chiusura automatica e nessun limite di durata. Restano flatten di fine sessione (`flatten`), tasto STOP (`stop`) e chiusura manuale (`manual`). La valutazione continua **anche fuori fascia** finché la posizione è aperta.
+- **Chiusura a mercato:** `closePosition(positionId)`, ritentata ogni 500 ms fino a 5 volte su errore/timeout MetaApi, con log `order_close_error`. Se il broker ha già chiuso (TP colpito) lo si riconosce con la logica di conferma (assenza confermata o deal in history) e `tp_quick` viene assegnato dal prezzo reale.
+- **Dopo ogni chiusura:** pausa re-entry `RE_ENTRY_SEC` (30 s). `LOSS_LOCK_MINUTES` e `CONSEC_LOSS_PAUSE_MINUTES` contano **solo** le chiusure `emergency`.
+- `tp_broker` = TP quick inviato (o `null` se rifiutato). La dashboard mostra "Modalità: quick · TP +1,5 $ · stop emergenza 15 $".
+
+Con **`EXIT_MODE=trailing`** vale per intero il comportamento descritto sotto, invariato: la mtf manda il proprio SL/TP al broker, `m1_short` e `m1_range` partono con SL iniziale e TP di sicurezza e il worker gestisce target1 → breakeven → trailing. La pausa re-entry resta `SCALPER_MIN_REENTRY_SEC` (120 s).
+
+### Uscita gestita di `m1_short` e `m1_range` (solo `EXIT_MODE=trailing`)
 
 Questi due setup non fanno più scalping puro: **nessun take profit al broker e nessun limite di durata**. L'ordine parte con il solo SL iniziale e da lì lo gestisce il worker.
 
@@ -114,7 +126,11 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `RANGE_SL_ATR` / `RANGE_SL_MIN_USD` | 2.0 / 2.0 | Pavimenti dello SL: ATR M1 e dollari (vince il più largo fra i due e la struttura) |
 | `RANGE_SL_MAX_USD` / `RANGE_SL_MAX_PCT` | 8.0 / 50 | Tetti dello SL: dollari e percentuale dell'ampiezza del range (oltre si scarta) |
 | `RANGE_TP_MIN_USD` | 1.5 | TP minimo: sotto questa distanza il trade viene scartato |
-| `SAFETY_TP_ATR` | 4.0 | TP di sicurezza al broker, in ATR M1 (vince il più largo fra questo e `SAFETY_TP_MIN_R`) |
+| `EXIT_MODE` | quick | `quick` = super scalper (TP quick, nessuno SL al broker, emergenza nel worker); `trailing` = gestione target1 → breakeven → trailing |
+| `TP_QUICK_USD` | 1.5 | Distanza a favore dal fill a cui si chiude (e TP inviato al broker) in modalità quick |
+| `EMERGENCY_SL_USD` | 15 | Distanza contraria dal fill oltre cui il worker chiude a mercato in modalità quick |
+| `RE_ENTRY_SEC` | 30 | Pausa dopo qualsiasi chiusura in modalità quick (in trailing vale `SCALPER_MIN_REENTRY_SEC`) |
+| `SAFETY_TP_ATR` | 4.0 | TP di sicurezza al broker, in ATR M1 (vince il più largo fra questo e `SAFETY_TP_MIN_R`) — solo `trailing` |
 | `SAFETY_TP_MIN_R` | 3.0 | TP di sicurezza minimo, in multipli della distanza entry→target1 |
 | `POSITION_GONE_CONFIRM_SEC` | 10 | Secondi di assenza dal terminal state prima di considerare chiusa una posizione |
 | `POSITION_GONE_CONFIRM_TICKS` | 3 | Tick consecutivi di assenza richiesti insieme ai secondi sopra |

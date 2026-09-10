@@ -279,9 +279,11 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
         WHERE closed_at IS NOT NULL AND mt5_position_id IS NOT NULL
      ),
      recent AS MATERIALIZED (
-       -- Conta come perdita solo lo stop iniziale chiuso in perdita: le uscite gestite no.
-       SELECT (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial'
-               AND COALESCE(mt5_profit,-1) < 0) AS is_loss,
+       -- Conta come perdita lo stop di emergenza (modalita' quick) o lo stop iniziale chiuso in
+       -- perdita (modalita' trailing): tutte le altre uscite no.
+       SELECT (close_reason='emergency'
+               OR (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial'
+                   AND COALESCE(mt5_profit,-1) < 0)) AS is_loss,
               closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
          FROM scalper_signals
         WHERE outcome IS NOT NULL
