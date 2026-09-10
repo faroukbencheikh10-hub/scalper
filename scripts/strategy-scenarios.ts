@@ -412,11 +412,11 @@ function withRange(env: Record<string, string>, test: () => void) {
     for (const [k, v] of previous) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 }
-// Zig-zag M1 dentro una banda: candele piccole, range largo. M5 piatte => la mtf non entra mai.
-function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset?: number; lastBody?: number } = {}) {
+// Zig-zag M1 dentro una banda, poi una gamba verso il bordo e la candela di rifiuto. M5 piatte => la mtf non entra mai.
+function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset?: number; lastBody?: number; leg?: number } = {}) {
   const base = fixture();
   const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
-  const direction = options.direction ?? "BUY", step = options.step ?? 1;
+  const direction = options.direction ?? "BUY", step = options.step ?? 1, leg = options.leg ?? 7;
   const lastBody = options.lastBody ?? (direction === "BUY" ? 0.3 : -0.3);
   const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
   const m1: Candle[] = [];
@@ -425,9 +425,10 @@ function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset
     const open = level; level += delta;
     m1.push(bar(end - (total - 1 - i) * MINUTE, open, level, 0.2));
   };
-  for (let i = 0; i < total - 5; i++) push(i, Math.floor(i / 4) % 2 === 0 ? step : -step);
-  // Ultime quattro candele verso il bordo da cui si rientra, poi la candela di rifiuto.
-  for (let i = total - 5; i < total - 1; i++) push(i, direction === "BUY" ? -step : step);
+  for (let i = 0; i < total - 1 - leg; i++) push(i, Math.floor(i / 4) % 2 === 0 ? step : -step);
+  // Ultime `leg` candele verso il bordo da cui si rientra, poi la candela di rifiuto: piu' e'
+  // lunga la gamba, piu' il range delle 8 M1 e' largo rispetto all'ATR (con leg 7 riempie la finestra).
+  for (let i = total - 1 - leg; i < total - 1; i++) push(i, direction === "BUY" ? -step : step);
   m1.push(bar(end, level, level + (direction === "BUY" ? lastBody : lastBody), 0.15));
   const window = m1.slice(-8);
   const high = Math.max(...window.map(c => c.high)), low = Math.min(...window.map(c => c.low));
@@ -447,12 +448,12 @@ check("m1_range: BUY sul rientro dal minimo del range", () => {
     const gate = s.evaluations.find(e => e.setup === "range_gate")!;
     assert.equal(gate.status, "triggered");
     assert.match(gate.reason, /range 8 M1 chiuse \d+\.\d\d-\d+\.\d\d \(\d+\.\d\d\$ = \d+\.\d\d ATR\)/);
-    assert.match(gate.reason, /distanza dal bordo \d+\.\d\d\$, SL \d+\.\d\d\$, TP \d+\.\d\d\$/);
-    // SL oltre il bordo + SL_BUFFER_USD, con minimo 1 ATR; TP sul lato opposto - TP_BUFFER_USD.
+    assert.match(gate.reason, /distanza dal bordo \d+\.\d\d\$, SL \d+\.\d\d\$ \(struttura \d+\.\d\d\$, ATR x[\d.]+ \d+\.\d\d\$, minimo \d+\.\d\d\$\), TP \d+\.\d\d\$/);
+    // SL oltre il bordo + SL_BUFFER_USD, mai sotto RANGE_SL_ATR x ATR M1 ne' RANGE_SL_MIN_USD; TP sul lato opposto - TP_BUFFER_USD.
     const closed = input.m1.slice(-8);
     const low = Math.min(...closed.map(c => c.low)), high = Math.max(...closed.map(c => c.high));
-    const atrM1 = s.slPlan!.atr;
-    assert.ok(Math.abs(s.stopLoss! - (s.entry! - Math.max(s.entry! - low + 0.3, atrM1))) <= 0.011, JSON.stringify(s.slPlan));
+    const floor = Math.max(s.entry! - low + 0.3, s.slPlan!.atr, s.slPlan!.minUsd!);
+    assert.ok(Math.abs(s.stopLoss! - (s.entry! - floor)) <= 0.011, JSON.stringify(s.slPlan));
     assert.ok(Math.abs(s.takeProfit! - (s.entry! + (high - s.entry! - 0.3))) <= 0.011, JSON.stringify(s));
     assert.ok(plannedEntryValid(s, input.quote));
   });
@@ -481,7 +482,7 @@ check("m1_range: prezzo lontano dal bordo non entra", () => {
 });
 check("m1_range: range troppo stretto non e' un setup", () => {
   withRange({}, () => {
-    const s = evaluateScalper(rangeInput({ step: 0.55 }));
+    const s = evaluateScalper(rangeInput({ step: 0.55, leg: 4 }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /range troppo stretto/);
   });
@@ -491,6 +492,40 @@ check("m1_range: SL oltre il massimo scarta", () => {
     const s = evaluateScalper(rangeInput());
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /oltre il massimo 0\.50\$/);
+  });
+});
+check("m1_range: SL alzato al minimo ATR", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput());
+    assert.equal(s.setup, "m1_range", JSON.stringify(s));
+    const plan = s.slPlan!;
+    // Il bordo e' vicino: comanda RANGE_SL_ATR x ATR M1, non la struttura ne' il minimo in dollari.
+    assert.ok(plan.atr > plan.structural! && plan.atr > plan.minUsd!, JSON.stringify(plan));
+    assert.ok(Math.abs(plan.applied - plan.atr) <= 0.011, JSON.stringify(plan));
+    assert.ok(Math.abs(s.entry! - s.stopLoss! - plan.atr) <= 0.011, JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /ATR x2 \d+\.\d\d\$/);
+  });
+});
+check("m1_range: SL alzato al minimo in dollari", () => {
+  withRange({}, () => {
+    // Candele piccole: 2 x ATR resta sotto RANGE_SL_MIN_USD, che diventa il pavimento.
+    const s = evaluateScalper(rangeInput({ step: 0.55 }));
+    assert.equal(s.setup, "m1_range", JSON.stringify(s));
+    const plan = s.slPlan!;
+    assert.ok(plan.minUsd! > plan.atr && plan.minUsd! > plan.structural!, JSON.stringify(plan));
+    assert.ok(Math.abs(plan.applied - plan.minUsd!) <= 0.011, JSON.stringify(plan));
+    assert.ok(Math.abs(s.entry! - s.stopLoss! - plan.minUsd!) <= 0.011, JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /minimo 2\.00\$/);
+  });
+});
+check("m1_range: SL oltre il 50% del range scarta", () => {
+  withRange({}, () => {
+    // Gamba corta: il range vale poco piu' di 3 ATR e il pavimento ATR si mangia meta' dell'ampiezza.
+    const s = evaluateScalper(rangeInput({ leg: 4 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    const reason = s.evaluations.find(e => e.setup === "range_gate")!.reason;
+    assert.match(reason, /SL troppo grande per il range/);
+    assert.match(reason, /SL \d+\.\d\d\$ oltre il 50% dell'ampiezza \d+\.\d\d\$ \(max \d+\.\d\d\$\)/);
   });
 });
 check("m1_range: TP sotto il minimo scarta", () => {

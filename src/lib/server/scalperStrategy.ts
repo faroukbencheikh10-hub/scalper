@@ -407,7 +407,8 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
   const minAtr = env("RANGE_MIN_ATR", 1.5, 0.1, 10), minUsd = env("RANGE_MIN_USD", 3, 0.1, 100);
   const edgePct = env("RANGE_EDGE_PCT", 20, 1, 50) / 100;
   const slBuffer = env("SL_BUFFER_USD", 0.3, 0, 5), tpBuffer = env("TP_BUFFER_USD", 0.3, 0, 5);
-  const slMinAtr = env("RANGE_SL_MIN_ATR", 1, 0.1, 5), slMaxUsd = env("RANGE_SL_MAX_USD", 8, 0.1, 100);
+  const slAtrMult = env("RANGE_SL_ATR", 2, 0.1, 10), slMinUsd = env("RANGE_SL_MIN_USD", 2, 0.1, 50);
+  const slMaxUsd = env("RANGE_SL_MAX_USD", 8, 0.1, 100), slMaxPct = env("RANGE_SL_MAX_PCT", 50, 5, 100) / 100;
   const tpMinUsd = env("RANGE_TP_MIN_USD", 1.5, 0.1, 50);
   const base = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
     + " (" + width.toFixed(2) + "$ = " + (width / atr1).toFixed(2) + " ATR), ATR M1 " + atr1.toFixed(2) + "$";
@@ -430,12 +431,22 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
   const entry = direction === "BUY" ? buyEntry : sellEntry;
   const edgeLevel = direction === "BUY" ? low : high;
   const oppositeLevel = direction === "BUY" ? high : low;
+  // Lo stop sta oltre il bordo, ma non piu' stretto di RANGE_SL_ATR * ATR M1 ne' di RANGE_SL_MIN_USD.
   const structural = signed(direction, entry - edgeLevel) + slBuffer;
-  const risk = Math.max(structural, atr1 * slMinAtr);
+  const risk = Math.max(structural, atr1 * slAtrMult, slMinUsd);
   const detail = base + ", distanza dal bordo " + Math.abs(entry - edgeLevel).toFixed(2)
-    + "$, SL " + risk.toFixed(2) + "$, TP " + (Math.abs(oppositeLevel - entry) - tpBuffer).toFixed(2) + "$";
+    + "$, SL " + risk.toFixed(2) + "$ (struttura " + structural.toFixed(2) + "$, ATR x" + slAtrMult + " "
+    + (atr1 * slAtrMult).toFixed(2) + "$, minimo " + slMinUsd.toFixed(2) + "$)"
+    + ", TP " + (Math.abs(oppositeLevel - entry) - tpBuffer).toFixed(2) + "$";
   if (risk > slMaxUsd) {
     return rejectRange("m1_range: SL " + risk.toFixed(2) + "$ oltre il massimo " + slMaxUsd.toFixed(2) + "$ (" + detail + ").", direction);
+  }
+  // Uno stop che vale mezzo range non e' un rientro dal bordo: il trade non ha spazio per lavorare.
+  const maxRiskFromRange = width * slMaxPct;
+  if (risk > maxRiskFromRange) {
+    return rejectRange("m1_range: SL troppo grande per il range: SL " + risk.toFixed(2) + "$ oltre il "
+      + (slMaxPct * 100).toFixed(0) + "% dell'ampiezza " + width.toFixed(2) + "$ (max " + maxRiskFromRange.toFixed(2) + "$) ("
+      + detail + ").", direction);
   }
   const reward = signed(direction, oppositeLevel - entry) - tpBuffer;
   if (reward < tpMinUsd) {
@@ -456,8 +467,8 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
     // level_used: bordo e ultima M1 chiusa nella chiave, un tentativo per bordo finche' non nasce un nuovo range.
     setupKey: [RANGE_STRATEGY_VERSION, direction, edgeLevel.toFixed(2), trigger.datetime].join(":"),
     entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
-    slPlan: { structural: Number(structural.toFixed(2)), atr: Number((atr1 * slMinAtr).toFixed(2)), applied: Number(appliedRisk.toFixed(2)),
-      minUsd: Number((atr1 * slMinAtr).toFixed(2)), maxUsd: slMaxUsd, rr: Number(rr.toFixed(2)), tpMinUsd },
+    slPlan: { structural: Number(structural.toFixed(2)), atr: Number((atr1 * slAtrMult).toFixed(2)), applied: Number(appliedRisk.toFixed(2)),
+      minUsd: slMinUsd, maxUsd: slMaxUsd, rr: Number(rr.toFixed(2)), tpMinUsd },
     evaluations: [{ setup: "range_gate", status: "triggered", direction, reason }],
     reasoning: RANGE_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
       + ". SL " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R). [shadow-score:" + score + "]",

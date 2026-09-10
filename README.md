@@ -26,7 +26,7 @@ Se nemmeno il `m1_short` produce un ordine viene valutato il terzo setup **`m1_r
 
 - **Range:** massimo/minimo delle ultime `RANGE_BARS` (8) candele M1 **chiuse**. Il setup è attivo solo se l'ampiezza vale almeno `RANGE_MIN_ATR` (1.5) × ATR M1 **e** almeno `RANGE_MIN_USD` (3$): un range stretto non è un setup.
 - **Entry (su tick):** BUY quando il prezzo live è dentro il range ed entro `RANGE_EDGE_PCT` (20%) dell'ampiezza dal minimo, con l'ultima M1 chiusa **verde**; SELL speculare vicino al massimo con l'ultima M1 chiusa **rossa**. Il confronto usa il prezzo che pagheresti (ask sui long, bid sugli short) e non aspetta la chiusura della candela in corso.
-- **SL:** oltre il bordo del range più `SL_BUFFER_USD` (0.30$), con minimo `RANGE_SL_MIN_ATR` (1.0) × ATR M1; sopra `RANGE_SL_MAX_USD` (8$) il trade viene **scartato**.
+- **SL:** oltre il bordo del range più `SL_BUFFER_USD` (0.30$), ma mai più stretto di `RANGE_SL_ATR` (2.0) × ATR M1 né di `RANGE_SL_MIN_USD` (2$): sul bordo lo stop strutturale è quasi sempre rumore, questi due pavimenti gli danno respiro. Il trade viene **scartato** se lo SL risultante supera `RANGE_SL_MAX_USD` (8$) oppure `RANGE_SL_MAX_PCT` (50%) dell'ampiezza del range — uno stop che vale mezzo range non è un rientro dal bordo. Il motivo nel `range_gate` riporta struttura, pavimento ATR, pavimento in dollari e il massimo consentito.
 - **TP:** lato opposto del range meno `TP_BUFFER_USD` (0.30$). Se la distanza disponibile è sotto `RANGE_TP_MIN_USD` (1.5$) il trade viene **scartato**, invece di spostare il target oltre il range. Nessun breakeven, nessun quick profit.
 - **Anti-accumulo:** non si applica a questo setup, qui il range è il setup e non un ostacolo. Spread, candela shock, ATR M1 e tutti i blocchi comuni restano.
 - Un tentativo per bordo: `setup_key` porta bordo e ultima M1 chiusa (`level_used`), quindi il bordo si riarma solo quando chiude una nuova M1 e nasce un nuovo range.
@@ -80,7 +80,8 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `RANGE_MIN_ATR` / `RANGE_MIN_USD` | 1.5 / 3.0 | Ampiezza minima del range, in ATR M1 e in dollari |
 | `RANGE_EDGE_PCT` | 20 | Distanza massima dal bordo, in percentuale dell'ampiezza |
 | `SL_BUFFER_USD` / `TP_BUFFER_USD` | 0.30 / 0.30 | Margine oltre il bordo per lo SL e dentro il lato opposto per il TP |
-| `RANGE_SL_MIN_ATR` / `RANGE_SL_MAX_USD` | 1.0 / 8.0 | SL minimo in ATR M1 e massimo in dollari (oltre si scarta) |
+| `RANGE_SL_ATR` / `RANGE_SL_MIN_USD` | 2.0 / 2.0 | Pavimenti dello SL: ATR M1 e dollari (vince il più largo fra i due e la struttura) |
+| `RANGE_SL_MAX_USD` / `RANGE_SL_MAX_PCT` | 8.0 / 50 | Tetti dello SL: dollari e percentuale dell'ampiezza del range (oltre si scarta) |
 | `RANGE_TP_MIN_USD` | 1.5 | TP minimo: sotto questa distanza il trade viene scartato |
 | `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
 | `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
