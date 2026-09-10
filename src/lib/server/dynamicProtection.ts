@@ -49,10 +49,10 @@ export function dynamicDistances(
   const atr = Number.isFinite(atrM1) && atrM1 > 0 ? atrM1 : config.slMinUsd / config.slAtrMult;
   const spread = Number.isFinite(spreadUsd) && spreadUsd >= 0 ? spreadUsd : 0;
 
-  const slDistanceUsd = clamp(
-    Math.max(atr * config.slAtrMult, spread * config.spreadMult, config.slMinUsd),
+  const requiredSlDistanceUsd = Math.max(
+    atr * config.slAtrMult,
+    spread * config.spreadMult,
     config.slMinUsd,
-    config.slMaxUsd,
   );
   const tpDistanceUsd = clamp(
     Math.max(atr * config.tpAtrMult, spread * config.spreadMult, config.tpMinUsd),
@@ -65,26 +65,75 @@ export function dynamicDistances(
     config.trailMaxUsd,
   );
 
-  return { slDistanceUsd, tpDistanceUsd, trailDistanceUsd };
+  return {
+    requiredSlDistanceUsd,
+    slDistanceUsd: Math.min(requiredSlDistanceUsd, config.slMaxUsd),
+    tpDistanceUsd,
+    trailDistanceUsd,
+  };
 }
 
+export type InitialDynamicLevels = {
+  valid: boolean;
+  rejectReason: "sl_distance_above_max" | null;
+  requiredSlDistanceUsd: number;
+  slDistanceUsd: number;
+  tpDistanceUsd: number;
+  trailDistanceUsd: number;
+  stopLoss: number | null;
+  takeProfit: number | null;
+};
+
+/**
+ * Paper/backtest initial plan.
+ * SL is the widest requirement from structure + ATR M1 + spread + configured minimum.
+ * If that required SL exceeds slMaxUsd the setup is rejected instead of silently tightening risk.
+ * TP is calculated once at entry from ATR M1 + spread and is not moved by the trailing model.
+ */
 export function initialDynamicLevels(input: {
   direction: TradeDirection;
   entry: number;
   atrM1: number;
   spreadUsd: number;
+  structuralDistanceUsd?: number | null;
   config?: DynamicProtectionConfig;
-}) {
+}): InitialDynamicLevels {
   const config = input.config ?? dynamicProtectionConfig();
-  const distances = dynamicDistances(input.atrM1, input.spreadUsd, config);
-  const stopLoss = input.direction === "BUY"
-    ? input.entry - distances.slDistanceUsd
-    : input.entry + distances.slDistanceUsd;
-  const takeProfit = input.direction === "BUY"
-    ? input.entry + distances.tpDistanceUsd
-    : input.entry - distances.tpDistanceUsd;
+  const base = dynamicDistances(input.atrM1, input.spreadUsd, config);
+  const structural = Number(input.structuralDistanceUsd);
+  const structuralDistanceUsd = Number.isFinite(structural) && structural > 0 ? structural : 0;
+  const requiredSlDistanceUsd = Math.max(base.requiredSlDistanceUsd, structuralDistanceUsd);
 
-  return { ...distances, stopLoss, takeProfit };
+  if (requiredSlDistanceUsd > config.slMaxUsd) {
+    return {
+      valid: false,
+      rejectReason: "sl_distance_above_max",
+      requiredSlDistanceUsd,
+      slDistanceUsd: requiredSlDistanceUsd,
+      tpDistanceUsd: base.tpDistanceUsd,
+      trailDistanceUsd: base.trailDistanceUsd,
+      stopLoss: null,
+      takeProfit: null,
+    };
+  }
+
+  const stopLoss = input.direction === "BUY"
+    ? input.entry - requiredSlDistanceUsd
+    : input.entry + requiredSlDistanceUsd;
+  const takeProfit = input.direction === "BUY"
+    ? input.entry + base.tpDistanceUsd
+    : input.entry - base.tpDistanceUsd;
+
+  return {
+    valid: true,
+    rejectReason: null,
+    requiredSlDistanceUsd,
+    slDistanceUsd: requiredSlDistanceUsd,
+    tpDistanceUsd: base.tpDistanceUsd,
+    trailDistanceUsd: base.trailDistanceUsd,
+    stopLoss,
+    takeProfit,
+  };
 }
 
 export type DynamicStopAction = {
@@ -99,6 +148,9 @@ export type DynamicStopAction = {
  * It never loosens: a BUY stop can only move upward; a SELL stop can only move downward.
  * There is no +2 EUR / +3 EUR activation threshold and no fixed profit target required before
  * protection begins. If the computed trailing level is not better than the existing SL, it stays put.
+ *
+ * Deliberately this function does not return or alter takeProfit: TP is fixed at the level calculated
+ * at entry, so a favourable move cannot keep pushing the target farther away.
  */
 export function dynamicProfitProtection(input: {
   direction: TradeDirection;
