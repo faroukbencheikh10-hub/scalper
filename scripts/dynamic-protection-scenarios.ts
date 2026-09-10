@@ -2,9 +2,11 @@
 // No MetaApi calls, broker orders or database writes happen in this file.
 import assert from "node:assert/strict";
 import {
+  adaptiveMinImprovementUsd,
   dynamicDistances,
   dynamicProfitProtection,
   initialDynamicLevels,
+  normalizeLevelToTick,
   type DynamicProtectionConfig,
 } from "../src/lib/server/dynamicProtection";
 
@@ -113,6 +115,33 @@ check("dynamic: broker minimum distance is respected at entry", () => {
   assert.ok(levels.slDistanceUsd! >= 2);
 });
 
+check("dynamic: tick normalization rounds levels away from entry", () => {
+  const levels = initialDynamicLevels({
+    direction: "BUY",
+    entry: 4400,
+    atrM1: 2.03,
+    spreadUsd: 0.1,
+    tickSizeUsd: 0.05,
+  });
+  assert.equal(levels.valid, true);
+  assert.ok(levels.takeProfit! >= 4401.624);
+  assert.ok(Math.abs(levels.takeProfit! / 0.05 - Math.round(levels.takeProfit! / 0.05)) < 1e-8);
+  assert.ok(Math.abs(levels.stopLoss! / 0.05 - Math.round(levels.stopLoss! / 0.05)) < 1e-8);
+});
+
+check("dynamic: explicit tick normalizer preserves safe side for SELL", () => {
+  const sl = normalizeLevelToTick({ direction: "SELL", kind: "stopLoss", value: 4403.011, tickSizeUsd: 0.05 });
+  const tp = normalizeLevelToTick({ direction: "SELL", kind: "takeProfit", value: 4398.489, tickSizeUsd: 0.05 });
+  assert.equal(sl, 4403.05);
+  assert.equal(tp, 4398.45);
+});
+
+check("dynamic: adaptive minimum improvement uses tick spread and floor", () => {
+  assert.equal(adaptiveMinImprovementUsd({ spreadUsd: 0.4, tickSizeUsd: 0.01 }), 0.1);
+  assert.equal(adaptiveMinImprovementUsd({ spreadUsd: 0.04, tickSizeUsd: 0.01 }), 0.05);
+  assert.equal(adaptiveMinImprovementUsd({ spreadUsd: 0.04, tickSizeUsd: 0.1 }), 0.1);
+});
+
 check("dynamic: SL tightens immediately without +2/+3 EUR trigger", () => {
   const levels = initialDynamicLevels({ direction: "BUY", entry: 4400, atrM1: 2, spreadUsd: 0.2 });
   assert.equal(levels.valid, true);
@@ -173,18 +202,67 @@ check("dynamic: pullback never loosens an already tightened BUY SL", () => {
   assert.equal(pullback.stopLoss, first.stopLoss);
 });
 
-check("dynamic: tiny improvement is held instead of producing noisy updates", () => {
+check("dynamic: adaptive threshold suppresses micro updates", () => {
   const action = dynamicProfitProtection({
     direction: "BUY",
     entry: 4400,
-    currentPrice: 4400.805,
+    currentPrice: 4400.83,
+    currentStopLoss: 4400.1,
+    atrM1: 2,
+    spreadUsd: 0.4,
+    tickSizeUsd: 0.01,
+  });
+  assert.equal(action.kind, "hold");
+  assert.equal(action.stopLoss, 4400.1);
+  assert.equal(action.minImprovementUsd, 0.1);
+});
+
+check("dynamic: rate limit holds repeated update inside interval", () => {
+  const action = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4402,
     currentStopLoss: 4400,
     atrM1: 2,
     spreadUsd: 0.2,
-    minImprovementUsd: 0.01,
+    nowMs: 10_200,
+    lastUpdateAtMs: 10_000,
+    minUpdateIntervalMs: 350,
   });
   assert.equal(action.kind, "hold");
+  assert.equal(action.reason, "rate_limited");
   assert.equal(action.stopLoss, 4400);
+});
+
+check("dynamic: update is allowed after rate-limit interval", () => {
+  const action = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4402,
+    currentStopLoss: 4400,
+    atrM1: 2,
+    spreadUsd: 0.2,
+    nowMs: 10_400,
+    lastUpdateAtMs: 10_000,
+    minUpdateIntervalMs: 350,
+  });
+  assert.equal(action.kind, "trail");
+  assert.ok(action.stopLoss > 4400);
+});
+
+check("dynamic: broker minimum distance is respected during trailing", () => {
+  const action = dynamicProfitProtection({
+    direction: "BUY",
+    entry: 4400,
+    currentPrice: 4402,
+    currentStopLoss: 4399,
+    atrM1: 1,
+    spreadUsd: 0.1,
+    brokerMinDistanceUsd: 1,
+    tickSizeUsd: 0.05,
+  });
+  assert.equal(action.kind, "trail");
+  assert.ok(4402 - action.stopLoss >= 1 - 1e-9);
 });
 
 check("dynamic: TP is fixed after entry while only SL moves", () => {
@@ -232,4 +310,4 @@ check("dynamic: SELL mirrors BUY and SL only moves downward", () => {
   assert.ok(second.stopLoss < first.stopLoss);
 });
 
-console.log(`dynamic-protection scenarios: ${passed}/15 passed`);
+console.log(`dynamic-protection scenarios: ${passed}/21 passed`);
