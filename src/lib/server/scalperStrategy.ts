@@ -341,17 +341,128 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number): ScalperSignal {
   };
 }
 
+export const RANGE_STRATEGY_VERSION = "m1-range-v1";
+
+function rangeEnabled() {
+  const raw = process.env.RANGE_ENABLED?.trim().toLowerCase();
+  return !(raw === "false" || raw === "0" || raw === "off" || raw === "no");
+}
+
+function rejectRange(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+  const evaluation: SetupEvaluation = direction
+    ? { setup: "range_gate", status: "rejected", direction, reason }
+    : { setup: "range_gate", status: "rejected", reason };
+  return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
+    takeProfit: null, riskReward: null, slPlan: null, reasoning: reason, evaluations: [evaluation] };
+}
+
 /**
- * Priorità: mtf-continuation-v1 e, solo se non produce un ordine, m1_short.
- * Le valutazioni dei due contesti viaggiano insieme in stream_last_decision.
+ * Rientro dal bordo di un range M1 largo: si compra vicino al minimo e si vende vicino al massimo
+ * delle ultime RANGE_BARS candele chiuse. Ingresso su tick, SL appena oltre il bordo e TP sul lato
+ * opposto del range. L'anti-accumulo non si applica: qui il range e' il setup, non un ostacolo.
+ */
+function evaluateM1Range(input: EvaluateInput, nowMs: number): ScalperSignal {
+  const { quote } = input;
+  const m1 = closedBars(input.m1, 1, nowMs);
+  if (!m1) return rejectRange("m1_range: candele M1 non valide.");
+  const bars = Math.floor(env("RANGE_BARS", 8, 3, 40));
+  if (m1.length < bars + 25) return rejectRange("m1_range: storico M1 insufficiente, servono " + (bars + 25) + " candele chiuse.");
+  if (!latestBarFresh(m1, 1, nowMs, 3 * MINUTE)) return rejectRange("m1_range: ultima M1 chiusa non aggiornata.");
+
+  const atr1 = atr(m1, 14, true);
+  if (!atr1 || !(atr1 > 0)) return rejectRange("m1_range: ATR M1 non disponibile.");
+  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
+    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectRange("m1_range: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+
+  const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
+  const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
+  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) {
+    return rejectRange("m1_range: candela M1 shock, nessun ingresso sul bordo.");
+  }
+
+  // Range e ATR solo da candele chiuse: del tick serve soltanto il prezzo.
+  const window = m1.slice(-bars);
+  const high = maxHigh(window), low = minLow(window), width = high - low;
+  const minAtr = env("RANGE_MIN_ATR", 1.5, 0.1, 10), minUsd = env("RANGE_MIN_USD", 3, 0.1, 100);
+  const edgePct = env("RANGE_EDGE_PCT", 20, 1, 50) / 100;
+  const slBuffer = env("SL_BUFFER_USD", 0.3, 0, 5), tpBuffer = env("TP_BUFFER_USD", 0.3, 0, 5);
+  const slMinAtr = env("RANGE_SL_MIN_ATR", 1, 0.1, 5), slMaxUsd = env("RANGE_SL_MAX_USD", 8, 0.1, 100);
+  const tpMinUsd = env("RANGE_TP_MIN_USD", 1.5, 0.1, 50);
+  const base = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
+    + " (" + width.toFixed(2) + "$ = " + (width / atr1).toFixed(2) + " ATR), ATR M1 " + atr1.toFixed(2) + "$";
+  if (width < atr1 * minAtr || width < minUsd) {
+    return rejectRange("m1_range: range troppo stretto, servono " + Math.max(atr1 * minAtr, minUsd).toFixed(2) + "$ (" + base + ").");
+  }
+
+  const green = trigger.close > trigger.open, red = trigger.close < trigger.open;
+  const buyEntry = quote.ask, sellEntry = quote.bid;
+  const edge = width * edgePct;
+  const nearLow = buyEntry >= low && buyEntry <= low + edge;
+  const nearHigh = sellEntry <= high && sellEntry >= high - edge;
+  const direction: "BUY" | "SELL" | null = nearLow && green ? "BUY" : nearHigh && red ? "SELL" : null;
+  if (!direction) {
+    const distance = "distanza dal bordo: low " + (buyEntry - low).toFixed(2) + "$, high " + (high - sellEntry).toFixed(2)
+      + "$, soglia " + edge.toFixed(2) + "$ (" + edgePct * 100 + "%), ultima M1 " + (green ? "verde" : red ? "rossa" : "neutra");
+    return rejectRange("m1_range: nessun rientro dal bordo, " + distance + " (" + base + ").");
+  }
+
+  const entry = direction === "BUY" ? buyEntry : sellEntry;
+  const edgeLevel = direction === "BUY" ? low : high;
+  const oppositeLevel = direction === "BUY" ? high : low;
+  const structural = signed(direction, entry - edgeLevel) + slBuffer;
+  const risk = Math.max(structural, atr1 * slMinAtr);
+  const detail = base + ", distanza dal bordo " + Math.abs(entry - edgeLevel).toFixed(2)
+    + "$, SL " + risk.toFixed(2) + "$, TP " + (Math.abs(oppositeLevel - entry) - tpBuffer).toFixed(2) + "$";
+  if (risk > slMaxUsd) {
+    return rejectRange("m1_range: SL " + risk.toFixed(2) + "$ oltre il massimo " + slMaxUsd.toFixed(2) + "$ (" + detail + ").", direction);
+  }
+  const reward = signed(direction, oppositeLevel - entry) - tpBuffer;
+  if (reward < tpMinUsd) {
+    return rejectRange("m1_range: TP disponibile " + reward.toFixed(2) + "$ sotto il minimo " + tpMinUsd.toFixed(2) + "$ (" + detail + ").", direction);
+  }
+
+  const sl = direction === "BUY" ? Math.floor((entry - risk) * 100) / 100 : Math.ceil((entry + risk) * 100) / 100;
+  const tp = direction === "BUY" ? Math.floor((entry + reward) * 100) / 100 : Math.ceil((entry - reward) * 100) / 100;
+  const appliedRisk = Math.abs(entry - sl), appliedReward = signed(direction, tp - entry);
+  if (!(appliedRisk > 0 && appliedReward > 0) || appliedRisk > slMaxUsd + 0.011) {
+    return rejectRange("m1_range: SL/TP non validi al prezzo corrente (" + detail + ").", direction);
+  }
+  const rr = appliedReward / appliedRisk;
+  const score = Math.min(95, Math.round(55 + Math.min(1, width / atr1 / 3) * 25 + (1 - Math.min(1, Math.abs(entry - edgeLevel) / Math.max(0.01, edge))) * 15));
+  const reason = "m1_range " + direction + ": rientro dal bordo " + edgeLevel.toFixed(2) + " verso " + oppositeLevel.toFixed(2) + " (" + detail + ").";
+  return {
+    direction, setup: "m1_range",
+    // level_used: bordo e ultima M1 chiusa nella chiave, un tentativo per bordo finche' non nasce un nuovo range.
+    setupKey: [RANGE_STRATEGY_VERSION, direction, edgeLevel.toFixed(2), trigger.datetime].join(":"),
+    entry, stopLoss: sl, takeProfit: tp, riskReward: Number(rr.toFixed(2)),
+    slPlan: { structural: Number(structural.toFixed(2)), atr: Number((atr1 * slMinAtr).toFixed(2)), applied: Number(appliedRisk.toFixed(2)),
+      minUsd: Number((atr1 * slMinAtr).toFixed(2)), maxUsd: slMaxUsd, rr: Number(rr.toFixed(2)), tpMinUsd },
+    evaluations: [{ setup: "range_gate", status: "triggered", direction, reason }],
+    reasoning: RANGE_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
+      + ". SL " + appliedRisk.toFixed(2) + "$, TP " + appliedReward.toFixed(2) + "$ (" + rr.toFixed(2) + "R). [shadow-score:" + score + "]",
+  };
+}
+
+/**
+ * Priorità: mtf-continuation-v1, poi m1_short e infine m1_range; il primo che produce un ordine vince.
+ * Le valutazioni dei contesti attraversati viaggiano insieme in stream_last_decision.
  */
 export function evaluateScalper(input: EvaluateInput): ScalperSignal {
   const nowMs = input.nowMs ?? Date.now();
   const blocked = commonPreflight(input, nowMs);
   if (blocked) return blocked;
   const mtf = evaluateMtfContinuation(input);
-  if (mtf.direction !== "NO_TRADE" || !shortEnabled()) return mtf;
-  const short = evaluateM1Short(input, nowMs);
-  const evaluations = [...mtf.evaluations, ...short.evaluations];
-  return short.direction === "NO_TRADE" ? { ...mtf, evaluations } : { ...short, evaluations };
+  if (mtf.direction !== "NO_TRADE") return mtf;
+  let evaluations = [...mtf.evaluations];
+  if (shortEnabled()) {
+    const short = evaluateM1Short(input, nowMs);
+    evaluations = [...evaluations, ...short.evaluations];
+    if (short.direction !== "NO_TRADE") return { ...short, evaluations };
+  }
+  if (rangeEnabled()) {
+    const ranged = evaluateM1Range(input, nowMs);
+    evaluations = [...evaluations, ...ranged.evaluations];
+    if (ranged.direction !== "NO_TRADE") return { ...ranged, evaluations };
+  }
+  return { ...mtf, evaluations };
 }

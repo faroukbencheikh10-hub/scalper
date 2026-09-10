@@ -16,12 +16,12 @@ export type Quote = {
   quotedAt: number | null;
 };
 
-export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_retest" | "micro_pullback" | "m1_short";
+export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_retest" | "micro_pullback" | "m1_short" | "m1_range";
 
 /** Diagnostica di un singolo tick: cosa e' stato valutato e perche' e' stato scartato. */
 export type SetupEvaluation = {
   /** Setup valutato, "m15_gate" per il contesto M15/M5 o "filtri" per i blocchi di protezione a monte. */
-  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate";
+  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate";
   status: "triggered" | "rejected";
   direction?: "BUY" | "SELL";
   reason: string;

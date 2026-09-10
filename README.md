@@ -13,7 +13,7 @@ Il cron non è più il motore principale. `/api/cron/analyze` resta soltanto com
 
 ## Due setup in cascata
 
-A ogni tick viene valutata prima la strategia **mtf-continuation-v1** (M15 → M5 → M1, descritta sotto). Se produce un ordine si usa quello. Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda soltanto l'M1:
+A ogni tick i setup vengono valutati in cascata — **mtf-continuation-v1** → **`m1_short`** → **`m1_range`** — e vince il primo che produce un ordine; la posizione aperta resta comunque una sola. Prima viene valutata la mtf (M15 → M5 → M1, descritta sotto). Solo se non produce nulla viene valutato il secondo setup **`m1_short`** (`m1-short-v1`), che guarda soltanto l'M1:
 
 - **Entry:** chiusura M1 fuori dal range delle ultime `SHORT_RANGE_BARS` (8) candele M1, nella direzione dell'EMA20 M1 — chiusura sopra l'EMA20 solo BUY, sotto solo SELL.
 - **SL:** `SHORT_SL_ATR` (2.0) × ATR M1, alzato a `SHORT_SL_MIN_USD` (3$); se la distanza richiesta supera `SHORT_SL_MAX_USD` (8$) il trade viene **scartato**, non stretto.
@@ -21,6 +21,17 @@ A ogni tick viene valutata prima la strategia **mtf-continuation-v1** (M15 → M
 - **Comuni alla mtf e invariati:** spread massimo, candela shock, ATR M1 dentro i limiti, pausa re-entry 120 s, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, una sola posizione aperta, flatten di fine sessione, STOP, watchdog, Telegram e lotti da `exec_lots` senza cap di rischio.
 - I suoi trade finiscono con `setup = "m1_short"` in `scalper_signals` e in `trades`; la valutazione con i numeri (range, EMA20, ATR, SL, TP) compare in `stream_last_decision.evaluations` come voce `m1_gate`, accanto a `m15_gate`, e la card **Setup valutati** della dashboard mostra entrambe.
 - `SHORT_ENABLED=false` lascia attiva solo la mtf.
+
+Se nemmeno il `m1_short` produce un ordine viene valutato il terzo setup **`m1_range`** (`m1-range-v1`), che compra i rientri dal bordo di un range M1 largo:
+
+- **Range:** massimo/minimo delle ultime `RANGE_BARS` (8) candele M1 **chiuse**. Il setup è attivo solo se l'ampiezza vale almeno `RANGE_MIN_ATR` (1.5) × ATR M1 **e** almeno `RANGE_MIN_USD` (3$): un range stretto non è un setup.
+- **Entry (su tick):** BUY quando il prezzo live è dentro il range ed entro `RANGE_EDGE_PCT` (20%) dell'ampiezza dal minimo, con l'ultima M1 chiusa **verde**; SELL speculare vicino al massimo con l'ultima M1 chiusa **rossa**. Il confronto usa il prezzo che pagheresti (ask sui long, bid sugli short) e non aspetta la chiusura della candela in corso.
+- **SL:** oltre il bordo del range più `SL_BUFFER_USD` (0.30$), con minimo `RANGE_SL_MIN_ATR` (1.0) × ATR M1; sopra `RANGE_SL_MAX_USD` (8$) il trade viene **scartato**.
+- **TP:** lato opposto del range meno `TP_BUFFER_USD` (0.30$). Se la distanza disponibile è sotto `RANGE_TP_MIN_USD` (1.5$) il trade viene **scartato**, invece di spostare il target oltre il range. Nessun breakeven, nessun quick profit.
+- **Anti-accumulo:** non si applica a questo setup, qui il range è il setup e non un ostacolo. Spread, candela shock, ATR M1 e tutti i blocchi comuni restano.
+- Un tentativo per bordo: `setup_key` porta bordo e ultima M1 chiusa (`level_used`), quindi il bordo si riarma solo quando chiude una nuova M1 e nasce un nuovo range.
+- I trade escono con `setup = "m1_range"` e la valutazione numerica (range, ATR, distanza dal bordo, SL, TP) compare come voce `range_gate` in `stream_last_decision.evaluations` e nella card **Setup valutati**.
+- `RANGE_ENABLED=false` lo spegne.
 
 ## Strategia M15 / M5 / M1
 
@@ -58,6 +69,13 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `SHORT_SL_MIN_USD` / `SHORT_SL_MAX_USD` | 3.0 / 8.0 | SL alzato al minimo; oltre il massimo il trade viene scartato |
 | `SHORT_TP_ATR` | 0.6 | TP del m1_short in ATR M1 |
 | `SHORT_TP_MIN_USD` / `SHORT_TP_MAX_USD` | 1.5 / 3.0 | Limiti del TP, indipendenti dallo SL |
+| `RANGE_ENABLED` | true | Abilita il terzo setup `m1_range` |
+| `RANGE_BARS` | 8 | Candele M1 chiuse che definiscono il range |
+| `RANGE_MIN_ATR` / `RANGE_MIN_USD` | 1.5 / 3.0 | Ampiezza minima del range, in ATR M1 e in dollari |
+| `RANGE_EDGE_PCT` | 20 | Distanza massima dal bordo, in percentuale dell'ampiezza |
+| `SL_BUFFER_USD` / `TP_BUFFER_USD` | 0.30 / 0.30 | Margine oltre il bordo per lo SL e dentro il lato opposto per il TP |
+| `RANGE_SL_MIN_ATR` / `RANGE_SL_MAX_USD` | 1.0 / 8.0 | SL minimo in ATR M1 e massimo in dollari (oltre si scarta) |
+| `RANGE_TP_MIN_USD` | 1.5 | TP minimo: sotto questa distanza il trade viene scartato |
 | `MTF_M5_SETUP_BARS` | 6 | Validità dell'impulso in M5 |
 | `MTF_M5_ZONE_ATR` | 0.30 | Tolleranza della zona di rientro in ATR M5 |
 | `MTF_M1_BODY_MIN` | 0.45 | Corpo minimo della conferma M1 |

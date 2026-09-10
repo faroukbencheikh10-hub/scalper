@@ -7,7 +7,7 @@ import type { Candle } from "../src/lib/types";
 
 // Isolate test configuration from deployment/local env.
 for (const key of Object.keys(process.env)) {
-  if (/^(MTF_|SCALPER_|SL_|SHOCK_|M15_|SHORT_)/.test(key)) delete process.env[key];
+  if (/^(MTF_|SCALPER_|SL_|SHOCK_|M15_|SHORT_|RANGE_|TP_)/.test(key)) delete process.env[key];
 }
 process.env.SCALPER_HOURS_UTC = "00:00-23:59";
 // Gli scenari mtf girano con il secondo setup spento: ognuno verifica una strategia sola.
@@ -340,6 +340,136 @@ check("m1_short: candela shock esclusa come nella mtf", () => {
     const s = evaluateScalper(shortInput({ breakout: 12 }));
     assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
     assert.match(s.evaluations.find(e => e.setup === "m1_gate")!.reason, /shock/);
+  });
+});
+// --- m1_range: rientro dal bordo di un range M1 largo, valutato dopo mtf e m1_short ---
+function withRange(env: Record<string, string>, test: () => void) {
+  const keys = Object.keys(env).concat("RANGE_ENABLED", "SHORT_ENABLED");
+  const previous = new Map(keys.map(k => [k, process.env[k]]));
+  process.env.RANGE_ENABLED = "true";
+  process.env.SHORT_ENABLED = "false";
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  try { test(); } finally {
+    for (const [k, v] of previous) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+}
+// Zig-zag M1 dentro una banda: candele piccole, range largo. M5 piatte => la mtf non entra mai.
+function rangeInput(options: { direction?: "BUY" | "SELL"; step?: number; offset?: number; lastBody?: number } = {}) {
+  const base = fixture();
+  const end = Date.UTC(2026, 8, 9, 10, 5), total = 40;
+  const direction = options.direction ?? "BUY", step = options.step ?? 1;
+  const lastBody = options.lastBody ?? (direction === "BUY" ? 0.3 : -0.3);
+  const m5 = base.m5.map(c => bar(Date.parse(c.datetime), 2200, 2200, 1));
+  const m1: Candle[] = [];
+  let level = 2200;
+  const push = (i: number, delta: number) => {
+    const open = level; level += delta;
+    m1.push(bar(end - (total - 1 - i) * MINUTE, open, level, 0.2));
+  };
+  for (let i = 0; i < total - 5; i++) push(i, Math.floor(i / 4) % 2 === 0 ? step : -step);
+  // Ultime quattro candele verso il bordo da cui si rientra, poi la candela di rifiuto.
+  for (let i = total - 5; i < total - 1; i++) push(i, direction === "BUY" ? -step : step);
+  m1.push(bar(end, level, level + (direction === "BUY" ? lastBody : lastBody), 0.15));
+  const window = m1.slice(-8);
+  const high = Math.max(...window.map(c => c.high)), low = Math.min(...window.map(c => c.low));
+  const offset = options.offset ?? 0.3;
+  const ask = direction === "BUY" ? low + offset : high - offset;
+  const bid = direction === "BUY" ? ask - 0.12 : ask;
+  return { nowMs: base.nowMs, m1, m5,
+    quote: { bid: direction === "BUY" ? ask - 0.12 : high - offset, ask: direction === "BUY" ? ask : high - offset + 0.12,
+      mid: bid + 0.06, spread: 0.12, quotedAt: base.nowMs } };
+}
+check("m1_range: BUY sul rientro dal minimo del range", () => {
+  withRange({}, () => {
+    const input = rangeInput();
+    const s = evaluateScalper(input);
+    assert.equal(s.direction, "BUY", JSON.stringify(s));
+    assert.equal(s.setup, "m1_range");
+    const gate = s.evaluations.find(e => e.setup === "range_gate")!;
+    assert.equal(gate.status, "triggered");
+    assert.match(gate.reason, /range 8 M1 chiuse \d+\.\d\d-\d+\.\d\d \(\d+\.\d\d\$ = \d+\.\d\d ATR\)/);
+    assert.match(gate.reason, /distanza dal bordo \d+\.\d\d\$, SL \d+\.\d\d\$, TP \d+\.\d\d\$/);
+    // SL oltre il bordo + SL_BUFFER_USD, con minimo 1 ATR; TP sul lato opposto - TP_BUFFER_USD.
+    const closed = input.m1.slice(-8);
+    const low = Math.min(...closed.map(c => c.low)), high = Math.max(...closed.map(c => c.high));
+    const atrM1 = s.slPlan!.atr;
+    assert.ok(Math.abs(s.stopLoss! - (s.entry! - Math.max(s.entry! - low + 0.3, atrM1))) <= 0.011, JSON.stringify(s.slPlan));
+    assert.ok(Math.abs(s.takeProfit! - (s.entry! + (high - s.entry! - 0.3))) <= 0.011, JSON.stringify(s));
+    assert.ok(plannedEntryValid(s, input.quote));
+  });
+});
+check("m1_range: SELL speculare sul rientro dal massimo", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ direction: "SELL" }));
+    assert.equal(s.direction, "SELL", JSON.stringify(s));
+    assert.equal(s.setup, "m1_range");
+    assert.ok(s.stopLoss! > s.entry! && s.takeProfit! < s.entry!);
+  });
+});
+check("m1_range: senza candela di rifiuto non entra", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ lastBody: -0.3 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /nessun rientro dal bordo/);
+  });
+});
+check("m1_range: prezzo lontano dal bordo non entra", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ offset: 2.5 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /nessun rientro dal bordo/);
+  });
+});
+check("m1_range: range troppo stretto non e' un setup", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(rangeInput({ step: 0.55 }));
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /range troppo stretto/);
+  });
+});
+check("m1_range: SL oltre il massimo scarta", () => {
+  withRange({ RANGE_SL_MAX_USD: "0.5" }, () => {
+    const s = evaluateScalper(rangeInput());
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /oltre il massimo 0\.50\$/);
+  });
+});
+check("m1_range: TP sotto il minimo scarta", () => {
+  withRange({ RANGE_TP_MIN_USD: "50" }, () => {
+    const s = evaluateScalper(rangeInput());
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.match(s.evaluations.find(e => e.setup === "range_gate")!.reason, /sotto il minimo 50\.00\$/);
+  });
+});
+check("m1_range: un tentativo per bordo, riarmato dal nuovo range", () => {
+  withRange({}, () => {
+    const input = rangeInput();
+    const first = evaluateScalper(input);
+    assert.equal(first.setup, "m1_range", JSON.stringify(first));
+    const closed = input.m1.at(-1)!;
+    assert.ok(first.setupKey!.startsWith("m1-range-v1:BUY:"), first.setupKey ?? "");
+    assert.ok(first.setupKey!.includes(closed.datetime), first.setupKey ?? "");
+    // Altro tick sullo stesso bordo: chiave invariata, nessun secondo ordine.
+    const again = { ...input, quote: { ...input.quote, ask: input.quote.ask + 0.05, bid: input.quote.bid + 0.05, mid: input.quote.mid + 0.05 } };
+    assert.equal(evaluateScalper(again).setupKey, first.setupKey);
+    // Nuova M1 chiusa: nuovo range, chiave diversa.
+    const next = { ...input, nowMs: input.nowMs + MINUTE, m1: [...input.m1], quote: { ...input.quote, quotedAt: input.nowMs + MINUTE } };
+    next.m1.push(bar(Date.parse(closed.datetime) + MINUTE, closed.open, closed.close, 0.15));
+    const after = evaluateScalper(next);
+    assert.equal(after.setup, "m1_range", JSON.stringify(after));
+    assert.notEqual(after.setupKey, first.setupKey);
+  });
+});
+check("m1_range: la mtf ha la precedenza e RANGE_ENABLED=false lo spegne", () => {
+  withRange({}, () => {
+    const s = evaluateScalper(fixture());
+    assert.equal(s.setup, "micro_pullback", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "range_gate"));
+  });
+  withRange({ RANGE_ENABLED: "false" }, () => {
+    const s = evaluateScalper(rangeInput());
+    assert.equal(s.direction, "NO_TRADE", JSON.stringify(s));
+    assert.ok(!s.evaluations.some(e => e.setup === "range_gate"));
   });
 });
 console.log(passed + " scenari superati.");
