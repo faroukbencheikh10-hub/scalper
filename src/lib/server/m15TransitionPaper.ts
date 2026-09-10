@@ -1,6 +1,6 @@
 export type BiasM5 = "up" | "down" | "flat";
 export type M15Structure = "trend_up" | "trend_down" | "unclear";
-export type M15PaperRegime = "trend_up" | "trend_down" | "true_range" | "transition";
+export type M15PaperRegime = "trend_up" | "trend_down" | "true_range" | "transition" | "invalid";
 
 export type M15PaperInput = {
   biasM5: BiasM5;
@@ -29,19 +29,23 @@ export type PaperGateDecision = {
  */
 export function classifyM15PaperRegime(input: Pick<M15PaperInput,
   "structure" | "m15BandAtr" | "maxBandAtr" | "priceInsideRangeBand">): M15PaperRegime {
+  if (!Number.isFinite(input.m15BandAtr) || input.m15BandAtr < 0
+    || !Number.isFinite(input.maxBandAtr) || input.maxBandAtr <= 0) return "invalid";
+
+  const compressed = input.m15BandAtr <= input.maxBandAtr;
+
+  // A real compressed range has priority over apparent swing structure while price remains inside.
+  // This preserves the anti-range protection instead of allowing a directional setup inside compression.
+  if (compressed && input.priceInsideRangeBand) return "true_range";
+
   if (input.structure === "trend_up") return "trend_up";
   if (input.structure === "trend_down") return "trend_down";
-
-  const compressed = Number.isFinite(input.m15BandAtr)
-    && Number.isFinite(input.maxBandAtr)
-    && input.m15BandAtr <= input.maxBandAtr;
-
-  if (compressed && input.priceInsideRangeBand) return "true_range";
   return "transition";
 }
 
 /**
  * Proposed paper gate for m1_short:
+ * - invalid M15 metrics: fail closed;
  * - flat M5: no directional short setup;
  * - true M15 range: keep blocking m1_short;
  * - confirmed M15 trend opposite M5: block;
@@ -52,6 +56,7 @@ export function evaluateShortContextPaper(input: M15PaperInput): PaperGateDecisi
   const regime = classifyM15PaperRegime(input);
   const allowed = input.biasM5 === "up" ? "BUY" : input.biasM5 === "down" ? "SELL" : null;
 
+  if (regime === "invalid") return { allowed: null, regime, reason: "m15 metrics invalid" };
   if (!allowed) return { allowed: null, regime, reason: "bias_m5=flat" };
   if (regime === "true_range") return { allowed: null, regime, reason: "m15=true_range" };
   if (allowed === "BUY" && regime === "trend_down") {
@@ -74,6 +79,7 @@ export function evaluateShortContextPaper(input: M15PaperInput): PaperGateDecisi
 /** Paper model for m1_range: only a real compressed range with flat M5 qualifies. */
 export function evaluateRangeContextPaper(input: M15PaperInput): PaperGateDecision {
   const regime = classifyM15PaperRegime(input);
+  if (regime === "invalid") return { allowed: null, regime, reason: "m15 metrics invalid" };
   if (input.breakoutRecent) return { allowed: null, regime, reason: "m15_breakout_recent=true" };
   if (input.biasM5 !== "flat") return { allowed: null, regime, reason: `bias_m5=${input.biasM5}` };
   if (regime !== "true_range") return { allowed: null, regime, reason: `m15=${regime}, non true_range` };
