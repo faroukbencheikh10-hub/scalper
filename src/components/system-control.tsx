@@ -133,6 +133,11 @@ export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLos
       </label>
     </div>
 
+    <div style={{ marginTop: 14, padding: "10px 12px", borderRadius: 10, border: "1px solid rgba(128,190,255,.35)", background: "rgba(38,75,120,.16)" }}>
+      <strong style={{ display: "block", color: "#b9dcff", marginBottom: 4 }}>SUPER SCALPER · MODELLO DINAMICO</strong>
+      <span style={{ color: "#cbd8ea" }}>SL e TP calcolati dal codice con ATR M1 + spread · SL dinamico immediato · nessuna soglia minima di profitto · lo SL può solo stringersi, mai allargarsi.</span>
+    </div>
+
     <p className="lot-metrics">
       Margine richiesto <strong className={marginShort ? "negative" : undefined}>≈ {amount(margin)} {currency}</strong>
       {" · "}Perdita a SL <strong className="negative">≈ {amount(risk)} {currency}</strong>
