@@ -105,7 +105,16 @@ export function plannedEntryValid(signal: ScalperSignal, quote: Quote) {
   return (reward - cost) / (risk + cost) >= signal.slPlan.minNetR;
 }
 
-type EvaluateInput = { quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number };
+type EvaluateInput = {
+  quote: Quote; m1: Candle[]; m5: Candle[]; nowMs?: number;
+  /**
+   * Esclusione esterna dalla valutazione (es. sessionLiquidity.ts in liquidita' LOW), oltre a
+   * SHORT_ENABLED/RANGE_ENABLED: nessuna modifica ai criteri d'ingresso dei setup, solo un gate
+   * aggiuntivo su SE vengono valutati, esattamente allo stesso punto dei due toggle esistenti.
+   */
+  disableShort?: boolean;
+  disableRange?: boolean;
+};
 
 /** Pure evaluation: a preview or failed preflight never consumes a setup. */
 function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
@@ -701,16 +710,18 @@ export function evaluateScalper(input: EvaluateInput): ScalperSignal {
   const mtf = evaluateMtfContinuation(input);
   if (mtf.direction !== "NO_TRADE") return mtf;
   let evaluations = [...mtf.evaluations];
+  const shortActive = shortEnabled() && !input.disableShort;
+  const rangeActive = rangeEnabled() && !input.disableRange;
   // Contesto M5/M15 letto una volta sola e condiviso dai due setup che lo usano.
-  const context = shortEnabled() || rangeEnabled()
+  const context = shortActive || rangeActive
     ? contextM5M15(closedBars(input.m5, 5, nowMs) ?? [], nowMs)
     : null;
-  if (shortEnabled()) {
+  if (shortActive) {
     const short = evaluateM1Short(input, nowMs, context);
     evaluations = [...evaluations, ...short.evaluations];
     if (short.direction !== "NO_TRADE") return { ...short, evaluations };
   }
-  if (rangeEnabled()) {
+  if (rangeActive) {
     const ranged = evaluateM1Range(input, nowMs, context);
     evaluations = [...evaluations, ...ranged.evaluations];
     if (ranged.direction !== "NO_TRADE") return { ...ranged, evaluations };

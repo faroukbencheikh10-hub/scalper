@@ -389,6 +389,20 @@ check("m1_short entra sulla rottura del range M1 quando la mtf non produce nulla
     assert.ok(plannedEntryValid(s, input.quote), "il piano deve restare valido al preflight finale");
   });
 });
+check("disableShort (liquidita' LOW): stesso input che entrerebbe in m1_short resta NO_TRADE", () => {
+  withShort({}, () => {
+    const input = shortInput();
+    const blocked = evaluateScalper({ ...input, disableShort: true });
+    assert.equal(blocked.direction, "NO_TRADE", JSON.stringify(blocked));
+    assert.ok(!blocked.evaluations.some(e => e.setup === "m1_gate"), "m1_short non deve essere valutato con disableShort");
+    // SHORT_ENABLED resta true: la sola causa del blocco e' il flag passato dal worker.
+    assert.equal(process.env.SHORT_ENABLED, "true");
+    // Senza il flag lo stesso identico input entra come prima: la modifica non tocca i criteri.
+    const allowed = evaluateScalper(input);
+    assert.equal(allowed.direction, "BUY");
+    assert.equal(allowed.setup, "m1_short");
+  });
+});
 check("La mtf ha la precedenza sul m1_short", () => {
   withShort({}, () => {
     const s = evaluateScalper(fixture());
@@ -536,6 +550,18 @@ check("m1_range: BUY sul rientro dal minimo del range", () => {
     assert.ok(Math.abs(s.stopLoss! - (s.entry! - floor)) <= 0.011, JSON.stringify(s.slPlan));
     assert.ok(Math.abs(s.takeProfit! - (s.entry! + (high - s.entry! - 0.3))) <= 0.011, JSON.stringify(s));
     assert.ok(plannedEntryValid(s, input.quote));
+  });
+});
+check("disableRange (liquidita' LOW): stesso input che entrerebbe in m1_range resta NO_TRADE", () => {
+  withRange({}, () => {
+    const input = rangeInput();
+    const blocked = evaluateScalper({ ...input, disableRange: true });
+    assert.equal(blocked.direction, "NO_TRADE", JSON.stringify(blocked));
+    assert.ok(!blocked.evaluations.some(e => e.setup === "range_gate"), "m1_range non deve essere valutato con disableRange");
+    assert.equal(process.env.RANGE_ENABLED, "true");
+    const allowed = evaluateScalper(input);
+    assert.equal(allowed.direction, "BUY");
+    assert.equal(allowed.setup, "m1_range");
   });
 });
 check("m1_range: SELL speculare sul rientro dal massimo", () => {

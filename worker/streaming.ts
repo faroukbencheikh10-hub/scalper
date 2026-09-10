@@ -20,6 +20,7 @@ import {
   type SltpMode,
 } from "../src/lib/server/dynamicSlTp";
 import { riskPerLot } from "../src/lib/server/orderSafety";
+import { sessionLiquiditySnapshot } from "../src/lib/server/sessionLiquidity";
 import { staleQuoteDecision } from "../src/lib/server/staleQuoteGuard";
 import { encodeWorkerHeartbeat } from "../src/lib/server/workerHeartbeat";
 import { setupLabel } from "../src/lib/setups";
@@ -1178,6 +1179,16 @@ async function main() {
       return;
     }
 
+    // Sessioni forex reali e livello di liquidita' del momento, DENTRO la fascia SCALPER_HOURS_UTC
+    // gia' verificata sopra: non cambia mai se il worker e' dentro o fuori sessione, solo quali
+    // setup valutare (LOW esclude m1_short/m1_range) e quanti lotti usare per l'ingresso.
+    const liquidity = sessionLiquiditySnapshot(quote.quotedAt ?? Date.now());
+    const liquidityEvaluation: SetupEvaluation = { setup: "session_liquidity", status: "triggered", reason: liquidity.reason };
+    const withLiquidityEvaluation = (signal: ScalperSignal): ScalperSignal => {
+      signal.evaluations = [liquidityEvaluation, ...signal.evaluations];
+      return signal;
+    };
+
     // Le posizioni si leggono da terminalState: una posizione e' chiusa solo dopo conferma MetaApi.
     const openPositions = (tradingConnection.terminalState.positions ?? [])
       .filter((position) => position.symbol === symbol()) as ManagedPosition[];
@@ -1218,7 +1229,7 @@ async function main() {
     if (entryBlockedByOpenPositions(openPositions.length, maxOpenPositions)) {
       // In posizione nessun setup viene valutato per l'ingresso: la valutazione resta diagnostica e
       // serve solo a registrare i segnali contrari, che non chiudono e non invertono mai.
-      const watching = evaluateScalper({ quote, m1, m5 });
+      const watching = withLiquidityEvaluation(evaluateScalper({ quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
       const reason = `Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`;
       latestDecision = noTradeDecision(reason, quote, { setup: watching.setup, evaluations: watching.evaluations });
       const openDirections = openPositions.map(positionDirection).filter((value): value is "BUY" | "SELL" => value !== null);
@@ -1229,7 +1240,7 @@ async function main() {
       return;
     }
 
-    const signal = evaluateScalper({ quote, m1, m5 });
+    const signal = withLiquidityEvaluation(evaluateScalper({ quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
     latestDecision = {
       at: new Date().toISOString(),
       mode: "event_driven_intrabar_fast_preflight",
@@ -1380,7 +1391,7 @@ async function main() {
         return;
       }
 
-      const finalSignal = evaluateScalper({ quote: finalQuote, m1, m5 });
+      const finalSignal = withLiquidityEvaluation(evaluateScalper({ quote: finalQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
       if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup || finalSignal.setupKey !== signal.setupKey) {
         const reason = finalSignal.direction === "NO_TRADE"
           ? `Final preflight: ${signal.direction}/${signal.setup ?? "—"} invalidato — ${finalSignal.reasoning}`
@@ -1467,7 +1478,11 @@ async function main() {
         Number(connection.terminalState.specification(symbol())?.tickSize),
         Number(connection.terminalState.price(symbol())?.lossTickValue));
       const orderRisk = (size: number) => perLot === null ? lossAtStop(size, slDistance) : size * perLot;
-      let orderLots = activeLots;
+      // Liquidita' del momento: lotti ridotti in MEDIUM/LOW (1 in HIGH, nessuna modifica),
+      // arrotondati al passo lotti del broker con lo stesso clampLots usato ovunque nel worker.
+      // Il cap di rischio sotto puo' ancora ridurli ulteriormente, mai riportarli sopra.
+      const sessionLots = clampLots(activeLots * liquidity.lotMultiplier);
+      let orderLots = sessionLots;
       let lotsCapped = false;
       if (riskCap !== null && orderRisk(orderLots) > riskCap) {
         const reduced = clampLots(riskFallbackLots);
@@ -1500,6 +1515,9 @@ async function main() {
         lots: orderLots,
         requestedLots: activeLots,
         lotsCapped,
+        liquidityLevel: liquidity.level,
+        liquidityActiveSessions: liquidity.activeSessions,
+        liquidityLotMultiplier: liquidity.lotMultiplier,
         managedExit,
         target1,
         tpBroker: brokerTp,
@@ -1519,7 +1537,7 @@ async function main() {
 
       const sendQuote = latestQuote ?? finalQuote;
       const sendAgeMs = quoteAgeMs(sendQuote);
-      const sendCheck = evaluateScalper({ quote: sendQuote, m1, m5 });
+      const sendCheck = withLiquidityEvaluation(evaluateScalper({ quote: sendQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
       const entryDrift = sendCheck.direction === "NO_TRADE" || sendCheck.entry === null
         ? Number.POSITIVE_INFINITY
         : Math.abs(sendCheck.entry - finalSignal.entry!);
@@ -1668,14 +1686,18 @@ async function main() {
         }
         const targetLabel = managedExit ? "Target1" : "TP";
         const sltpLabel = activeSltpMode === "trailing" ? "TP trailing" : activeSltpMode === "fixed" ? "TP fisso" : targetLabel;
+        const lotsAdjustedNote = orderLots !== activeLots
+          ? ` (da ${activeLots}${liquidity.lotMultiplier !== 1 ? ` × ${liquidity.lotMultiplier} liquidita' ${liquidity.level}` : ""}${lotsCapped ? ", ridotti per il cap rischio" : ""})`
+          : "";
         void sendTelegram(
           `\u{1f7e2} SCALPER ${symbol()} · apertura ${finalSignal.direction}`
-          + `\nlotti ${orderLots}${lotsCapped ? ` (ridotti da ${activeLots} per il cap rischio)` : ""}`
+          + `\nlotti ${orderLots}${lotsAdjustedNote}`
           + ` · entry ${money(finalSignal.entry)} · SL ${money(finalSignal.stopLoss)} · ${sltpLabel} ${money(target1)}`
           + `\nSL ${money(riskPlan.slDistance)}$ · ${sltpLabel} ${money(riskPlan.target1Distance)}$ a ${finalSignal.riskReward}R`
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `${managedExit ? `\nTP broker (sicurezza) ${money(brokerTp)} a ${money(riskPlan.tpBrokerDistance)}$ · uscita gestita: breakeven a Target1 poi trailing M5` : ""}`
           + `${useSltpEngine ? `\nSLTP_MODE=${activeSltpMode}: SL da struttura, si stringe soltanto${activeSltpMode === "trailing" ? "; TP trailing dopo il trigger di estensione" : "; TP fisso"}.` : ""}`
+          + `\nliquidita' ${liquidity.level} · sessioni attive: ${liquidity.activeSessions.length ? liquidity.activeSessions.join(", ") : "nessuna"}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );
       } else if (execution.status === "error" || execution.status === "pending_confirmation") {

@@ -246,7 +246,11 @@ STOP TUTTO richiede al worker la chiusura delle posizioni XAUUSD e la cancellazi
 
 ## Scenari sintetici
 
-`npm run scenarios` esegue scenari deterministici offline (mtf con `SHORT_ENABLED=false`, più un blocco dedicato al `m1_short`) per BUY/SELL, M15 in range, M5 pullback/retest, conferma M1, dati mancanti, costi, stop, ripetizione dei preflight, recupero ordini e rischio con tick value, più il gate M15 a 4 stati (`scripts/m15-gate-scenarios.ts`, inclusa la non-regressione con `M15_GATE_MODE=off` e una matrice di 72 combinazioni M5×M15) e SL/TP da struttura (`scripts/sltp-scenarios.ts`, `SLTP_MODE=fixed`/`trailing`/`off`). Non chiama MetaApi né il database.
+`npm run scenarios` esegue scenari deterministici offline (mtf con `SHORT_ENABLED=false`, più un blocco dedicato al `m1_short`) per BUY/SELL, M15 in range, M5 pullback/retest, conferma M1, dati mancanti, costi, stop, ripetizione dei preflight, recupero ordini e rischio con tick value, più il gate M15 a 4 stati (`scripts/m15-gate-scenarios.ts`, inclusa la non-regressione con `M15_GATE_MODE=off` e una matrice di 72 combinazioni M5×M15), SL/TP da struttura (`scripts/sltp-scenarios.ts`, `SLTP_MODE=fixed`/`trailing`/`off`) e sessioni/liquidità (`scripts/session-liquidity-scenarios.ts`, un orario per fascia LOW/MEDIUM/HIGH più la disattivazione di `m1_short`/`m1_range` in LOW). Non chiama MetaApi né il database.
+
+### Sessioni forex e liquidità (`SESSION_LOT_MULT_MEDIUM`/`SESSION_LOT_MULT_LOW`)
+
+`src/lib/server/sessionLiquidity.ts` legge solo l'ora UTC del tick, dentro la fascia `SCALPER_HOURS_UTC` già esistente (non la tocca, né il flatten di fine fascia): Sydney 21:00–06:00, Tokyo 00:00–09:00, Londra 07:00–16:00, New York 12:00–21:00 UTC. Livello di liquidità: `LOW` 06:00–07:00 (solo coda Tokyo, `mtf` attivo, `m1_short`/`m1_range` esclusi dalla valutazione), `MEDIUM` 07:00–12:00 e 16:00–20:30 (una sola piazza, tutti e tre i setup attivi, lotti × `SESSION_LOT_MULT_MEDIUM`, default 0.7), `HIGH` 12:00–16:00 (overlap Londra–New York, nessuna modifica). I lotti risultanti passano dallo stesso `clampLots` usato ovunque nel worker, quindi restano sempre arrotondati al passo lotti del broker. Il livello calcolato e le sessioni attive compaiono come voce `session_liquidity` in `stream_last_decision.evaluations` ad ogni tick e nel messaggio Telegram di ogni apertura.
 
 ## Avvio web
 
