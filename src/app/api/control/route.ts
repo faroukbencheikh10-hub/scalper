@@ -6,9 +6,31 @@ import {
   clampFastTpUsd, DEFAULT_FAST_TP_USD, EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY,
   MIN_FAST_TP_USD, resolveExitMode, resolveFastTpUsd,
 } from "@/lib/exitMode";
+import {
+  parseHhMm, resolveScheduledCloseConfig, scheduledCloseStatus, SCHEDULED_CLOSE_ENABLED_KEY,
+  SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
+  SCHEDULED_CLOSE_TIMEZONE,
+} from "@/lib/scheduledClose";
 import { dashboardGuard } from "@/lib/server/dashboardAuth";
 
 export const dynamic = "force-dynamic";
+
+/** Le quattro chiavi della chiusura programmata, lette esattamente come le legge il worker. */
+async function readScheduledCloseConfig() {
+  const [enabled, startLocal, endLocal, timeZone] = await Promise.all([
+    getSetting(SCHEDULED_CLOSE_ENABLED_KEY),
+    getSetting(SCHEDULED_CLOSE_START_KEY),
+    getSetting(SCHEDULED_CLOSE_END_KEY),
+    getSetting(SCHEDULED_CLOSE_TIMEZONE_KEY),
+  ]);
+  const values: Record<string, string | undefined> = {
+    [SCHEDULED_CLOSE_ENABLED_KEY]: enabled,
+    [SCHEDULED_CLOSE_START_KEY]: startLocal,
+    [SCHEDULED_CLOSE_END_KEY]: endLocal,
+    [SCHEDULED_CLOSE_TIMEZONE_KEY]: timeZone,
+  };
+  return resolveScheduledCloseConfig((key) => values[key]);
+}
 
 export async function GET(req: NextRequest) {
   const denied = await dashboardGuard(req);
@@ -26,6 +48,7 @@ export async function GET(req: NextRequest) {
       exitMode: resolveExitMode(await getSetting(EXIT_MODE_SETTING_KEY)),
       fastTpUsd: resolveFastTpUsd(await getSetting(FAST_TP_USD_SETTING_KEY)),
       fastTpUsdMin: MIN_FAST_TP_USD,
+      scheduledClose: scheduledCloseStatus(new Date(), await readScheduledCloseConfig()),
     });
   } catch (err) {
     return NextResponse.json({ ok: false, error: err instanceof Error ? err.message : String(err) }, { status: 500 });
@@ -80,6 +103,47 @@ export async function POST(req: NextRequest) {
         note: exitMode === "fast"
           ? `Modalita' fast attiva: target ${appliedTp.toFixed(2)}$ dall'entry${appliedTp !== requestedTp ? ` (richiesti ${requestedTp}, minimo ${MIN_FAST_TP_USD})` : ""}. Si applica solo alle nuove posizioni, non a quelle gia' aperte.`
           : "Modalita' normale attiva: target1, breakeven e trailing come prima. Si applica solo alle nuove posizioni, non a quelle gia' aperte.",
+      });
+    }
+
+    if (body?.action === "set_scheduled_close") {
+      // Gli orari arrivano gia' convertiti nel fuso di riferimento dalla dashboard, come "HH:MM".
+      // Si scrivono solo se presenti nel body: spegnere la programmazione non li cancella mai.
+      for (const [field, value] of [["startLocal", body.startLocal], ["endLocal", body.endLocal]] as const) {
+        if (value !== undefined && parseHhMm(typeof value === "string" ? value : null) === null) {
+          return NextResponse.json({ ok: false, error: `${field} deve essere "HH:MM"` }, { status: 400 });
+        }
+      }
+      if (body.startLocal !== undefined) await setSetting(SCHEDULED_CLOSE_START_KEY, String(body.startLocal).trim());
+      if (body.endLocal !== undefined) await setSetting(SCHEDULED_CLOSE_END_KEY, String(body.endLocal).trim());
+      await setSetting(SCHEDULED_CLOSE_TIMEZONE_KEY, SCHEDULED_CLOSE_TIMEZONE);
+
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== "boolean") {
+          return NextResponse.json({ ok: false, error: "enabled boolean richiesto" }, { status: 400 });
+        }
+        // Si accende solo con una finestra davvero utilizzabile: due orari validi e diversi.
+        if (body.enabled) {
+          const pending = await readScheduledCloseConfig();
+          if (!scheduledCloseStatus(new Date(), pending).configured) {
+            return NextResponse.json(
+              { ok: false, error: "Imposta prima due orari validi e diversi fra loro." },
+              { status: 400 },
+            );
+          }
+        }
+        await setSetting(SCHEDULED_CLOSE_ENABLED_KEY, body.enabled ? "true" : "false");
+      }
+
+      const status = scheduledCloseStatus(new Date(), await readScheduledCloseConfig());
+      return NextResponse.json({
+        ok: true,
+        scheduledClose: status,
+        note: !status.enabled
+          ? "Chiusura programmata spenta: nessun effetto sulle aperture. Gli orari restano salvati."
+          : status.active
+            ? `Chiusura programmata attiva e in corso (${status.startLocal}-${status.endLocal} ${status.timeZone}): nessun nuovo ordine fino alle ${status.endLocal}. Le posizioni gia' aperte restano gestite normalmente.`
+            : `Chiusura programmata attiva: nessun nuovo ordine dalle ${status.startLocal} alle ${status.endLocal} (${status.timeZone}). Fuori da quella finestra il bot opera come sempre.`,
       });
     }
 
