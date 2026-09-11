@@ -388,24 +388,26 @@ function rejectContext(reason: string, direction?: "BUY" | "SELL"): ScalperSigna
 }
 
 /**
- * Contesto obbligatorio per m1_short: si opera solo nella direzione del bias M5, con l'M15 dalla
- * stessa parte, mai in range e mai subito dopo una rottura M15.
+ * Contesto obbligatorio per m1_short: si opera solo nella direzione del bias M5, mai contro un
+ * bias M15 esplicito e opposto, e mai subito dopo una rottura M15.
  *
- * M15_GATE_MODE=off (default): comportamento invariato bit per bit, sul m15State a 3 valori.
- * M15_GATE_MODE=live: gate a 4 stati sul m15Regime. true_range e trend opposto bloccano sempre
- * come prima; la differenza e' che "transition" (M15 non ancora confermato ma non un range vero)
- * non blocca piu' da sola: il bias M5 puo' portare il trade, la zona grigia si sblocca.
+ * M15_GATE_MODE=off (default): comportamento invariato bit per bit, sul m15State a 3 valori
+ * (qui "range" blocca ancora sempre, a differenza di true_range in modalita' live: nessuna
+ * modifica a questo ramo).
+ * M15_GATE_MODE=live: gate a 4 stati sul m15Regime. Blocca solo un trend M15 esplicito e
+ * contrario al bias M5, o una rottura M15 recente. true_range e transition non bloccano piu' da
+ * soli: senza un bias M15 opposto calcolabile, il bias M5 basta a portare il trade.
  */
-export function shortContextGate(label: string, context: MarketContext | null) {
+export function shortContextGate(
+  label: string,
+  context: MarketContext | null,
+): { allowed: "BUY" | "SELL" | null; blocked: ScalperSignal | null; passReason?: string } {
   if (!context) return { allowed: null, blocked: rejectContext(label + ": contesto M5/M15 non disponibile, storico M5/M15 insufficiente.") };
   const allowed: "BUY" | "SELL" | null = context.biasM5 === "up" ? "BUY" : context.biasM5 === "down" ? "SELL" : null;
   const detail = " (" + context.detail + ")";
   if (!allowed) return { allowed: null, blocked: rejectContext(label + ": bias_m5=flat" + detail + ".") };
 
   if (m15GateMode() === "live") {
-    if (context.m15Regime === "true_range") {
-      return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_regime=true_range" + detail + ".", allowed) };
-    }
     const contraryRegime: M15Regime = allowed === "BUY" ? "trend_down" : "trend_up";
     if (context.m15Regime === contraryRegime) {
       return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_regime=" + contraryRegime + " contrario al bias M5" + detail + ".", allowed) };
@@ -413,7 +415,11 @@ export function shortContextGate(label: string, context: MarketContext | null) {
     if (context.m15BreakoutRecent) {
       return { allowed: null, blocked: rejectContext(label + " " + allowed + ": m15_breakout_recent=true" + detail + ".", allowed) };
     }
-    // trend_<stessa direzione> o transition: il bias M5 porta il trade.
+    if (context.m15Regime === "true_range" || context.m15Regime === "transition") {
+      // Range o non ancora confermato: nessun bias M15 opposto calcolabile, il bias M5 basta.
+      return { allowed, blocked: null, passReason: "m15 range/transition ma nessun bias M15 opposto: consentito" };
+    }
+    // trend_<stessa direzione>: bias M15 e M5 allineati.
     return { allowed, blocked: null };
   }
 
@@ -480,7 +486,9 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number, context: MarketCon
   if (gate.blocked) return gate.blocked;
   const allowed = gate.allowed!, ctx = context!;
   const contextEval: SetupEvaluation = { setup: "context_gate", status: "triggered", direction: allowed,
-    reason: "m1_short: contesto ok, solo " + allowed + " (" + ctx.detail + ")." };
+    reason: gate.passReason
+      ? "m1_short: " + gate.passReason + " (" + ctx.detail + ")."
+      : "m1_short: contesto ok, solo " + allowed + " (" + ctx.detail + ")." };
   const rejectShort = (reason: string, direction?: "BUY" | "SELL"): ScalperSignal => {
     const signal = rejectShortGate(reason, direction);
     return { ...signal, evaluations: [contextEval, ...signal.evaluations] };
