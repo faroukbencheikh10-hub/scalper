@@ -2,6 +2,10 @@ import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
 import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
 import { autoExecEnabled, clampLots, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
+import {
+  EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY, fastTargetPrice, resolveExitMode, resolveFastTpUsd,
+  type ExitMode,
+} from "../src/lib/exitMode";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
@@ -276,13 +280,20 @@ async function main() {
   let subscribed = false;
   let ready = false;
   let activeLots = lots();
+  // exit_mode/fast_tp_usd: letti dalla dashboard come i lotti, ma fissati sulla singola posizione
+  // al momento dell'apertura (vedi orderExitMode/orderFastTpUsd piu' sotto) — un cambio qui non
+  // tocca mai le posizioni gia' aperte.
+  let activeExitMode: ExitMode = "normal";
+  let activeFastTpUsd = resolveFastTpUsd(undefined);
   // Liquidita' del momento da segnali di mercato reali (spread/tick-rate/ATR), non dall'orologio:
   // un solo stato per la vita del processo, aggiornato ad ogni tick dentro la fascia oraria.
   const liquidityState = createLiquidityState(workerStartedAtMs);
 
   const refreshControl = async () => {
-    const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY]);
+    const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY, EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY]);
     activeLots = resolveLots(settings.get(EXEC_LOTS_SETTING_KEY));
+    activeExitMode = resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY));
+    activeFastTpUsd = resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY));
     return settings.get("system_stop") === "true";
   };
 
@@ -430,6 +441,8 @@ async function main() {
     lots: activeLots,
     lotsMin: lotsMin(),
     lotsMax: lotsMax(),
+    exitMode: activeExitMode,
+    fastTpUsd: activeFastTpUsd,
     account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
@@ -1352,6 +1365,10 @@ async function main() {
       const entryContext = isManagedSetup(signal.setup)
         ? contextM5M15(closedBars(m5, 5, Date.now()) ?? [], Date.now())
         : null;
+      // Snapshot unico per l'intero ciclo di apertura: exit_mode/fast_tp_usd non devono cambiare
+      // fra la prenotazione e l'invio dell'ordine anche se la dashboard li aggiorna nel frattempo.
+      const orderExitMode: ExitMode = activeExitMode;
+      const orderFastTpUsd = activeFastTpUsd;
       const reservation = await reserveStreamingSignal({
         setupKey: signal.setupKey!,
         direction: signal.direction,
@@ -1363,6 +1380,8 @@ async function main() {
         reasoning: signal.reasoning,
         openPositionCount: openPositions.length,
         tpBroker: signal.tpBroker ?? null,
+        exitMode: orderExitMode,
+        fastTpUsd: orderExitMode === "fast" ? orderFastTpUsd : null,
         context: entryContext === null ? null : {
           biasM5: entryContext.biasM5,
           m15State: entryContext.m15State,
@@ -1473,6 +1492,16 @@ async function main() {
         finalSignal.tpBroker = null;
       }
 
+      // exit_mode=fast: TP fisso a orderFastTpUsd dall'entry, sempre l'unico target mandato al
+      // broker — sostituisce il TP della strategia (e quello di SLTP_MODE, se mai attivo insieme).
+      // Il SL resta quello gia' calcolato sopra: nessun impatto sull'emergenza.
+      if (orderExitMode === "fast") {
+        const fastTarget = fastTargetPrice(finalSignal.direction as "BUY" | "SELL", finalSignal.entry!, orderFastTpUsd);
+        finalSignal.takeProfit = fastTarget;
+        finalSignal.tpBroker = fastTarget;
+        finalSignal.reasoning = `${finalSignal.reasoning} · exit_mode=fast: TP ${orderFastTpUsd}$ dall'entry, chiusura immediata, nessun breakeven/trailing.`;
+      }
+
       await dbQuery(
         `UPDATE scalper_signals
             SET entry=$2,stop_loss=$3,take_profit=$4,risk_reward=$5,reasoning=$6,
@@ -1521,7 +1550,7 @@ async function main() {
       // Con SLTP_MODE attivo il motore cambia del tutto (vedi sltpExits sotto): l'uscita gestita
       // "classica" (breakeven poi trailing M5) resta solo per SLTP_MODE=off, come oggi in main.
       const useSltpEngine = activeSltpMode !== "off";
-      const managedExit = !useSltpEngine && isManagedSetup(finalSignal.setup);
+      const managedExit = orderExitMode !== "fast" && !useSltpEngine && isManagedSetup(finalSignal.setup);
       const target1 = finalSignal.takeProfit!;
       // Ogni ordine parte con SL e TP: sui setup gestiti il TP e' la rete di sicurezza, non l'obiettivo.
       const brokerTp = managedExit ? finalSignal.tpBroker ?? null : finalSignal.takeProfit!;
@@ -1541,6 +1570,8 @@ async function main() {
         liquidityAtrRatio: liquidity.snapshot.atrRatio,
         liquidityWarmup: liquidity.snapshot.warmup,
         managedExit,
+        exitMode: orderExitMode,
+        fastTpUsd: orderExitMode === "fast" ? orderFastTpUsd : null,
         target1,
         tpBroker: brokerTp,
         tpBrokerDistance: Number(Math.abs(Number(brokerTp) - finalSignal.entry!).toFixed(2)),
@@ -1567,7 +1598,9 @@ async function main() {
       // plannedEntryValid ricontrolla il piano R:R/minNetR della STRATEGIA: con SLTP_MODE attivo
       // SL/TP sono gia' stati sostituiti sopra con quelli da struttura, che rispondono ai loro
       // stessi vincoli (sltpInitial.valid, gia' verificato) e non a quelli del setup originale.
-      const plannedInvalid = !useSltpEngine && !plannedEntryValid(finalSignal, sendQuote);
+      // exit_mode=fast: stesso discorso, il TP e' ormai il target fisso in $, non il piano R:R del
+      // setup originale.
+      const plannedInvalid = orderExitMode !== "fast" && !useSltpEngine && !plannedEntryValid(finalSignal, sendQuote);
       if (
         sendAgeMs > finalQuoteMaxAgeMs
         || sendCheck.direction !== finalSignal.direction
@@ -1682,7 +1715,7 @@ async function main() {
           missingPositions.delete(state.positionId);
           await persistManagedExit(state).catch((error) => console.error(error));
         }
-        if (useSltpEngine && execution.status === "opened" && execution.positionId) {
+        if (useSltpEngine && orderExitMode !== "fast" && execution.status === "opened" && execution.positionId) {
           // SL/TP da struttura: si riparte dal fill reale quando disponibile, altrimenti
           // dall'entry teorica (corretto comunque dai ricalcoli successivi ad ogni tick).
           const filled = Number(execution.openPrice);
@@ -1718,7 +1751,8 @@ async function main() {
           + `\nSL ${money(riskPlan.slDistance)}$ · ${sltpLabel} ${money(riskPlan.target1Distance)}$ a ${finalSignal.riskReward}R`
           + ` · rischio ${money(riskPlan.risk)} ${riskPlan.currency ?? "EUR"}${riskPlan.riskPct === null ? "" : ` (${money(riskPlan.riskPct)}% del saldo)`}`
           + `${managedExit ? `\nTP broker (sicurezza) ${money(brokerTp)} a ${money(riskPlan.tpBrokerDistance)}$ · uscita gestita: breakeven a Target1 poi trailing M5` : ""}`
-          + `${useSltpEngine ? `\nSLTP_MODE=${activeSltpMode}: SL da struttura, si stringe soltanto${activeSltpMode === "trailing" ? "; TP trailing dopo il trigger di estensione" : "; TP fisso"}.` : ""}`
+          + `${orderExitMode === "fast" ? `\nexit_mode=fast: TP ${orderFastTpUsd}$ dall'entry, chiusura immediata, nessun breakeven/trailing.` : ""}`
+          + `${useSltpEngine && orderExitMode !== "fast" ? `\nSLTP_MODE=${activeSltpMode}: SL da struttura, si stringe soltanto${activeSltpMode === "trailing" ? "; TP trailing dopo il trigger di estensione" : "; TP fisso"}.` : ""}`
           + `\n${describeLiquiditySnapshot(liquidity.snapshot)}`
           + `\nsetup ${setupLabel(finalSignal.setup)} (${finalSignal.setup ?? "—"}) · ${balanceLine()}`,
         );

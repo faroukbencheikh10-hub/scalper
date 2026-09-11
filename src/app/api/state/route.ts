@@ -2,6 +2,9 @@ import { NextResponse } from "next/server";
 import { dbQuery, ensureSchema } from "@/lib/server/db";
 import { lotsMax, lotsMin, resolveLots } from "@/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY, LOT_CHOICES } from "@/lib/lots";
+import {
+  EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY, MIN_FAST_TP_USD, resolveExitMode, resolveFastTpUsd,
+} from "@/lib/exitMode";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
 import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
 
@@ -18,13 +21,15 @@ const SETTING_KEYS = [
   "system_stop",
   "system_stop_changed_at",
   EXEC_LOTS_SETTING_KEY,
+  EXIT_MODE_SETTING_KEY,
+  FAST_TP_USD_SETTING_KEY,
 ] as const;
 
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type ParsedError = { raw: string; message: string; at: string | null; atMs: number | null };
 type WorkerAccount = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
-type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
+type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; exitMode?: "normal" | "fast"; fastTpUsd?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
 
 function parseJson<T = Record<string, unknown>>(value: string | undefined): T | null {
   if (!value) return null;
@@ -117,6 +122,9 @@ export async function GET() {
       lotsMin: lotsMin(),
       lotsMax: lotsMax(),
       lotChoices: LOT_CHOICES,
+      exitMode: resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY)),
+      fastTpUsd: resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY)),
+      fastTpUsdMin: MIN_FAST_TP_USD,
       account: workerDetail?.account ?? null,
       results: { total: Number(st.total ?? 0), wins, losses, breakeven: Number(st.breakeven ?? 0), winRate: decided > 0 ? Number(((wins / decided) * 100).toFixed(1)) : 0, profit: Number(st.profit ?? 0), resultR: Number(st.result_r ?? 0), last: lastClosed.rows[0] ?? null },
       stream: { status: workerStatus, heartbeat: workerHeartbeat.at, heartbeatData: { at: workerHeartbeat.at, quoteAgeSec: workerHeartbeat.quoteAgeSec }, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },

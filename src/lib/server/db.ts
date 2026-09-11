@@ -56,6 +56,10 @@ export async function ensureSchema() {
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS close_reason text;
     -- TP di sicurezza inviato al broker, distinto da target1 che resta l'obiettivo gestito dal worker.
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS tp_broker numeric;
+    -- exit_mode/fast_tp_usd: letti da scalper_settings al momento dell'apertura e fissati sulla riga,
+    -- cosi' un cambio di modalita' dalla dashboard non tocca mai le posizioni gia' aperte.
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS exit_mode text NOT NULL DEFAULT 'normal';
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS fast_tp_usd numeric;
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
     CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)
       WHERE outcome IS NULL AND direction IN ('BUY','SELL');
@@ -131,6 +135,8 @@ export async function ensureSchema() {
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS final_sl numeric;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS close_reason text;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS tp_broker numeric;
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_mode text NOT NULL DEFAULT 'normal';
+    ALTER TABLE trades ADD COLUMN IF NOT EXISTS fast_tp_usd numeric;
     ALTER TABLE trades ADD COLUMN IF NOT EXISTS status text;
     CREATE INDEX IF NOT EXISTS trades_closed_at_idx ON trades(closed_at DESC);
     -- Un trade con closed_at e' chiuso: allinea lo storico rimasto a 'open' per una svista.
@@ -161,23 +167,29 @@ export async function ensureSchema() {
           trailing_active=COALESCE(NEW.trailing_active,false),
           final_sl=COALESCE(NEW.final_sl,NEW.stop_loss),
           close_reason=COALESCE(NEW.close_reason,close_reason),
+          exit_mode=COALESCE(NEW.exit_mode,'normal'),
+          fast_tp_usd=NEW.fast_tp_usd,
           payload=jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score,
-                                     'closeReason',NEW.close_reason,'target1',NEW.target1,'tpBroker',NEW.tp_broker)
+                                     'closeReason',NEW.close_reason,'target1',NEW.target1,'tpBroker',NEW.tp_broker,
+                                     'exitMode',NEW.exit_mode,'fastTpUsd',NEW.fast_tp_usd)
         WHERE source='scalper' AND mt5_position_id=NEW.mt5_position_id;
         IF NOT FOUND THEN
           INSERT INTO trades(
             source,scalper_signal_id,symbol,mt5_position_id,direction,setup,lot,open_price,close_price,
             profit,result_r,reason,opened_at,closed_at,payload,status,
-            context_json,target1,tp_broker,breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason
+            context_json,target1,tp_broker,breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason,
+            exit_mode,fast_tp_usd
           ) VALUES (
             'scalper',NEW.id::text,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.setup,NEW.mt5_volume,NEW.mt5_open_price,
             NEW.mt5_close_price,NEW.mt5_profit,NEW.result_r,'normal',NEW.created_at,
             COALESCE(NEW.closed_at,now()),
             jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score,
-                               'closeReason',NEW.close_reason,'target1',NEW.target1,'tpBroker',NEW.tp_broker),
+                               'closeReason',NEW.close_reason,'target1',NEW.target1,'tpBroker',NEW.tp_broker,
+                               'exitMode',NEW.exit_mode,'fastTpUsd',NEW.fast_tp_usd),
             'closed',
             NEW.context_json,NEW.target1,NEW.tp_broker,NEW.breakeven_price,NEW.breakeven_at,COALESCE(NEW.trailing_updates,0),
-            COALESCE(NEW.trailing_active,false),COALESCE(NEW.final_sl,NEW.stop_loss),NEW.close_reason
+            COALESCE(NEW.trailing_active,false),COALESCE(NEW.final_sl,NEW.stop_loss),NEW.close_reason,
+            COALESCE(NEW.exit_mode,'normal'),NEW.fast_tp_usd
           );
         END IF;
       END IF;
@@ -200,12 +212,13 @@ export async function ensureSchema() {
 
     INSERT INTO trades(
       source,scalper_signal_id,symbol,mt5_position_id,direction,setup,lot,open_price,close_price,
-      profit,result_r,reason,opened_at,closed_at,payload
+      profit,result_r,reason,opened_at,closed_at,payload,exit_mode,fast_tp_usd
     )
     SELECT
       'scalper',s.id::text,'XAUUSD',s.mt5_position_id,s.direction,s.setup,s.mt5_volume,s.mt5_open_price,s.mt5_close_price,
       s.mt5_profit,s.result_r,'normal',s.created_at,COALESCE(s.closed_at,now()),
-      jsonb_build_object('setup',s.setup,'outcome',s.outcome,'qualityScore',s.quality_score)
+      jsonb_build_object('setup',s.setup,'outcome',s.outcome,'qualityScore',s.quality_score),
+      COALESCE(s.exit_mode,'normal'),s.fast_tp_usd
     FROM scalper_signals s
     WHERE s.outcome IN ('WIN','LOSS','BREAKEVEN') AND s.mt5_position_id IS NOT NULL
       AND NOT EXISTS (

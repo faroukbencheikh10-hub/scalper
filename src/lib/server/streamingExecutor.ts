@@ -5,7 +5,8 @@ import { requiredMargin } from "@/lib/lots";
 import { sessionWindowStart } from "@/lib/session";
 import { deals, symbol } from "./metaApi";
 import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
-import { closeReasonFromPrice, countsAsLoss, isManagedSetup, sltpCloseReasonFromPrice } from "./positionManager";
+import { closeReasonFromPrice, countsAsLoss, fastExitCloseReasonFromPrice, isManagedSetup, sltpCloseReasonFromPrice } from "./positionManager";
+import type { ExitMode } from "@/lib/exitMode";
 
 type StreamPosition = {
   id: string;
@@ -70,6 +71,9 @@ type ReserveSignalInput = {
   context?: unknown;
   /** TP di sicurezza mandato al broker, distinto da takeProfit/target1. */
   tpBroker?: number | null;
+  /** exit_mode/fast_tp_usd letti da scalper_settings all'apertura: fissati sulla riga per sempre. */
+  exitMode?: ExitMode;
+  fastTpUsd?: number | null;
 };
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
@@ -332,8 +336,8 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      ),
      inserted AS (
        INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key,
-                                   target1,context_json,final_sl,tp_broker)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4,$17 FROM decision WHERE reason IS NULL
+                                   target1,context_json,final_sl,tp_broker,exit_mode,fast_tp_usd)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4,$17,$18,$19 FROM decision WHERE reason IS NULL
        ON CONFLICT DO NOTHING
        RETURNING id::text AS id
      )
@@ -358,6 +362,8 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       input.setupKey,
       input.context === undefined || input.context === null ? null : JSON.stringify(input.context),
       input.tpBroker ?? null,
+      input.exitMode ?? "normal",
+      input.fastTpUsd ?? null,
     ],
   );
 
@@ -392,7 +398,8 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
 
   const rows = await dbQuery(
     `SELECT id,setup,direction,mt5_position_id,mt5_open_price,entry,stop_loss,take_profit,target1,tp_broker,
-            final_sl,breakeven_price,breakeven_at,trailing_updates,close_reason,created_at,context_json
+            final_sl,breakeven_price,breakeven_at,trailing_updates,close_reason,created_at,context_json,
+            exit_mode,fast_tp_usd
        FROM scalper_signals
       WHERE outcome IS NULL AND mt5_position_id IS NOT NULL
       ORDER BY created_at ASC`,
@@ -433,24 +440,32 @@ export async function syncStreamingExecutor(connection: StreamingConnectionLike,
     // check attivo del worker. Riconosciuto da context_json.sltp, che non esiste per nessuna riga
     // aperta con SLTP_MODE=off: quel ramo resta quindi identico a prima in ogni altro caso.
     const sltp = (signal.context_json as { sltp?: { mode?: string; triggered?: boolean } } | null)?.sltp;
+    // exit_mode=fast (fissato sulla riga all'apertura): nessun breakeven ne' trailing, solo lo SL
+    // iniziale e l'unico target mandato al broker. Ha la precedenza su isManagedSetup: un m1_short
+    // o m1_range aperto in fast non e' mai passato dalla gestione classica.
     const closeReason = signal.close_reason
       ? String(signal.close_reason)
-      : sltp
-        ? sltpCloseReasonFromPrice(close, {
-          currentSl: number(signal.final_sl ?? signal.stop_loss),
-          slTightened: trailingUpdates > 0,
-          currentTp: number(signal.tp_broker ?? signal.target1 ?? signal.take_profit),
-          tpTriggered: sltp.triggered === true,
+      : signal.exit_mode === "fast"
+        ? fastExitCloseReasonFromPrice(close, profit, {
+          initialStop: number(signal.stop_loss),
+          fastTarget: number(signal.tp_broker ?? signal.target1),
         })
-        : isManagedSetup(signal.setup)
-          ? closeReasonFromPrice(close, profit, {
-            initialStop: number(signal.stop_loss),
-            breakevenStop: number(signal.breakeven_price),
-            trailingStop: trailingUpdates > 0 ? number(signal.final_sl) : null,
-            brokerTp: number(signal.tp_broker),
-            target1: number(signal.target1 ?? signal.take_profit),
+        : sltp
+          ? sltpCloseReasonFromPrice(close, {
+            currentSl: number(signal.final_sl ?? signal.stop_loss),
+            slTightened: trailingUpdates > 0,
+            currentTp: number(signal.tp_broker ?? signal.target1 ?? signal.take_profit),
+            tpTriggered: sltp.triggered === true,
           })
-          : null;
+          : isManagedSetup(signal.setup)
+            ? closeReasonFromPrice(close, profit, {
+              initialStop: number(signal.stop_loss),
+              breakevenStop: number(signal.breakeven_price),
+              trailingStop: trailingUpdates > 0 ? number(signal.final_sl) : null,
+              brokerTp: number(signal.tp_broker),
+              target1: number(signal.target1 ?? signal.take_profit),
+            })
+            : null;
     await dbQuery(
       `UPDATE scalper_signals
           SET mt5_close_price=$2,mt5_profit=$3,outcome=$4,result_r=$5,closed_at=COALESCE($6::timestamptz,now()),
