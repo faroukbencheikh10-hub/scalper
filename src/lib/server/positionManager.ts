@@ -18,7 +18,9 @@ export type ManagedCloseReason =
   // SLTP_MODE=fixed|trailing (dynamicSlTp.ts): tp_fixed prima del trigger di estensione, tp_trailing
   // dopo. sltp_rejected e' l'ultima spiaggia quando il broker ha rifiutato due volte sia lo SL sia
   // il TP calcolati e non resta nessun livello noto a cui attribuire la chiusura.
-  | "tp_fixed" | "tp_trailing" | "sltp_rejected";
+  | "tp_fixed" | "tp_trailing" | "sltp_rejected"
+  // exit_mode=fast (exitMode.ts): unico livello, mandato al broker come TP, nessun breakeven/trailing.
+  | "tp_fast";
 
 /** Tick del simbolo: la granularita' con cui si riconosce "chiuso su quel livello". */
 export const PRICE_TICK_USD = 0.01;
@@ -296,6 +298,24 @@ export function sltpCloseReasonFromPrice(closePrice: number, levels: SltpCloseLe
   if (!Number.isFinite(closePrice)) return "manual";
   if (near(closePrice, levels.currentSl)) return levels.slTightened ? "sl_trailing" : "sl_initial";
   if (near(closePrice, levels.currentTp)) return levels.tpTriggered ? "tp_trailing" : "tp_fixed";
+  return "manual";
+}
+
+/** Livelli noti di una posizione exit_mode=fast: solo lo SL iniziale e l'unico target al broker. */
+export type FastExitCloseLevels = {
+  initialStop: number | null;
+  fastTarget: number | null;
+};
+
+/**
+ * Motivo di chiusura per exit_mode=fast, letto anch'esso dal prezzo REALE del deal: nessun
+ * breakeven ne' trailing qui, solo lo SL iniziale (sl_initial se chiuso in perdita) e il target
+ * unico mandato al broker (tp_fast).
+ */
+export function fastExitCloseReasonFromPrice(closePrice: number, profit: number, levels: FastExitCloseLevels): ManagedCloseReason {
+  if (!Number.isFinite(closePrice)) return "manual";
+  if (near(closePrice, levels.initialStop) && Number.isFinite(profit) && profit < 0) return "sl_initial";
+  if (near(closePrice, levels.fastTarget)) return "tp_fast";
   return "manual";
 }
 

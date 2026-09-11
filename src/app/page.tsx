@@ -2,13 +2,15 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { SystemControl } from "@/components/system-control";
+import { ExitModeControl } from "@/components/exit-mode-control";
 import { setupLabel } from "@/lib/setups";
 import { usdDistanceToEurApprox } from "@/lib/lots";
 import { currentOperationalState, type OperationalState } from "@/lib/operationalState";
+import { DEFAULT_FAST_TP_USD, type ExitMode } from "@/lib/exitMode";
 
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
-type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
+type RiskPlan = { lots?: number; requestedLots?: number; lotsCapped?: boolean; managedExit?: boolean; exitMode?: ExitMode; fastTpUsd?: number | null; target1?: number; target1Distance?: number; tpBroker?: number | null; tpBrokerDistance?: number; slDistance?: number; tpDistance?: number; riskReward?: number | null; risk?: number; riskPct?: number | null; riskMaxPct?: number; currency?: string | null; overCap?: boolean };
 /** Piano di uscita del trade aperto: nessun TP al broker, breakeven a target1 e trailing sulla M5. */
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
 /** Piano SLTP_MODE=fixed|trailing: SL da struttura (si stringe solo), TP fisso o trailing sui nuovi massimi/minimi. */
@@ -44,6 +46,9 @@ type DashboardState = {
   lotsMin?: number;
   lotsMax?: number;
   lotChoices?: number[];
+  exitMode?: ExitMode;
+  fastTpUsd?: number;
+  fastTpUsdMin?: number;
   account?: Account | null;
   stream?: {
     status?: string;
@@ -150,6 +155,11 @@ export default function Home() {
     ? `${money(Number(risk.risk))} ${risk.currency ?? "EUR"}${Number.isFinite(risk.riskPct) ? ` · ${money(Number(risk.riskPct))}% del saldo` : ""}${risk.lotsCapped ? ` · lotti ridotti a ${risk.lots}` : ""}`
     : "—";
   const targetLabel = risk?.managedExit ? "Target1" : "TP";
+  const exitModeText = risk?.exitMode === "fast"
+    ? `fast · target ${money(Number(risk?.fastTpUsd))}$ dall'entry`
+    : risk?.exitMode === "normal"
+      ? "normal"
+      : "—";
   const slTpText = risk && Number.isFinite(risk.slDistance)
     ? `SL ${money(Number(risk.slDistance))}$ · ${targetLabel} ${money(Number(risk.target1Distance ?? risk.tpDistance))}$${Number.isFinite(risk.riskReward) ? ` (${risk.riskReward}R)` : ""}`
     : "—";
@@ -255,6 +265,15 @@ export default function Home() {
         />
       ) : null}
 
+      {data ? (
+        <ExitModeControl
+          exitMode={data.exitMode ?? "normal"}
+          fastTpUsd={data.fastTpUsd ?? DEFAULT_FAST_TP_USD}
+          fastTpUsdMin={data.fastTpUsdMin}
+          onChanged={(exitMode, fastTpUsd) => setData((current) => current ? { ...current, exitMode, fastTpUsd } : current)}
+        />
+      ) : null}
+
       {data?.stream?.currentError ? (
         <article className="rules-card" style={{ marginBottom: 18, borderColor: "rgba(255,95,121,.5)" }}>
           <div className="card-heading rules-heading"><div><span className="card-index">!</span><h3>Errore corrente</h3></div><span style={{ color: "#ff8fa9" }}>{formatTime(data.stream.currentError.at)}</span></div>
@@ -296,6 +315,7 @@ export default function Home() {
             <div><dt>Spread</dt><dd>{money(quote?.spread)} $</dd></div>
             <div><dt>Setup ultimo segnale</dt><dd className="mt5-value">{setupLabel(last?.setup)}</dd></div>
             <div><dt>SL / {targetLabel} ultimo ordine</dt><dd className="mt5-value">{slTpText}</dd></div>
+            <div><dt>Modalità ultimo ordine</dt><dd className="mt5-value">{exitModeText}</dd></div>
             <div><dt>TP broker (sicurezza)</dt><dd className="mt5-value">{brokerTpText}</dd></div>
             <div><dt>Uscita trade aperto</dt><dd className="mt5-value">{openExitText}</dd></div>
             <div><dt>Rischio ultimo ordine</dt><dd className={`mt5-value${risk?.overCap ? " negative" : ""}`}>{riskText}</dd></div>
