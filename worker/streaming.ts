@@ -6,6 +6,10 @@ import {
   EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY, fastTargetPrice, resolveExitMode, resolveFastTpUsd,
   type ExitMode,
 } from "../src/lib/exitMode";
+import {
+  resolveScheduledCloseConfig, scheduledCloseStatus, SCHEDULED_CLOSE_ENABLED_KEY,
+  SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
+} from "../src/lib/scheduledClose";
 import { money, sendTelegram } from "../src/lib/server/notify";
 import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
@@ -285,17 +289,31 @@ async function main() {
   // tocca mai le posizioni gia' aperte.
   let activeExitMode: ExitMode = "normal";
   let activeFastTpUsd = resolveFastTpUsd(undefined);
+  // Chiusura programmata: blocco indipendente, riletto dal database come i lotti. Decide SOLO se
+  // aprire nuovi ordini; le posizioni gia' aperte non passano mai di qui.
+  let scheduledCloseConfig = resolveScheduledCloseConfig(() => undefined);
   // Liquidita' del momento da segnali di mercato reali (spread/tick-rate/ATR), non dall'orologio:
   // un solo stato per la vita del processo, aggiornato ad ogni tick dentro la fascia oraria.
   const liquidityState = createLiquidityState(workerStartedAtMs);
 
   const refreshControl = async () => {
-    const settings = await getSettings(["system_stop", EXEC_LOTS_SETTING_KEY, EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY]);
+    const settings = await getSettings([
+      "system_stop", EXEC_LOTS_SETTING_KEY, EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY,
+      SCHEDULED_CLOSE_ENABLED_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
+    ]);
     activeLots = resolveLots(settings.get(EXEC_LOTS_SETTING_KEY));
     activeExitMode = resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY));
     activeFastTpUsd = resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY));
+    scheduledCloseConfig = resolveScheduledCloseConfig((key) => settings.get(key));
     return settings.get("system_stop") === "true";
   };
+
+  /**
+   * Stato della chiusura programmata adesso, con la stessa funzione pura che usa /api/state: le
+   * chiavi sono le stesse e l'offset del fuso si ricalcola ogni volta, quindi dashboard e worker
+   * non possono divergere ne' sbagliare il passaggio CET/CEST.
+   */
+  const scheduledClose = () => scheduledCloseStatus(new Date(), scheduledCloseConfig);
 
   let stopped = await refreshControl();
   let m1: Candle[] = [];
@@ -443,6 +461,8 @@ async function main() {
     lotsMax: lotsMax(),
     exitMode: activeExitMode,
     fastTpUsd: activeFastTpUsd,
+    // Lo stesso calcolo di /api/state, cosi' si vede subito se worker e dashboard concordano.
+    scheduledClose: scheduledClose(),
     account: accountSnapshot(),
     openPositions: (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol()).length,
     maxOpenPositions,
@@ -1326,6 +1346,17 @@ async function main() {
       logTick(signal, quote, reason);
       return;
     }
+    // Chiusura programmata: vale per tutti e tre i setup, che restano valutati normalmente (il
+    // segnale e' gia' stato prodotto qui sopra da liquidita', context_gate e m1_gate). Blocca solo
+    // l'APERTURA di un nuovo ordine: nessuna posizione aperta viene toccata, chiusa o modificata.
+    const scheduledCloseNow = scheduledClose();
+    if (scheduledCloseNow.active) {
+      const reason = scheduledCloseNow.reason!;
+      latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
+      notifyBlock(reason);
+      logTick(signal, quote, reason);
+      return;
+    }
 
     const nowMs = Date.now();
     const directionUntil = dupDirectionUntil[signal.direction];
@@ -1358,6 +1389,13 @@ async function main() {
       const preReservationGate = sessionGuard(quote);
       if (!preReservationGate.allowed) {
         latestDecision = noTradeDecision(preReservationGate.reasoning!, quote);
+        return;
+      }
+      // Ricontrollo appena prima di prenotare l'ordine: la finestra puo' essere appena iniziata
+      // fra la valutazione del tick e questo punto. Anche qui si blocca solo l'apertura.
+      const scheduledCloseBeforeOrder = scheduledClose();
+      if (scheduledCloseBeforeOrder.active) {
+        latestDecision = noTradeDecision(scheduledCloseBeforeOrder.reason!, quote, { setup: signal.setup, evaluations: signal.evaluations });
         return;
       }
 

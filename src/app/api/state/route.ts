@@ -5,6 +5,10 @@ import { EXEC_LOTS_SETTING_KEY, LOT_CHOICES } from "@/lib/lots";
 import {
   EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY, MIN_FAST_TP_USD, resolveExitMode, resolveFastTpUsd,
 } from "@/lib/exitMode";
+import {
+  resolveScheduledCloseConfig, scheduledCloseStatus, SCHEDULED_CLOSE_ENABLED_KEY,
+  SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
+} from "@/lib/scheduledClose";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
 import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
 
@@ -23,6 +27,10 @@ const SETTING_KEYS = [
   EXEC_LOTS_SETTING_KEY,
   EXIT_MODE_SETTING_KEY,
   FAST_TP_USD_SETTING_KEY,
+  SCHEDULED_CLOSE_ENABLED_KEY,
+  SCHEDULED_CLOSE_START_KEY,
+  SCHEDULED_CLOSE_END_KEY,
+  SCHEDULED_CLOSE_TIMEZONE_KEY,
 ] as const;
 
 type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
@@ -125,6 +133,9 @@ export async function GET() {
       exitMode: resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY)),
       fastTpUsd: resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY)),
       fastTpUsdMin: MIN_FAST_TP_USD,
+      // Stato calcolato server-side con l'ora del server e il fuso salvato: la dashboard mostra
+      // questo, e il worker usa la stessa funzione sulle stesse chiavi. Nessun offset congelato.
+      scheduledClose: scheduledCloseStatus(now, resolveScheduledCloseConfig((key) => settings.get(key))),
       account: workerDetail?.account ?? null,
       results: { total: Number(st.total ?? 0), wins, losses, breakeven: Number(st.breakeven ?? 0), winRate: decided > 0 ? Number(((wins / decided) * 100).toFixed(1)) : 0, profit: Number(st.profit ?? 0), resultR: Number(st.result_r ?? 0), last: lastClosed.rows[0] ?? null },
       stream: { status: workerStatus, heartbeat: workerHeartbeat.at, heartbeatData: { at: workerHeartbeat.at, quoteAgeSec: workerHeartbeat.quoteAgeSec }, detail: workerDetail, lastDecision, lastFlatten, currentError: errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null, historicalError: !errorIsCurrent && parsedError ? { message: parsedError.message, at: parsedError.at } : null },

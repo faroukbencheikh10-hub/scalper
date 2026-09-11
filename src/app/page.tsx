@@ -3,10 +3,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { SystemControl } from "@/components/system-control";
 import { ExitModeControl } from "@/components/exit-mode-control";
+import { ScheduledCloseControl } from "@/components/scheduled-close-control";
 import { setupLabel } from "@/lib/setups";
 import { usdDistanceToEurApprox } from "@/lib/lots";
 import { currentOperationalState, type OperationalState } from "@/lib/operationalState";
 import { DEFAULT_FAST_TP_USD, type ExitMode } from "@/lib/exitMode";
+import type { ScheduledCloseStatus } from "@/lib/scheduledClose";
 
 type Quote = { bid?: number; ask?: number; mid?: number; spread?: number; quotedAt?: number | string | null; receivedAt?: string | null };
 type SetupEvaluation = { setup?: string; status?: string; direction?: string | null; reason?: string };
@@ -49,6 +51,7 @@ type DashboardState = {
   exitMode?: ExitMode;
   fastTpUsd?: number;
   fastTpUsdMin?: number;
+  scheduledClose?: ScheduledCloseStatus | null;
   account?: Account | null;
   stream?: {
     status?: string;
@@ -271,6 +274,13 @@ export default function Home() {
           fastTpUsd={data.fastTpUsd ?? DEFAULT_FAST_TP_USD}
           fastTpUsdMin={data.fastTpUsdMin}
           onChanged={(exitMode, fastTpUsd) => setData((current) => current ? { ...current, exitMode, fastTpUsd } : current)}
+        />
+      ) : null}
+
+      {data ? (
+        <ScheduledCloseControl
+          status={data.scheduledClose}
+          onChanged={(scheduledClose) => setData((current) => current ? { ...current, scheduledClose } : current)}
         />
       ) : null}
 
