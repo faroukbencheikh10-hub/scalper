@@ -52,11 +52,12 @@ check("1) M5 up + M15 transition -> m1_short BUY passa (mode=live)", () => {
   });
 });
 
-check("2) M5 up + M15 true_range -> m1_short bloccato", () => {
+check("2) M5 up + M15 true_range, nessun bias M15 opposto -> m1_short ACCETTATO", () => {
   withEnv({ M15_GATE_MODE: "live" }, () => {
     const gate = shortContextGate("m1_short", ctx({ biasM5: "up", m15Regime: "true_range" }));
-    assert.equal(gate.allowed, null);
-    assert.match(gate.blocked!.reasoning, /m15_regime=true_range/);
+    assert.equal(gate.allowed, "BUY", JSON.stringify(gate));
+    assert.equal(gate.blocked, null);
+    assert.equal(gate.passReason, "m15 range/transition ma nessun bias M15 opposto: consentito");
   });
 });
 
@@ -196,7 +197,7 @@ check("8) matrice 72 combinazioni M5xM15 senza violazioni", () => {
             const contraryState = biasM5 === "up" ? "trend_down" : "trend_up";
 
             const expectAllowed = live
-              ? m15Regime !== "true_range" && m15Regime !== contraryRegime && !m15BreakoutRecent
+              ? m15Regime !== contraryRegime && !m15BreakoutRecent
               : m15State !== "range" && m15State !== contraryState && !m15BreakoutRecent;
 
             assert.equal(
@@ -204,8 +205,17 @@ check("8) matrice 72 combinazioni M5xM15 senza violazioni", () => {
               expectAllowed ? expectedDirection : null,
               JSON.stringify({ mode, biasM5, m15Regime, m15State, m15BreakoutRecent, gate }),
             );
-            // true_range ha sempre la priorita' in live: non deve mai passare, qualunque sia il resto.
-            if (live && m15Regime === "true_range") assert.equal(gate.allowed, null);
+            // true_range/transition senza bias M15 opposto: passa, ma con un passReason esplicito
+            // che lo distingue nei log da un trend M15 allineato (mai per m15Regime di trend).
+            if (live && expectAllowed && (m15Regime === "true_range" || m15Regime === "transition")) {
+              assert.equal(
+                gate.passReason,
+                "m15 range/transition ma nessun bias M15 opposto: consentito",
+                JSON.stringify({ mode, biasM5, m15Regime, gate }),
+              );
+            } else if (gate.allowed) {
+              assert.equal(gate.passReason, undefined, JSON.stringify({ mode, biasM5, m15Regime, gate }));
+            }
             // Invariante di non-regressione: off non deve MAI dipendere da m15Regime, solo da m15State.
             if (!live) {
               const altRegime: M15Regime = m15Regime === "true_range" ? "transition" : "true_range";
