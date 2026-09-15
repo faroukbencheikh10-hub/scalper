@@ -604,6 +604,9 @@ export async function executeStreaming(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const rejected = definitelyRejected(error);
+    // Retcode MT5 del rifiuto, quando c'e': chi legge l'esito distingue il motivo esatto senza
+    // rovistare nel messaggio (es. 10019 NO_MONEY per il cooldown da margine, vedi marginCooldown.ts).
+    const code = Number((error as { numericCode?: number })?.numericCode);
     await dbQuery(
       `UPDATE scalper_signals SET mt5_error=$2,outcome=CASE WHEN $3 THEN 'ERROR' ELSE NULL END,
         closed_at=CASE WHEN $3 THEN now() ELSE NULL END WHERE id=$1`,
@@ -614,7 +617,12 @@ export async function executeStreaming(
       direction,
       error: message,
     });
-    return { status: rejected ? "error" as const : "pending_confirmation" as const, error: message, clientId: orderClientId };
+    return {
+      status: rejected ? "error" as const : "pending_confirmation" as const,
+      error: message,
+      numericCode: Number.isFinite(code) ? code : null,
+      clientId: orderClientId,
+    };
   }
 
   const orderId = typeof result.orderId === "string" ? result.orderId : null;

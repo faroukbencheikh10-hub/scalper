@@ -227,6 +227,17 @@ Dopo una chiusura in perdita il worker blocca la **stessa direzione** per `LOSS_
 
 L'orario di sblocco compare ovunque: in `stream_last_decision.reasoning`, in `stream_worker_detail` (`lossLockedDirections`, `lossLockUntil`, `lossPauseUntil`), sulla dashboard (card Esecuzione, righe *Re-entry bloccato* e *Pausa perdite*) e su Telegram, sia nel messaggio di chiusura in perdita sia nella notifica di ingresso bloccato.
 
+### Cooldown da margine insufficiente (`MARGIN_FAIL_COOLDOWN_SEC`)
+
+Blocco **aggiuntivo e indipendente** dai precedenti: non tocca `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, la pausa re-entry né i criteri d'ingresso di alcun setup. Si arma **solo** sul fallimento specifico del margine, che nel codice ha due firme e due sole:
+
+- il preflight sul free margin dentro `executeStreaming` (`status = "insufficient_margin"`), che non manda nemmeno l'ordine al broker;
+- il rifiuto del broker con retcode MT5 **10019** (`TRADE_RETCODE_NO_MONEY`), già fra i codici di `definitelyRejected`, che arriva come `status = "error"` con il `numericCode` propagato.
+
+Quando scatta, quella combinazione **symbol + setup + direzione** viene scartata per `MARGIN_FAIL_COOLDOWN_SEC` (default 30) subito nella valutazione del tick — prima di costruire, prenotare o inviare qualsiasi ordine — con una voce `rejected` in `stream_last_decision.evaluations` e il motivo `Margine insufficiente su <setup> <direzione>: cooldown attivo fino alle HH:MM:SS UTC (altri N s)`. Come per `LOSS_LOCK`, il blocco è **per singola direzione**: un BUY bloccato non blocca il SELL, e gli altri setup restano liberi.
+
+Il cooldown **non si cancella in anticipo** se nel frattempo il margine si libera (per esempio perché un'altra posizione chiude): scade sempre al tempo pieno, per non far oscillare gli ingressi attorno alla soglia di margine. L'attivazione si logga **una volta sola** (`margin_fail_cooldown`): i tick bloccati dentro la finestra non producono log, restano solo in `stream_last_decision`. Lo stato vive in memoria nel worker (come i blocchi da perdita) ed è visibile in `stream_worker_detail` (`marginFailCooldownSec`, `marginFailCooldowns`). `MARGIN_FAIL_COOLDOWN_SEC=0` lo spegne.
+
 ## Notifiche Telegram
 
 Con `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID` il worker notifica: avvio, apertura, chiusura, blocco per limite o cooldown, errore ordine, flatten di fine sessione e STOP dashboard. Senza le due variabili `sendTelegram` e' un no-op e non lancia mai eccezioni.

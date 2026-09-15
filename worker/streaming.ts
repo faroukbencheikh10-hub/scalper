@@ -31,6 +31,10 @@ import {
 } from "../src/lib/server/dynamicSlTp";
 import { riskPerLot } from "../src/lib/server/orderSafety";
 import {
+  armMarginCooldown, isInsufficientMarginFailure, marginCooldownActive, marginCooldownKey,
+  marginCooldownReason, type MarginCooldownState,
+} from "../src/lib/server/marginCooldown";
+import {
   computeLiquiditySnapshot, createLiquidityState, describeLiquiditySnapshot, lotMultiplierFor,
   setupsAllowedFor, updateLiquidityState,
 } from "../src/lib/server/marketLiquidity";
@@ -295,6 +299,7 @@ async function main() {
   const lossLockMs = envInt("LOSS_LOCK_MINUTES", 30, 0, 1440) * 60_000;
   const consecLossPauseMs = envInt("CONSEC_LOSS_PAUSE_MINUTES", 120, 0, 1440) * 60_000;
   const consecLossCount = envInt("CONSEC_LOSS_COUNT", 3, 2, 10);
+  const marginFailCooldownMs = envInt("MARGIN_FAIL_COOLDOWN_SEC", 30, 0, 3600) * 1000;
   const riskMaxPct = envNum("RISK_MAX_PCT", 0);
   const riskFallbackLots = envNum("RISK_FALLBACK_LOTS", 0.01);
   const maxTradesPerDay = envInt("MAX_TRADES_PER_DAY", 12, 1, 1000);
@@ -372,6 +377,10 @@ async function main() {
   const dupSetupUntilBucket = new Map<string, number>();
   const lossLockUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   let lossPauseUntil = 0;
+  // Cooldown da margine insufficiente, per symbol+setup+direzione: blocco aggiuntivo e indipendente
+  // da LOSS_LOCK/CONSEC_LOSS/re-entry, armato solo dal fallimento specifico del margine. In memoria
+  // come i blocchi da perdita: dura 30 s, molto meno di un riavvio del worker.
+  const marginFailUntil: MarginCooldownState = new Map();
   const knownPositionIds = new Set<string>();
   let lastPositionCloseAt = 0;
   let lastReseedAttempt = 0;
@@ -541,6 +550,10 @@ async function main() {
     staleQuoteSec,
     staleQuoteExitSec,
     ...lossGuards(),
+    marginFailCooldownSec: Math.round(marginFailCooldownMs / 1000),
+    marginFailCooldowns: [...marginFailUntil.entries()]
+      .filter(([, until]) => until > Date.now())
+      .map(([key, until]) => ({ key, until: new Date(until).toISOString() })),
     m1: m1.length,
     m5: m5.length,
     m15: aggregateM15(closedBars(m5, 5, Date.now()) ?? []).length,
@@ -1416,6 +1429,19 @@ async function main() {
       logTick(signal, quote, reason);
       return;
     }
+    // Cooldown da margine insufficiente: scarta subito questo setup in questa direzione, senza
+    // costruire ne' prenotare ne' mandare l'ordine. Nessun logTick qui di proposito: l'attivazione
+    // e' gia' stata loggata una volta sola, i tick bloccati restano solo in stream_last_decision.
+    const marginUntil = marginCooldownActive(marginFailUntil, marginCooldownKey(symbol(), signal.setup, signal.direction), nowMs);
+    if (marginUntil !== null) {
+      const reason = marginCooldownReason(signal.setup, signal.direction, marginUntil, nowMs);
+      const blocked: SetupEvaluation = { setup: signal.setup ?? "filtri", status: "rejected", direction: signal.direction, reason };
+      latestDecision = noTradeDecision(reason, quote, {
+        setup: signal.setup,
+        evaluations: [...signal.evaluations, blocked],
+      });
+      return;
+    }
 
     logTick(signal, quote);
 
@@ -1756,6 +1782,30 @@ async function main() {
         tradingConnection,
         { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: sendQuote.mid },
       );
+
+      // Margine insufficiente: due sole firme reali (preflight "insufficient_margin" e retcode 10019
+      // TRADE_RETCODE_NO_MONEY dal broker, vedi marginCooldown.ts). Arma il blocco per questo
+      // setup+direzione e logga solo l'attivazione: i tick dentro la finestra non ritentano nulla.
+      if (isInsufficientMarginFailure(execution)) {
+        const armed = armMarginCooldown(
+          marginFailUntil,
+          marginCooldownKey(symbol(), finalSignal.setup, finalSignal.direction),
+          Date.now(),
+          marginFailCooldownMs,
+        );
+        if (armed.armed) {
+          console.warn("[scalper-worker] margin_fail_cooldown", JSON.stringify({
+            at: new Date().toISOString(),
+            signalId,
+            setup: finalSignal.setup,
+            direction: finalSignal.direction,
+            status: execution.status,
+            detail: "reason" in execution ? execution.reason : "error" in execution ? execution.error : null,
+            until: new Date(armed.until).toISOString(),
+            cooldownSec: Math.round(marginFailCooldownMs / 1000),
+          }));
+        }
+      }
 
       if ([
         "blocked",
