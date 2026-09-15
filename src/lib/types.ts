@@ -16,7 +16,7 @@ export type Quote = {
   quotedAt: number | null;
 };
 
-export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_retest" | "micro_pullback" | "m1_short" | "m1_range";
+export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_retest" | "micro_pullback" | "m1_short" | "m1_range" | "quick_tick";
 
 /** Diagnostica di un singolo tick: cosa e' stato valutato e perche' e' stato scartato. */
 export type SetupEvaluation = {
