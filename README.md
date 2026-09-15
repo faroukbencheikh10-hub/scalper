@@ -47,16 +47,20 @@ Se nemmeno il `m1_short` produce un ordine viene valutato il terzo setup **`m1_r
 - I trade escono con `setup = "m1_range"` e la valutazione numerica (range, ATR, distanza dal bordo, SL, TP) compare come voce `range_gate` in `stream_last_decision.evaluations` e nella card **Setup valutati**.
 - `RANGE_ENABLED=false` lo spegne.
 
-Se nemmeno `m1_range` produce un ordine, e **solo quando `scalper_settings.exit_mode = "fast"`**, viene valutato un quarto setup, **`quick_tick`** (`quick-tick-v1`): nessuna struttura M1/M5/M15, solo la direzione del tick rispetto al precedente.
+Se nemmeno `m1_range` produce un ordine, e **solo quando `scalper_settings.exit_mode = "fast"`**, viene valutato un quarto setup, **`quick_tick`** (`quick-tick-v2`): tre condizioni tutte vere insieme, poi SL/TP propri sull'ATR M1 mandati al broker come ordine reale.
 
 ### `quick_tick` (solo `exit_mode=fast`)
 
-- **Entry (su tick):** BUY se il mid sale di oltre `QUICK_TICK_BUFFER_USD` (0.05$) rispetto al mid del **tick precedente**, SELL se scende di altrettanto. Non è una candela: è lo stato tick-per-tick del worker, azzerato dopo un gap ripristinato da un reseed dello storico (un salto di prezzo non è momentum).
-- **Unico filtro proprio:** spread ≤ `QUICK_TICK_MAX_SPREAD` (0.20$). Niente `context_gate`, niente M15/M5, niente `disableShort`/`disableRange` da liquidità LOW. Restano solo i blocchi comuni a tutti i setup: quote valida, sessione, una sola posizione aperta, pausa re-entry `SCALPER_MIN_REENTRY_SEC`, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`.
-- **SL:** `QUICK_TICK_EMERGENCY_SL_USD` (5$) fisso dall'entry, mandato al broker come rete di emergenza — lo stesso ruolo dello SL strutturale di mtf/`m1_short`/`m1_range` quando aperti in `exit_mode=fast` (vedi sotto): non è l'obiettivo del trade, scatta solo se worker o MetaApi muoiono.
-- **Uscita:** identica a quella di qualsiasi altro setup aperto in `exit_mode=fast` — TP fisso a `fast_tp_usd` (dashboard) dall'entry, mandato al broker come unico target, chiusura immediata, **nessun breakeven né trailing**. `close_reason`: `tp_fast` sul target, `sl_initial` sullo SL di emergenza in perdita.
+1. **Direzione (`context_gate`).** Riusa il `bias_m5` già calcolato per `m1_short`/`m1_range` da `contextM5M15`, senza ricalcolare nulla: BUY ammesso solo con `bias_m5=up`, SELL solo con `bias_m5=down`. Con `bias_m5=flat` quick_tick non guarda nemmeno l'M1: `NO_TRADE` immediato. A differenza di `m1_short`/`m1_range`, non guarda `m15_state`/`m15_regime`/`m15_breakout_recent`: solo il bias M5.
+2. **Rottura M1 (`quick_tick_gate`).** Stesso trigger su tick di `m1_gate`/`m1_short` — il prezzo live deve superare di `QUICK_TICK_BREAKOUT_BUFFER_USD` (0.15$) il massimo/minimo delle ultime `QUICK_TICK_M1_WINDOW` (6) candele M1 **chiuse** — ma con una finestra più corta e un buffer proprio. Una rottura nella direzione opposta al bias M5 viene scartata (`bias_m5=X ammette solo Y`), esattamente come per `m1_short`.
+3. **Spread dinamico (`quick_tick_gate`).** Spread attuale ≤ `QUICK_TICK_MAX_SPREAD_RATIO` (1.5) × spread medio delle ultime 20 candele M1 **chiuse** (rolling, tracciato tick per tick nel worker: le candele non portano lo spread). Finché quella media non è pronta (warmup: appena avviato, o subito dopo un reseed dello storico da un gap) si ripiega sul fallback assoluto `QUICK_TICK_MAX_SPREAD` (0.20$).
+- **SL:** `QUICK_TICK_SL_ATR_MULT` (1.2) × ATR M1, alzato a `QUICK_TICK_SL_MIN_USD` (2.5$); se la distanza richiesta supera `QUICK_TICK_SL_MAX_USD` (6$) il trade viene **scartato**, non stretto — stesso comportamento di `RANGE_SL_MAX_PCT` su `m1_range`.
+- **TP:** `QUICK_TICK_TP_ATR_MULT` (1.5) × ATR M1, clampato fra `QUICK_TICK_TP_MIN_USD` (2$) e `QUICK_TICK_TP_MAX_USD` (4$).
+- **Uscita:** resta dentro `exit_mode=fast` — un solo livello per lato mandato al broker, chiusura immediata, **nessun breakeven/trailing/target1** — ma a differenza degli altri setup il TP **non** è il `fast_tp_usd` fisso della dashboard: è il TP dinamico appena descritto, calcolato da `evaluateQuickTick` e lasciato invariato dal blocco `exit_mode=fast` del worker. `close_reason`: `tp_fast` sul target, `sl_initial` sullo SL in perdita.
+- Restano i blocchi comuni a tutti i setup: quote valida, sessione, una sola posizione aperta, pausa re-entry `SCALPER_MIN_REENTRY_SEC`, `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`. Mai spento da `disableShort`/`disableRange` (liquidità LOW): l'unico interruttore è `exit_mode`.
 - Non è mai valutato con `exit_mode=normal` (default): in quel caso la cascata resta quella di sempre, solo mtf/`m1_short`/`m1_range`.
-- I suoi trade finiscono con `setup = "quick_tick"` in `scalper_signals` e in `trades`, come gli altri; la voce `quick_tick` in `stream_last_decision.evaluations` porta mid corrente, mid precedente e spread.
+- Un tentativo per livello: `setup_key` porta il massimo/minimo della finestra e l'ultima M1 chiusa (`level_used`), come `m1_short` — si riarma quando chiude una nuova M1.
+- I suoi trade finiscono con `setup = "quick_tick"` in `scalper_signals` e in `trades`, come gli altri.
 
 ### Uscita gestita di `m1_short` e `m1_range`
 
@@ -153,9 +157,13 @@ Restano i limiti di sessione, STOP, numero di posizioni e pause configurate. Nes
 | `RANGE_TP_MIN_USD` | 1.5 | TP minimo: sotto questa distanza il trade viene scartato |
 | `SAFETY_TP_ATR` | 4.0 | TP di sicurezza al broker, in ATR M1 (vince il più largo fra questo e `SAFETY_TP_MIN_R`) |
 | `SAFETY_TP_MIN_R` | 3.0 | TP di sicurezza minimo, in multipli della distanza entry→target1 |
-| `QUICK_TICK_BUFFER_USD` | 0.05 | Variazione minima del mid rispetto al tick precedente per il quarto setup `quick_tick` (solo `exit_mode=fast`) |
-| `QUICK_TICK_MAX_SPREAD` | 0.20 | Spread massimo per `quick_tick`: unico suo filtro, oltre ai blocchi comuni |
-| `QUICK_TICK_EMERGENCY_SL_USD` | 5.0 | SL fisso di `quick_tick`, mandato al broker come rete di emergenza — l'uscita reale è il TP fisso di `exit_mode=fast` |
+| `QUICK_TICK_M1_WINDOW` | 6 | Candele M1 chiuse della finestra di rottura del quarto setup `quick_tick` (solo `exit_mode=fast`) |
+| `QUICK_TICK_BREAKOUT_BUFFER_USD` | 0.15 | Margine oltre la finestra che il prezzo live deve superare (stesso ruolo di `ENTRY_BUFFER_USD` per `m1_short`) |
+| `QUICK_TICK_MAX_SPREAD_RATIO` | 1.5 | Spread massimo per `quick_tick`, come rapporto sulla media rolling delle ultime 20 M1 chiuse |
+| `QUICK_TICK_MAX_SPREAD` | 0.20 | Fallback assoluto per `quick_tick` finché la media rolling non è pronta (warmup) |
+| `QUICK_TICK_TP_ATR_MULT` / `QUICK_TICK_TP_MIN_USD` / `QUICK_TICK_TP_MAX_USD` | 1.5 / 2.0 / 4.0 | TP di `quick_tick` sull'ATR M1, clampato fra minimo e massimo, mandato al broker |
+| `QUICK_TICK_SL_ATR_MULT` / `QUICK_TICK_SL_MIN_USD` | 1.2 / 2.5 | SL di `quick_tick` sull'ATR M1, alzato al minimo |
+| `QUICK_TICK_SL_MAX_USD` | 6.0 | Tetto dello SL di `quick_tick`: oltre si scarta il trade, non si stringe |
 | `POSITION_GONE_CONFIRM_SEC` | 10 | Secondi di assenza dal terminal state prima di considerare chiusa una posizione |
 | `POSITION_GONE_CONFIRM_TICKS` | 3 | Tick consecutivi di assenza richiesti insieme ai secondi sopra |
 | `FILL_POLL_INTERVAL_MS` | 500 | Intervallo di attesa del prezzo di fill reale dopo l'ordine |

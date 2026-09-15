@@ -115,14 +115,14 @@ type EvaluateInput = {
    */
   disableShort?: boolean;
   disableRange?: boolean;
-  /**
-   * Mid dell'ultimo tick precedente, per quick_tick: stato tick-per-tick del worker (non una
-   * candela, non derivato da m1/m5). null quando non ancora disponibile (avvio, o subito dopo un
-   * gap ripristinato da seedCandles).
-   */
-  previousTick?: Quote | null;
   /** exit_mode corrente da scalper_settings: quick_tick si valuta SOLO quando vale "fast". */
   exitMode?: ExitMode;
+  /**
+   * Spread medio delle ultime QUICK_TICK_SPREAD_WINDOW_M1 candele M1 chiuse, per la condizione 3 di
+   * quick_tick: stato tick-per-tick del worker (non derivato da m1/m5, le candele non portano lo
+   * spread). null in warmup, prima che sia chiusa almeno una M1 dall'avvio o da un reseed.
+   */
+  quickTickSpreadAvg?: number | null;
 };
 
 /** Pure evaluation: a preview or failed preflight never consumes a setup. */
@@ -716,78 +716,145 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketCon
   };
 }
 
-export const QUICK_TICK_STRATEGY_VERSION = "quick-tick-v1";
+export const QUICK_TICK_STRATEGY_VERSION = "quick-tick-v2";
 
-function quickTickBufferUsd() {
-  return env("QUICK_TICK_BUFFER_USD", 0.05, 0, 5);
+/** Finestra della media spread rolling per la condizione 3 (non configurabile: come CONTEXT_M15_BARS). */
+export const QUICK_TICK_SPREAD_WINDOW_M1 = 20;
+
+function quickTickM1Window() {
+  return Math.floor(env("QUICK_TICK_M1_WINDOW", 6, 2, 40));
 }
 
-function quickTickMaxSpread() {
+function quickTickBreakoutBufferUsd() {
+  return env("QUICK_TICK_BREAKOUT_BUFFER_USD", 0.15, 0, 5);
+}
+
+function quickTickMaxSpreadRatio() {
+  return env("QUICK_TICK_MAX_SPREAD_RATIO", 1.5, 1, 10);
+}
+
+/** Fallback assoluto finche' la media spread rolling non e' pronta (warmup): stesso ruolo di sempre. */
+function quickTickMaxSpreadFallback() {
   return env("QUICK_TICK_MAX_SPREAD", 0.2, 0.01, 10);
 }
 
-/** Rete di emergenza mandata al broker: mai l'obiettivo del trade, quello resta il TP fisso di exit_mode=fast. */
-function quickTickEmergencySlUsd() {
-  return env("QUICK_TICK_EMERGENCY_SL_USD", 5, 0.5, 50);
-}
+function quickTickTpAtrMult() { return env("QUICK_TICK_TP_ATR_MULT", 1.5, 0.1, 10); }
+function quickTickTpMinUsd() { return env("QUICK_TICK_TP_MIN_USD", 2, 0.1, 50); }
+function quickTickTpMaxUsd() { return env("QUICK_TICK_TP_MAX_USD", 4, 0.1, 100); }
+function quickTickSlAtrMult() { return env("QUICK_TICK_SL_ATR_MULT", 1.2, 0.1, 10); }
+function quickTickSlMinUsd() { return env("QUICK_TICK_SL_MIN_USD", 2.5, 0.1, 50); }
+function quickTickSlMaxUsd() { return env("QUICK_TICK_SL_MAX_USD", 6, 0.1, 100); }
 
-function rejectQuickTick(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+function rejectQuickTickGate(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
   const evaluation: SetupEvaluation = direction
-    ? { setup: "quick_tick", status: "rejected", direction, reason }
-    : { setup: "quick_tick", status: "rejected", reason };
+    ? { setup: "quick_tick_gate", status: "rejected", direction, reason }
+    : { setup: "quick_tick_gate", status: "rejected", reason };
   return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
     takeProfit: null, riskReward: null, slPlan: null, reasoning: reason, evaluations: [evaluation] };
 }
 
 /**
  * Quarto setup, valutato SOLO in exit_mode=fast (scalper_settings) e solo quando mtf/m1_short/
- * m1_range non producono un ordine. Nessuna struttura M1/M5, nessun contesto M5/M15: solo la
- * direzione del mid rispetto all'ultimo tick precedente, filtrata dallo spread. Il TP qui sotto e'
- * un piano 1:1 sull'emergenza, sempre sovrascritto dal blocco exit_mode=fast del worker col target
- * fisso di fast_tp_usd; lo SL e' solo la rete di emergenza mandata al broker (worker/streaming.ts),
- * mai l'obiettivo reale del trade.
+ * m1_range non producono un ordine. Tre condizioni, tutte vere insieme:
+ * 1) direzione dal bias_m5 gia' calcolato per context_gate — flat non valuta nulla, NO_TRADE;
+ * 2) rottura su tick della finestra delle ultime QUICK_TICK_M1_WINDOW M1 chiuse (stesso trigger di
+ *    m1_gate/m1_short, finestra piu' corta e buffer proprio);
+ * 3) spread attuale entro QUICK_TICK_MAX_SPREAD_RATIO volte lo spread medio delle ultime
+ *    QUICK_TICK_SPREAD_WINDOW_M1 M1 chiuse, o QUICK_TICK_MAX_SPREAD assoluto finche' quella media
+ *    non e' pronta (warmup).
+ * SL e TP sono entrambi dimensionati sull'ATR M1 e mandati al broker come ordine reale — exit_mode=
+ * fast resta senza breakeven/trailing/target1, ma qui non e' il fast_tp_usd della dashboard.
  */
-function evaluateQuickTick(input: EvaluateInput): ScalperSignal {
-  const { quote, previousTick } = input;
-  if (!previousTick || previousTick.quotedAt === null || !Number.isFinite(previousTick.mid)) {
-    return rejectQuickTick("quick_tick: nessun tick precedente disponibile.");
+function evaluateQuickTick(input: EvaluateInput, nowMs: number, context: MarketContext | null): ScalperSignal {
+  const { quote } = input;
+  // 1) Direzione dal bias M5 gia' calcolato per context_gate: nessun calcolo di EMA20 M5 duplicato qui.
+  if (!context) return rejectContext("quick_tick: contesto M5/M15 non disponibile, storico M5/M15 insufficiente.");
+  const direction: "BUY" | "SELL" | null = context.biasM5 === "up" ? "BUY" : context.biasM5 === "down" ? "SELL" : null;
+  if (!direction) return rejectContext("quick_tick: bias_m5=flat (" + context.detail + ").");
+  const contextEval: SetupEvaluation = { setup: "context_gate", status: "triggered", direction,
+    reason: "quick_tick: bias_m5=" + context.biasM5 + " (" + context.detail + ")." };
+  const rejectGate = (reason: string, dir?: "BUY" | "SELL"): ScalperSignal => {
+    const signal = rejectQuickTickGate(reason, dir ?? direction);
+    return { ...signal, evaluations: [contextEval, ...signal.evaluations] };
+  };
+
+  // 2) Rottura su tick della finestra M1 corta.
+  const m1 = closedBars(input.m1, 1, nowMs);
+  if (!m1) return rejectGate("quick_tick: candele M1 non valide.");
+  const bars = quickTickM1Window();
+  if (m1.length < bars + 25) return rejectGate("quick_tick: storico M1 insufficiente, servono " + (bars + 25) + " candele chiuse.");
+  if (!latestBarFresh(m1, 1, nowMs, 3 * MINUTE)) return rejectGate("quick_tick: ultima M1 chiusa non aggiornata.");
+
+  const atr1 = atr(m1, 14, true);
+  if (!atr1 || !(atr1 > 0)) return rejectGate("quick_tick: ATR M1 non disponibile.");
+  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
+    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectGate("quick_tick: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+
+  const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
+  const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
+  if (range(trigger) > shock || (Date.parse(forming.datetime) + MINUTE > nowMs && range(forming) > shock)) {
+    return rejectGate("quick_tick: candela M1 shock, nessun inseguimento.");
   }
+
+  const window = m1.slice(-bars);
+  const high = maxHigh(window), low = minLow(window);
+  const buffer = quickTickBreakoutBufferUsd();
+  const detail = "finestra " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
+    + ", prezzo " + quote.bid.toFixed(2) + "/" + quote.ask.toFixed(2) + ", buffer " + buffer.toFixed(2) + "$"
+    + ", ATR M1 " + atr1.toFixed(2) + "$";
+  const brokeUp = quote.bid >= high + buffer, brokeDown = quote.ask <= low - buffer;
+  if (!brokeUp && !brokeDown) return rejectGate("quick_tick: prezzo dentro la finestra delle ultime " + bars + " M1 chiuse (" + detail + ").");
+  const breakoutDirection: "BUY" | "SELL" = brokeUp ? "BUY" : "SELL";
+  if (breakoutDirection !== direction) {
+    return rejectGate("quick_tick " + breakoutDirection + ": bias_m5=" + context.biasM5 + " ammette solo " + direction
+      + " (" + context.detail + ").", breakoutDirection);
+  }
+
+  // 3) Spread entro il rapporto sulla media rolling; fallback assoluto in warmup.
   const spread = quote.ask - quote.bid;
-  const maxSpread = quickTickMaxSpread();
+  const rollingAvg = input.quickTickSpreadAvg ?? null;
+  const warmup = rollingAvg === null || !(rollingAvg > 0);
+  const maxSpread = warmup ? quickTickMaxSpreadFallback() : quickTickMaxSpreadRatio() * rollingAvg!;
   if (spread > maxSpread) {
-    return rejectQuickTick("quick_tick: spread troppo alto " + spread.toFixed(2) + "$ (max " + maxSpread.toFixed(2) + "$).");
+    return rejectGate("quick_tick: spread " + spread.toFixed(2) + "$ oltre " + (warmup
+      ? "il fallback " + maxSpread.toFixed(2) + "$ (media rolling non ancora pronta, warmup)"
+      : quickTickMaxSpreadRatio() + "x la media rolling " + rollingAvg!.toFixed(2) + "$ (" + maxSpread.toFixed(2) + "$)") + ".", direction);
   }
-  const buffer = quickTickBufferUsd();
-  const delta = quote.mid - previousTick.mid;
-  const direction: "BUY" | "SELL" | null = delta > buffer ? "BUY" : delta < -buffer ? "SELL" : null;
-  const deltaDetail = "mid " + quote.mid.toFixed(2) + " vs precedente " + previousTick.mid.toFixed(2)
-    + " (" + (delta >= 0 ? "+" : "") + delta.toFixed(2) + "$, soglia " + buffer.toFixed(2) + "$), spread " + spread.toFixed(2) + "$";
-  if (!direction) {
-    return rejectQuickTick("quick_tick: variazione tick sotto soglia, " + deltaDetail + ".");
+
+  // SL/TP sull'ATR M1: lo SL scarta il trade se oltre il massimo (come RANGE_SL_MAX_PCT su
+  // m1_range), il TP e' solo un clamp fra minimo e massimo. Entrambi al broker, nessun target1.
+  const slAtrRaw = atr1 * quickTickSlAtrMult();
+  const slMin = quickTickSlMinUsd(), slMax = quickTickSlMaxUsd();
+  if (slAtrRaw > slMax) {
+    return rejectGate("quick_tick: SL richiesto " + slAtrRaw.toFixed(2) + "$ oltre il massimo " + slMax.toFixed(2) + "$ (" + detail + ").", direction);
   }
+  const plannedRisk = Math.max(slAtrRaw, slMin);
+  const tpAtrRaw = atr1 * quickTickTpAtrMult();
+  const plannedReward = Math.min(Math.max(tpAtrRaw, quickTickTpMinUsd()), quickTickTpMaxUsd());
 
   const entry = direction === "BUY" ? quote.ask : quote.bid;
-  const emergency = quickTickEmergencySlUsd();
-  // Stesso arrotondamento conservativo di mtf/m1_short/m1_range: SL sempre arrotondato lontano
-  // dall'entry (mai piu' stretto), TP sempre arrotondato verso l'entry (mai piu' generoso). Qui il
-  // TP e' comunque solo un piano 1:1 placeholder: il blocco exit_mode=fast lo sovrascrive sempre.
-  const sl = direction === "BUY" ? Math.floor((entry - emergency) * 100) / 100 : Math.ceil((entry + emergency) * 100) / 100;
-  const tp = direction === "BUY" ? Math.floor((entry + emergency) * 100) / 100 : Math.ceil((entry - emergency) * 100) / 100;
-  const risk = Math.abs(entry - sl), reward = Math.abs(tp - entry);
-  if (!(risk > 0 && reward > 0)) return rejectQuickTick("quick_tick: SL di emergenza non calcolabile al prezzo corrente.", direction);
-
-  const reason = "quick_tick " + direction + ": " + deltaDetail + ".";
+  const sl = direction === "BUY" ? Math.floor((entry - plannedRisk) * 100) / 100 : Math.ceil((entry + plannedRisk) * 100) / 100;
+  const tp = direction === "BUY" ? Math.floor((entry + plannedReward) * 100) / 100 : Math.ceil((entry - plannedReward) * 100) / 100;
+  const risk = Math.abs(entry - sl), reward = signed(direction, tp - entry);
+  if (!(risk > 0 && reward > 0) || risk > slMax + 0.011) {
+    return rejectGate("quick_tick: SL/TP non validi al prezzo corrente (" + detail + ").", direction);
+  }
+  const rr = reward / risk;
+  const level = direction === "BUY" ? high : low;
+  const reason = "quick_tick " + direction + ": prezzo oltre " + level.toFixed(2) + " (" + detail + "), spread " + spread.toFixed(2) + "$"
+    + (warmup ? " (fallback, warmup)" : " (media rolling " + rollingAvg!.toFixed(2) + "$)") + ".";
   return {
     direction, setup: "quick_tick",
-    // Chiave unica per tick, nessuna candela da riarmare: l'anti-duplicazione reale e' il cooldown
-    // generico DUP_COOLDOWN_S/DUP_SETUP_BARS del worker, non questa chiave.
-    setupKey: [QUICK_TICK_STRATEGY_VERSION, direction, String(previousTick.quotedAt)].join(":"),
+    // level_used: livello e ultima M1 chiusa nella chiave, come m1_short — un solo tentativo finche'
+    // non chiude una nuova M1.
+    setupKey: [QUICK_TICK_STRATEGY_VERSION, direction, level.toFixed(2), trigger.datetime].join(":"),
     entry, stopLoss: sl, takeProfit: tp,
-    riskReward: Number((reward / risk).toFixed(2)),
-    slPlan: null,
-    evaluations: [{ setup: "quick_tick", status: "triggered", direction, reason }],
-    reasoning: QUICK_TICK_STRATEGY_VERSION + ": " + reason + " SL emergenza " + emergency.toFixed(2)
-      + "$ (uscita reale: TP fisso exit_mode=fast, nessun breakeven/trailing).",
+    riskReward: Number(rr.toFixed(2)),
+    slPlan: { structural: Number(slAtrRaw.toFixed(2)), atr: Number(slAtrRaw.toFixed(2)), applied: Number(risk.toFixed(2)),
+      minUsd: slMin, maxUsd: slMax, rr: Number(rr.toFixed(2)), tpMinUsd: quickTickTpMinUsd(), tpMaxUsd: quickTickTpMaxUsd() },
+    evaluations: [contextEval, { setup: "quick_tick_gate", status: "triggered", direction, reason }],
+    reasoning: QUICK_TICK_STRATEGY_VERSION + ": " + reason + " M1 chiusa " + trigger.datetime
+      + ". SL " + risk.toFixed(2) + "$, TP " + reward.toFixed(2) + "$ (" + rr.toFixed(2) + "R), entrambi al broker, nessun breakeven/trailing/target1.",
   };
 }
 
@@ -805,8 +872,9 @@ export function evaluateScalper(input: EvaluateInput): ScalperSignal {
   let evaluations = [...mtf.evaluations];
   const shortActive = shortEnabled() && !input.disableShort;
   const rangeActive = rangeEnabled() && !input.disableRange;
-  // Contesto M5/M15 letto una volta sola e condiviso dai due setup che lo usano.
-  const context = shortActive || rangeActive
+  const quickTickActive = input.exitMode === "fast";
+  // Contesto M5/M15 letto una volta sola e condiviso da tutti e tre i setup che lo usano.
+  const context = shortActive || rangeActive || quickTickActive
     ? contextM5M15(closedBars(input.m5, 5, nowMs) ?? [], nowMs)
     : null;
   if (shortActive) {
@@ -819,8 +887,8 @@ export function evaluateScalper(input: EvaluateInput): ScalperSignal {
     evaluations = [...evaluations, ...ranged.evaluations];
     if (ranged.direction !== "NO_TRADE") return { ...ranged, evaluations };
   }
-  if (input.exitMode === "fast") {
-    const quickTick = evaluateQuickTick(input);
+  if (quickTickActive) {
+    const quickTick = evaluateQuickTick(input, nowMs, context);
     evaluations = [...evaluations, ...quickTick.evaluations];
     if (quickTick.direction !== "NO_TRADE") return { ...quickTick, evaluations };
   }

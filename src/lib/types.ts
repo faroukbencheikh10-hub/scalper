@@ -22,9 +22,10 @@ export type ScalperSetup = "liquidity_sweep" | "momentum_breakout" | "breakout_r
 export type SetupEvaluation = {
   /**
    * Setup valutato, "m15_gate" per il contesto M15/M5 della mtf, "context_gate" per il contesto
-   * M5/M15 di m1_short e m1_range o "filtri" per i blocchi di protezione a monte.
+   * M5/M15 di m1_short, m1_range e quick_tick (bias_m5), "quick_tick_gate" per la rottura M1 e il
+   * filtro spread propri di quick_tick, o "filtri" per i blocchi di protezione a monte.
    */
-  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate" | "context_gate" | "market_liquidity";
+  setup: ScalperSetup | "filtri" | "m15_gate" | "m1_gate" | "range_gate" | "quick_tick_gate" | "context_gate" | "market_liquidity";
   status: "triggered" | "rejected";
   direction?: "BUY" | "SELL";
   reason: string;
