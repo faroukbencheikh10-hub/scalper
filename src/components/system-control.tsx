@@ -16,18 +16,27 @@ type Props = {
   account?: Account;
   /** Contract size e leva dello strumento attivo: margine e rischio non sono quelli dell'oro su NAS100. */
   contract?: ContractSpec | null;
+  /** Strumento tradato e sua eventuale posizione aperta, che blocca il cambio. */
+  activeSymbol?: string | null;
+  symbolChoices?: string[];
+  symbolBlockedBy?: string | null;
   onChanged?: (stopped: boolean) => void;
   onLotsChanged?: (lots: number) => void;
+  onSymbolChanged?: (symbol: string) => void;
 };
 
 function amount(value: number | null | undefined, digits = 2) {
   return Number.isFinite(value) ? Number(value).toFixed(digits) : "—";
 }
 
-export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLoss, account, contract, onChanged, onLotsChanged }: Props) {
+export function SystemControl({
+  stopped, lots, lotChoices, price, entry, stopLoss, account, contract,
+  activeSymbol, symbolChoices, symbolBlockedBy, onChanged, onLotsChanged, onSymbolChanged,
+}: Props) {
   const [isStopped, setIsStopped] = useState(stopped);
   const [busy, setBusy] = useState(false);
   const [lotsBusy, setLotsBusy] = useState(false);
+  const [symbolBusy, setSymbolBusy] = useState(false);
   const [activeLots, setActiveLots] = useState<number | null>(lots ?? null);
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -93,7 +102,39 @@ export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLos
     }
   }
 
+  async function changeSymbol(next: string) {
+    if (next === activeSymbol || symbolBusy) return;
+    const ok = window.confirm(
+      `Passare a ${next}? Il worker cambia sottoscrizione e riparte da zero con storico candele,`
+      + " baseline di liquidita' e cooldown anti-duplicazione. I lotti e il TP fisso sono quelli salvati per "
+      + `${next}.`,
+    );
+    if (!ok) return;
+    setSymbolBusy(true);
+    setMsg(null);
+    try {
+      const response = await fetch("/api/control", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "set_symbol", symbol: next }),
+      });
+      const data = await response.json();
+      if (!data.ok) {
+        setMsg(data.error || "Cambio strumento non riuscito");
+      } else {
+        setMsg(data.note || `Strumento impostato su ${next}`);
+        onSymbolChanged?.(next);
+      }
+    } catch {
+      setMsg("Errore di rete");
+    } finally {
+      setSymbolBusy(false);
+    }
+  }
+
   const active = !isStopped;
+  const symbols = symbolChoices && symbolChoices.length > 0 ? symbolChoices : [];
+  const symbolLocked = Boolean(symbolBlockedBy);
   const choices = lotChoices && lotChoices.length > 0 ? lotChoices : LOT_CHOICES;
   const selected = Number.isFinite(activeLots) ? Number(activeLots) : null;
   const options = selected !== null && !choices.includes(selected) ? [...choices, selected].sort((a, b) => a - b) : choices;
@@ -135,7 +176,28 @@ export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLos
           {options.map((value) => <option key={value} value={value}>{value.toFixed(2)}</option>)}
         </select>
       </label>
+      {symbols.length > 1 ? (
+        <label className="lot-picker">
+          <span>Strumento</span>
+          <select
+            value={activeSymbol ?? ""}
+            onChange={(event) => void changeSymbol(event.target.value)}
+            disabled={symbolBusy || symbolLocked}
+            aria-label="Strumento tradato"
+          >
+            {activeSymbol ? null : <option value="">—</option>}
+            {symbols.map((value) => <option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
+      ) : null}
     </div>
+
+    {symbolLocked ? (
+      <p className="lot-note">
+        Cambio strumento bloccato: posizione aperta su <strong>{symbolBlockedBy}</strong>. Chiudila (o aspetta
+        la chiusura) per poter passare all&apos;altro strumento.
+      </p>
+    ) : null}
 
     <p className="lot-metrics">
       Margine richiesto <strong className={marginShort ? "negative" : undefined}>≈ {amount(margin)} {currency}</strong>

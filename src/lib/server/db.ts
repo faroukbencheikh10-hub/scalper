@@ -60,6 +60,12 @@ export async function ensureSchema() {
     -- cosi' un cambio di modalita' dalla dashboard non tocca mai le posizioni gia' aperte.
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS exit_mode text NOT NULL DEFAULT 'normal';
     ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS fast_tp_usd numeric;
+    -- Strumento del segnale. Tutto lo storico e' nato quando si tradava solo l'oro: viene
+    -- migrato sotto XAUUSD, cosi' i blocchi da perdita in corso al deploy non si perdono.
+    ALTER TABLE scalper_signals ADD COLUMN IF NOT EXISTS symbol text NOT NULL DEFAULT 'XAUUSD';
+    UPDATE scalper_signals SET symbol='XAUUSD' WHERE symbol IS NULL OR symbol='';
+    CREATE INDEX IF NOT EXISTS scalper_signals_symbol_closed_idx ON scalper_signals(symbol,closed_at DESC)
+      WHERE outcome IS NOT NULL;
     CREATE INDEX IF NOT EXISTS scalper_signals_created_at_idx ON scalper_signals(created_at DESC);
     CREATE INDEX IF NOT EXISTS scalper_signals_open_idx ON scalper_signals(created_at DESC)
       WHERE outcome IS NULL AND direction IN ('BUY','SELL');
@@ -147,7 +153,7 @@ export async function ensureSchema() {
       IF NEW.outcome IN ('WIN','LOSS','BREAKEVEN') AND NEW.mt5_position_id IS NOT NULL THEN
         UPDATE trades SET
           scalper_signal_id=NEW.id::text,
-          symbol='XAUUSD',
+          symbol=COALESCE(NEW.symbol,'XAUUSD'),
           direction=NEW.direction,
           setup=NEW.setup,
           lot=COALESCE(NEW.mt5_volume,lot),
@@ -180,7 +186,7 @@ export async function ensureSchema() {
             context_json,target1,tp_broker,breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason,
             exit_mode,fast_tp_usd
           ) VALUES (
-            'scalper',NEW.id::text,'XAUUSD',NEW.mt5_position_id,NEW.direction,NEW.setup,NEW.mt5_volume,NEW.mt5_open_price,
+            'scalper',NEW.id::text,COALESCE(NEW.symbol,'XAUUSD'),NEW.mt5_position_id,NEW.direction,NEW.setup,NEW.mt5_volume,NEW.mt5_open_price,
             NEW.mt5_close_price,NEW.mt5_profit,NEW.result_r,'normal',NEW.created_at,
             COALESCE(NEW.closed_at,now()),
             jsonb_build_object('setup',NEW.setup,'outcome',NEW.outcome,'qualityScore',NEW.quality_score,
@@ -199,7 +205,7 @@ export async function ensureSchema() {
 
     DROP TRIGGER IF EXISTS scalper_signal_trade_sync ON scalper_signals;
     CREATE TRIGGER scalper_signal_trade_sync
-      AFTER INSERT OR UPDATE OF outcome,mt5_close_price,mt5_profit,result_r,closed_at,
+      AFTER INSERT OR UPDATE OF outcome,mt5_close_price,mt5_profit,result_r,closed_at,symbol,
         breakeven_price,breakeven_at,trailing_updates,trailing_active,final_sl,close_reason,target1,tp_broker,
         context_json
         ON scalper_signals
@@ -215,7 +221,7 @@ export async function ensureSchema() {
       profit,result_r,reason,opened_at,closed_at,payload,exit_mode,fast_tp_usd
     )
     SELECT
-      'scalper',s.id::text,'XAUUSD',s.mt5_position_id,s.direction,s.setup,s.mt5_volume,s.mt5_open_price,s.mt5_close_price,
+      'scalper',s.id::text,COALESCE(s.symbol,'XAUUSD'),s.mt5_position_id,s.direction,s.setup,s.mt5_volume,s.mt5_open_price,s.mt5_close_price,
       s.mt5_profit,s.result_r,'normal',s.created_at,COALESCE(s.closed_at,now()),
       jsonb_build_object('setup',s.setup,'outcome',s.outcome,'qualityScore',s.quality_score),
       COALESCE(s.exit_mode,'normal'),s.fast_tp_usd

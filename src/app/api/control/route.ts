@@ -12,6 +12,11 @@ import {
   SCHEDULED_CLOSE_TIMEZONE,
 } from "@/lib/scheduledClose";
 import { dashboardGuard } from "@/lib/server/dashboardAuth";
+import {
+  ACTIVE_SYMBOL_SETTING_KEY, execLotsSettingKey, fastTpSettingKey, pickSymbolSetting,
+  resolveTradedSymbol, symbolSwitchDecision, TRADED_SYMBOLS, tradedSymbolLabel, type TradedSymbol,
+} from "@/lib/symbols";
+import { fastTpBounds } from "@/lib/server/symbolConfig";
 
 export const dynamic = "force-dynamic";
 
@@ -32,22 +37,46 @@ async function readScheduledCloseConfig() {
   return resolveScheduledCloseConfig((key) => values[key]);
 }
 
+/** Strumento attivo e, se c'e' una posizione aperta, lo strumento su cui e' aperta. */
+async function readSymbolState() {
+  const [rawActive, rawDetail] = await Promise.all([
+    getSetting(ACTIVE_SYMBOL_SETTING_KEY),
+    getSetting("stream_worker_detail"),
+  ]);
+  const activeSymbol = resolveTradedSymbol(rawActive);
+  let openOn: TradedSymbol | null = null;
+  try {
+    const detail = rawDetail ? JSON.parse(rawDetail) as { openPositions?: number; activeSymbol?: string } : null;
+    // Il worker e' l'unico a vedere il terminal state: la dashboard si fida del suo ultimo battito.
+    if (Number(detail?.openPositions ?? 0) > 0) openOn = resolveTradedSymbol(detail?.activeSymbol ?? activeSymbol);
+  } catch { openOn = null; }
+  return { activeSymbol, openOn };
+}
+
 export async function GET(req: NextRequest) {
   const denied = await dashboardGuard(req);
   if (denied) return denied;
   try {
     await ensureSchema();
+    const { activeSymbol, openOn } = await readSymbolState();
     return NextResponse.json({
       ok: true,
       stopped: await systemStopActive(),
       changedAt: await getSetting("system_stop_changed_at") ?? null,
-      lots: resolveLots(await getSetting(EXEC_LOTS_SETTING_KEY)),
+      activeSymbol,
+      activeSymbolLabel: tradedSymbolLabel(activeSymbol),
+      symbolChoices: TRADED_SYMBOLS,
+      symbolSwitchBlockedBy: openOn,
+      lots: resolveLots(pickSymbolSetting(
+        activeSymbol, await getSetting(execLotsSettingKey(activeSymbol)), await getSetting(EXEC_LOTS_SETTING_KEY))),
       lotsMin: lotsMin(),
       lotsMax: lotsMax(),
       lotChoices: LOT_CHOICES,
       exitMode: resolveExitMode(await getSetting(EXIT_MODE_SETTING_KEY)),
-      fastTpUsd: resolveFastTpUsd(await getSetting(FAST_TP_USD_SETTING_KEY)),
-      fastTpUsdMin: MIN_FAST_TP_USD,
+      fastTpUsd: resolveFastTpUsd(
+        pickSymbolSetting(activeSymbol, await getSetting(fastTpSettingKey(activeSymbol)), await getSetting(FAST_TP_USD_SETTING_KEY)),
+        fastTpBounds(activeSymbol)),
+      fastTpUsdMin: fastTpBounds(activeSymbol).minUsd,
       scheduledClose: scheduledCloseStatus(new Date(), await readScheduledCloseConfig()),
     });
   } catch (err) {
@@ -68,7 +97,9 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, error: "lots numerico positivo richiesto" }, { status: 400 });
       }
       const applied = clampLots(requested);
-      await setSetting(EXEC_LOTS_SETTING_KEY, applied.toFixed(2));
+      const { activeSymbol } = await readSymbolState();
+      // I lotti sono per strumento: si scrive la chiave del simbolo attivo, non quella storica.
+      await setSetting(execLotsSettingKey(activeSymbol), applied.toFixed(2));
       return NextResponse.json({
         ok: true,
         lots: applied,
@@ -82,6 +113,33 @@ export async function POST(req: NextRequest) {
       });
     }
 
+    if (body?.action === "set_symbol") {
+      const requested = String(body.symbol ?? "");
+      if (!(TRADED_SYMBOLS as string[]).includes(requested.trim().toUpperCase())) {
+        return NextResponse.json({ ok: false, error: `symbol fra ${TRADED_SYMBOLS.join(" e ")} richiesto` }, { status: 400 });
+      }
+      const symbol = resolveTradedSymbol(requested);
+      const { activeSymbol, openOn } = await readSymbolState();
+      if (symbol === activeSymbol) {
+        return NextResponse.json({ ok: true, activeSymbol, changed: false, note: `Strumento gia' su ${tradedSymbolLabel(activeSymbol)}.` });
+      }
+      // Stessa regola che applica il worker (symbols.ts), qui come prima barriera: con una posizione
+      // aperta su QUALUNQUE strumento non si cambia, perche' il limite di una posizione e' di conto.
+      const decision = symbolSwitchDecision({ current: activeSymbol, requested: symbol, openPositionSymbol: openOn });
+      if (!decision.allowed) {
+        return NextResponse.json({
+          ok: false, activeSymbol, symbolSwitchBlockedBy: openOn, error: decision.reason,
+        }, { status: 409 });
+      }
+      await setSetting(ACTIVE_SYMBOL_SETTING_KEY, symbol);
+      return NextResponse.json({
+        ok: true,
+        activeSymbol: symbol,
+        changed: true,
+        note: `Strumento impostato su ${tradedSymbolLabel(symbol)}. Il worker cambia sottoscrizione e azzera storico e baseline al prossimo ciclo di controllo.`,
+      });
+    }
+
     if (body?.action === "set_exit_mode") {
       if (body.exitMode !== "normal" && body.exitMode !== "fast") {
         return NextResponse.json({ ok: false, error: "exitMode 'normal' o 'fast' richiesto" }, { status: 400 });
@@ -91,9 +149,10 @@ export async function POST(req: NextRequest) {
       if (!Number.isFinite(requestedTp) || requestedTp <= 0) {
         return NextResponse.json({ ok: false, error: "fastTpUsd numerico positivo richiesto" }, { status: 400 });
       }
-      const appliedTp = clampFastTpUsd(requestedTp);
+      const { activeSymbol } = await readSymbolState();
+      const appliedTp = clampFastTpUsd(requestedTp, fastTpBounds(activeSymbol));
       await setSetting(EXIT_MODE_SETTING_KEY, exitMode);
-      await setSetting(FAST_TP_USD_SETTING_KEY, appliedTp.toFixed(2));
+      await setSetting(fastTpSettingKey(activeSymbol), appliedTp.toFixed(2));
       return NextResponse.json({
         ok: true,
         exitMode,

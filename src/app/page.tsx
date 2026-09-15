@@ -271,6 +271,9 @@ export default function Home() {
           stopLoss={last?.stop_loss === null || last?.stop_loss === undefined ? null : Number(last.stop_loss)}
           account={data.account ?? data.stream?.detail?.account ?? null}
           contract={contract}
+          activeSymbol={data.activeSymbol ?? null}
+          symbolChoices={data.symbolChoices}
+          symbolBlockedBy={data.symbolSwitchBlockedBy ?? null}
           onChanged={(stopped) => setData((current) => current ? { ...current, systemStopped: stopped } : current)}
           onLotsChanged={(lots) => setData((current) => current ? { ...current, lots } : current)}
         />

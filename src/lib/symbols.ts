@@ -54,6 +54,37 @@ export function pickSymbolSetting(
   return legacy !== null && legacy !== undefined && String(legacy).trim() !== "" ? legacy : undefined;
 }
 
+/**
+ * Si puo' passare da uno strumento all'altro? Regola unica, usata sia dall'API di controllo sia dal
+ * worker: con una posizione aperta su QUALUNQUE strumento il cambio e' vietato (il limite di una
+ * posizione e' di conto, non per simbolo), e un ciclo d'ordine in volo lo rimanda.
+ */
+export type SymbolSwitchDecision = { allowed: boolean; reason: string | null };
+
+export function symbolSwitchDecision(input: {
+  current: TradedSymbol;
+  requested: TradedSymbol;
+  openPositionSymbol: TradedSymbol | null;
+  busy?: boolean;
+}): SymbolSwitchDecision {
+  if (input.requested === input.current) {
+    return { allowed: false, reason: `Strumento gia' su ${input.current}.` };
+  }
+  if (input.openPositionSymbol) {
+    return {
+      allowed: false,
+      reason: `Posizione aperta su ${input.openPositionSymbol}: chiudila prima di passare a ${input.requested}.`,
+    };
+  }
+  if (input.busy) {
+    return {
+      allowed: false,
+      reason: `Ordine o chiusura in corso su ${input.current}: cambio a ${input.requested} rimandato al prossimo controllo.`,
+    };
+  }
+  return { allowed: true, reason: null };
+}
+
 /** Etichetta leggibile dello strumento per dashboard, log e Telegram. */
 export function tradedSymbolLabel(symbol: TradedSymbol) {
   return symbol === "NAS100" ? "NAS100 (US Tech 100)" : "XAUUSD (oro)";

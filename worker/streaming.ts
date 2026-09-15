@@ -36,11 +36,12 @@ import {
 } from "../src/lib/server/marginCooldown";
 import {
   ACTIVE_SYMBOL_SETTING_KEY, execLotsSettingKey, fastTpSettingKey, pickSymbolSetting,
-  resolveTradedSymbol, tradedSymbolLabel, type TradedSymbol,
+  resolveTradedSymbol, symbolSwitchDecision, tradedSymbolLabel, type TradedSymbol,
 } from "../src/lib/symbols";
 import {
   brokerSymbol, contractSpec, fastTpBounds, symbolPriceParam,
 } from "../src/lib/server/symbolConfig";
+import { lossGuardsFromClosures, type DirectionLocks } from "../src/lib/server/lossGuards";
 import {
   computeLiquiditySnapshot, createLiquidityState, describeLiquiditySnapshot, lotMultiplierFor,
   setupsAllowedFor, updateLiquidityState,
@@ -213,6 +214,13 @@ type FlattenConnection = StreamingConnectionLike & {
   modifyPosition: (positionId: string, stopLoss?: number, takeProfit?: number) => Promise<Record<string, unknown>>;
 };
 
+/**
+ * Attesa prima di ritentare un cambio strumento fallito (sottoscrizione rifiutata, nome simbolo
+ * sbagliato sul broker): il poll di controllo gira ogni 250 ms, senza questa pausa riproverebbe in
+ * continuazione. 30 s sono abbastanza per assorbire un disservizio temporaneo del feed.
+ */
+const SYMBOL_SWITCH_RETRY_MS = 30_000;
+
 /** Motivo di chiusura scritto dalle chiusure forzate: il resto lo deduce il piano di uscita. */
 const FORCED_CLOSE_REASON: Record<string, ManagedCloseReason> = {
   end_of_session: "flatten",
@@ -329,6 +337,15 @@ async function main() {
   // unita' di prezzo. Il cambio a caldo da dashboard arriva piu' sotto (switchActiveSymbol).
   let activeSymbol: TradedSymbol = resolveTradedSymbol(await getSetting(ACTIVE_SYMBOL_SETTING_KEY));
   setActiveBrokerSymbol(brokerSymbol(activeSymbol));
+  // Strumento richiesto dalla dashboard: il cambio vero avviene nel poll di controllo, mai qui.
+  let desiredSymbol: TradedSymbol = activeSymbol;
+  let symbolSwitchBusy = false;
+  let symbolSwitchBlockedReason: string | null = null;
+  // Un cambio fallito non va ritentato al poll successivo: il poll di controllo gira ogni 250 ms e
+  // rileggerebbe subito active_symbol dal DB, riprovando 4 volte al secondo (round-trip MetaApi,
+  // scrittura DB e riga di log ognuna). Con un METAAPI_SYMBOL_* sbagliato sarebbe un loop infinito.
+  let symbolSwitchFailedTarget: TradedSymbol | null = null;
+  let symbolSwitchRetryAtMs = 0;
   let activeLots = lots();
   // exit_mode/fast_tp_usd: letti dalla dashboard come i lotti, ma fissati sulla singola posizione
   // al momento dell'apertura (vedi orderExitMode/orderFastTpUsd piu' sotto) — un cambio qui non
@@ -340,7 +357,7 @@ async function main() {
   let scheduledCloseConfig = resolveScheduledCloseConfig(() => undefined);
   // Liquidita' del momento da segnali di mercato reali (spread/tick-rate/ATR), non dall'orologio:
   // un solo stato per la vita del processo, aggiornato ad ogni tick dentro la fascia oraria.
-  const liquidityState = createLiquidityState(workerStartedAtMs);
+  let liquidityState = createLiquidityState(workerStartedAtMs);
 
   const refreshControl = async () => {
     const settings = await getSettings([
@@ -350,6 +367,7 @@ async function main() {
     ]);
     activeLots = resolveLots(pickSymbolSetting(
       activeSymbol, settings.get(execLotsSettingKey(activeSymbol)), settings.get(EXEC_LOTS_SETTING_KEY)));
+    desiredSymbol = resolveTradedSymbol(settings.get(ACTIVE_SYMBOL_SETTING_KEY));
     activeExitMode = resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY));
     activeFastTpUsd = resolveFastTpUsd(
       pickSymbolSetting(activeSymbol, settings.get(fastTpSettingKey(activeSymbol)), settings.get(FAST_TP_USD_SETTING_KEY)),
@@ -390,8 +408,12 @@ async function main() {
   let lastEmptyFlattenMarker: string | null = null;
   const dupDirectionUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
   const dupSetupUntilBucket = new Map<string, number>();
-  const lossLockUntil: Record<"BUY" | "SELL", number> = { BUY: 0, SELL: 0 };
-  let lossPauseUntil = 0;
+  // Blocchi da perdita per strumento: una serie di perdite sull'oro non deve fermare NAS100, ne'
+  // il contrario. Lo storico nato senza dimensione symbol e' migrato sotto XAUUSD (vedi db.ts).
+  const lossLockUntil = new Map<TradedSymbol, DirectionLocks>();
+  const lossPauseUntil = new Map<TradedSymbol, number>();
+  const locksFor = (target: TradedSymbol): DirectionLocks => lossLockUntil.get(target) ?? { BUY: 0, SELL: 0 };
+  const pauseFor = (target: TradedSymbol): number => lossPauseUntil.get(target) ?? 0;
   // Cooldown da margine insufficiente, per symbol+setup+direzione: blocco aggiuntivo e indipendente
   // da LOSS_LOCK/CONSEC_LOSS/re-entry, armato solo dal fallimento specifico del margine. In memoria
   // come i blocchi da perdita: dura 30 s, molto meno di un riavvio del worker.
@@ -426,31 +448,20 @@ async function main() {
   const refreshLossGuards = async () => {
     const start = sessionWindowStart(new Date(), sessionConfig);
     const result = await dbQuery(
-      `SELECT direction,outcome,close_reason,mt5_profit,closed_at FROM scalper_signals
+      `SELECT symbol,direction,outcome,close_reason,mt5_profit,closed_at FROM scalper_signals
         WHERE outcome IN ('WIN','LOSS','BREAKEVEN') AND mt5_position_id IS NOT NULL
           AND closed_at >= $1::timestamptz
-        ORDER BY closed_at DESC LIMIT 50`,
+        ORDER BY closed_at DESC LIMIT 100`,
       [start.toISOString()],
     );
-    const rows = result.rows as Array<{ direction?: string; outcome?: string; close_reason?: string; mt5_profit?: unknown; closed_at?: unknown }>;
-    lossLockUntil.BUY = 0;
-    lossLockUntil.SELL = 0;
-    lossPauseUntil = 0;
-    // Solo sl_initial e' una perdita: breakeven, trailing, flatten, stop e watchdog non bloccano nulla.
-    for (const row of rows) {
-      if (!countsAsLoss(row.outcome, row.close_reason, row.mt5_profit)) continue;
-      const direction = row.direction === "BUY" || row.direction === "SELL" ? row.direction : null;
-      if (!direction || lossLockUntil[direction] > 0) continue;
-      lossLockUntil[direction] = closedAtMs(row.closed_at) + lossLockMs;
-    }
-    let streak = 0;
-    for (const row of rows) {
-      if (!countsAsLoss(row.outcome, row.close_reason, row.mt5_profit)) break;
-      streak += 1;
-      if (streak >= consecLossCount) {
-        lossPauseUntil = closedAtMs(rows[0]?.closed_at) + consecLossPauseMs;
-        break;
-      }
+    // Le chiusure arrivano gia' dalla piu' recente: il raggruppamento per strumento e la stessa
+    // logica di sempre stanno in lossGuardsFromClosures, verificata dagli scenari offline.
+    const guards = lossGuardsFromClosures(result.rows, { lossLockMs, consecLossPauseMs, consecLossCount });
+    lossLockUntil.clear();
+    lossPauseUntil.clear();
+    for (const [target, value] of guards) {
+      lossLockUntil.set(target, value.locks);
+      if (value.pauseUntil > 0) lossPauseUntil.set(target, value.pauseUntil);
     }
   };
 
@@ -458,22 +469,31 @@ async function main() {
 
   const lossGuards = () => {
     const now = Date.now();
-    const directions = (["BUY", "SELL"] as const).filter((direction) => lossLockUntil[direction] > now);
+    const locks = locksFor(activeSymbol), pause = pauseFor(activeSymbol);
+    const directions = (["BUY", "SELL"] as const).filter((direction) => locks[direction] > now);
     return {
+      // Chiavi invariate: mostrano lo strumento attivo, non i due insieme.
       lossLockedDirections: [...directions],
-      lossLockUntil: Object.fromEntries(directions.map((direction) => [direction, new Date(lossLockUntil[direction]).toISOString()])),
-      lossPauseUntil: lossPauseUntil > now ? new Date(lossPauseUntil).toISOString() : null,
+      lossLockUntil: Object.fromEntries(directions.map((direction) => [direction, new Date(locks[direction]).toISOString()])),
+      lossPauseUntil: pause > now ? new Date(pause).toISOString() : null,
       lossLockMinutes: Math.round(lossLockMs / 60_000),
       consecLossPauseMinutes: Math.round(consecLossPauseMs / 60_000),
+      // Quadro completo per diagnosi: i blocchi dell'altro strumento restano visibili nel dettaglio.
+      lossLocksBySymbol: Object.fromEntries([...lossLockUntil].map(([target, value]) => [target, {
+        BUY: value.BUY > now ? new Date(value.BUY).toISOString() : null,
+        SELL: value.SELL > now ? new Date(value.SELL).toISOString() : null,
+        pauseUntil: pauseFor(target) > now ? new Date(pauseFor(target)).toISOString() : null,
+      }])),
     };
   };
 
   const lossGuardLine = () => {
     const now = Date.now();
+    const locks = locksFor(activeSymbol), pause = pauseFor(activeSymbol);
     const parts = (["BUY", "SELL"] as const)
-      .filter((direction) => lossLockUntil[direction] > now)
-      .map((direction) => `${direction} bloccato fino alle ${hhmmUtc(lossLockUntil[direction])} UTC`);
-    if (lossPauseUntil > now) parts.push(`pausa ${consecLossCount} perdite consecutive fino alle ${hhmmUtc(lossPauseUntil)} UTC`);
+      .filter((direction) => locks[direction] > now)
+      .map((direction) => `${direction} bloccato fino alle ${hhmmUtc(locks[direction])} UTC`);
+    if (pause > now) parts.push(`pausa ${consecLossCount} perdite consecutive fino alle ${hhmmUtc(pause)} UTC`);
     return parts.length > 0 ? parts.join(" \u00b7 ") : "nessun blocco da perdita attivo";
   };
 
@@ -515,6 +535,9 @@ async function main() {
     activeSymbol,
     activeSymbolLabel: tradedSymbolLabel(activeSymbol),
     contract: contractSpec(activeSymbol),
+    desiredSymbol,
+    symbolSwitchPending: desiredSymbol !== activeSymbol,
+    symbolSwitchBlockedReason,
     mode: `M15 trend / M5 pullback-retest / M1 chiusa + max ${maxOpenPositions} posizioni`,
     strategyVersion: STRATEGY_VERSION,
     autoExec: autoExecEnabled(),
@@ -1407,15 +1430,15 @@ async function main() {
       logTick(signal, quote, reason);
       return;
     }
-    if (lossPauseUntil > guardNow) {
-      const reason = `Pausa dopo ${consecLossCount} perdite consecutive: nessun ingresso fino alle ${hhmmUtc(lossPauseUntil)} UTC.`;
+    if (pauseFor(activeSymbol) > guardNow) {
+      const reason = `Pausa dopo ${consecLossCount} perdite consecutive su ${activeSymbol}: nessun ingresso fino alle ${hhmmUtc(pauseFor(activeSymbol))} UTC.`;
       latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
       notifyBlock(reason);
       logTick(signal, quote, reason);
       return;
     }
-    if (lossLockUntil[signal.direction] > guardNow) {
-      const reason = `Perdita recente in ${signal.direction}: direzione bloccata fino alle ${hhmmUtc(lossLockUntil[signal.direction])} UTC.`;
+    if (locksFor(activeSymbol)[signal.direction] > guardNow) {
+      const reason = `Perdita recente in ${signal.direction} su ${activeSymbol}: direzione bloccata fino alle ${hhmmUtc(locksFor(activeSymbol)[signal.direction])} UTC.`;
       latestDecision = noTradeDecision(reason, quote, { setup: signal.setup, evaluations: signal.evaluations });
       notifyBlock(reason);
       logTick(signal, quote, reason);
@@ -1508,6 +1531,7 @@ async function main() {
         tpBroker: signal.tpBroker ?? null,
         exitMode: orderExitMode,
         fastTpUsd: orderExitMode === "fast" ? orderFastTpUsd : null,
+        symbol: activeSymbol,
         context: entryContext === null ? null : {
           biasM5: entryContext.biasM5,
           m15State: entryContext.m15State,
@@ -2025,6 +2049,87 @@ async function main() {
     await markWorker("streaming", workerDetail());
   };
 
+  /**
+   * Cambio strumento a caldo. Non e' solo un nome: tutto lo stato che dipende dallo strumento va
+   * buttato, altrimenti NAS100 partirebbe con le candele, la baseline di liquidita' e la media
+   * spread dell'oro. Bloccato finche' resta aperta una posizione (su qualunque simbolo) o finche'
+   * un ciclo d'ordine e' in volo: l'utente deve prima chiudere.
+   */
+  const applySymbolSwitch = async () => {
+    if (symbolSwitchBusy || desiredSymbol === activeSymbol) return;
+    const next = desiredSymbol;
+    if (next === symbolSwitchFailedTarget && Date.now() < symbolSwitchRetryAtMs) return;
+    const openPositions = (tradingConnection.terminalState.positions ?? []).filter((position) => position.symbol === symbol());
+    const decision = symbolSwitchDecision({
+      current: activeSymbol,
+      requested: next,
+      openPositionSymbol: openPositions.length > 0 ? activeSymbol : null,
+      busy: decisionBusy || flattenBusy || staleReconnectBusy,
+    });
+    if (!decision.allowed) {
+      symbolSwitchBlockedReason = decision.reason;
+      return;
+    }
+    symbolSwitchBusy = true;
+    const previous = activeSymbol;
+    try {
+      if (subscribed) {
+        await connection.unsubscribeFromMarketData(symbol(), marketDataUnsubscriptions).catch(() => undefined);
+        subscribed = false;
+      }
+      activeSymbol = next;
+      setActiveBrokerSymbol(brokerSymbol(next));
+      // Stato dipendente dallo strumento: azzerato tutto insieme, niente eredita' dell'oro.
+      m1 = [];
+      m5 = [];
+      latestQuote = null;
+      lastQuoteReceivedAtMs = 0;
+      latestDecision = null;
+      latestPreview = null;
+      quickTickSpreadState.forming = null;
+      quickTickSpreadState.closed = [];
+      liquidityState = createLiquidityState(Date.now());
+      dupDirectionUntil.BUY = 0;
+      dupDirectionUntil.SELL = 0;
+      dupSetupUntilBucket.clear();
+      missingPositions.clear();
+      lastTickLogKey = "";
+      signalLockUntil = 0;
+      await setSetting("stream_last_quote", "");
+      // I lotti e il TP fisso sono per strumento: si rileggono subito, senza aspettare il poll.
+      await refreshControl().catch(() => undefined);
+      await refreshLossGuards().catch(() => undefined);
+      await subscribe();
+      symbolSwitchBlockedReason = null;
+      symbolSwitchFailedTarget = null;
+      symbolSwitchRetryAtMs = 0;
+      console.log("[scalper-worker] symbol_switch", JSON.stringify({
+        at: new Date().toISOString(), from: previous, to: next, brokerSymbol: symbol(), lots: activeLots,
+      }));
+      void sendTelegram(
+        `\u{1f504} SCALPER · strumento cambiato: ${previous} → ${next} (${symbol()})`
+        + `\nlotti ${activeLots} · storico e baseline di liquidita' ripartono da zero.`
+        + `\n${balanceLine()}`,
+      );
+    } catch (error) {
+      // Senza sottoscrizione valida si torna allo strumento precedente: meglio fermi sul noto.
+      activeSymbol = previous;
+      setActiveBrokerSymbol(brokerSymbol(previous));
+      const firstFailure = symbolSwitchFailedTarget !== next;
+      symbolSwitchFailedTarget = next;
+      symbolSwitchRetryAtMs = Date.now() + SYMBOL_SWITCH_RETRY_MS;
+      symbolSwitchBlockedReason = `Cambio a ${next} fallito: ${error instanceof Error ? error.message : String(error)}`;
+      if (firstFailure) {
+        // Una riga sola per bersaglio fallito: il ritentativo e' silenzioso finche' l'errore non cambia.
+        await setSetting("stream_last_error", `${new Date().toISOString()} ${symbolSwitchBlockedReason}`).catch(() => undefined);
+        console.error("[scalper-worker] symbol_switch_failed", symbolSwitchBlockedReason);
+      }
+      await subscribe().catch((retry) => console.error(retry));
+    } finally {
+      symbolSwitchBusy = false;
+    }
+  };
+
   const reconnectStaleQuotes = async (quoteAgeSec: number | null) => {
     if (staleReconnectBusy || staleExitBusy || stopped) return;
     staleReconnectBusy = true;
@@ -2140,6 +2245,7 @@ nessuna quote valida da ${decision.quoteAgeSec ?? "?"} s`,
         } else {
           stopped = nextStopped;
         }
+        if (!stopped) await applySymbolSwitch();
       } catch (error) {
         console.error(error);
       } finally {

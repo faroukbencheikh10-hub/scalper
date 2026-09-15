@@ -227,6 +227,55 @@ Dopo una chiusura in perdita il worker blocca la **stessa direzione** per `LOSS_
 
 L'orario di sblocco compare ovunque: in `stream_last_decision.reasoning`, in `stream_worker_detail` (`lossLockedDirections`, `lossLockUntil`, `lossPauseUntil`), sulla dashboard (card Esecuzione, righe *Re-entry bloccato* e *Pausa perdite*) e su Telegram, sia nel messaggio di chiusura in perdita sia nella notifica di ingresso bloccato.
 
+### Strumento tradato: XAUUSD o NAS100
+
+Un solo strumento alla volta, sullo stesso conto MT5. Lo strumento attivo sta in
+`scalper_settings.active_symbol` (default `XAUUSD`) e si cambia dal **selettore in dashboard**.
+
+- **Il cambio e' bloccato se c'e' una posizione aperta**, su *qualunque* strumento: il limite di una
+  posizione e' di conto, non per simbolo. La dashboard dice su quale strumento e' aperta; la stessa
+  regola (`symbolSwitchDecision`) la applicano sia l'API di controllo sia il worker, che rifiuta il
+  cambio anche mentre un ordine e' in volo (in quel caso lo rimanda, non lo nega).
+- **Il cambio e' a caldo**: il worker si disiscrive dal vecchio simbolo, sottoscrive il nuovo e
+  **azzera tutto lo stato che dipende dallo strumento** — candele M1/M5, baseline di liquidita'
+  (media spread e tick-rate ripartono dal warmup), media spread rolling di `quick_tick`, cooldown
+  anti-duplicazione, ultima decisione. Se la nuova sottoscrizione fallisce torna allo strumento
+  precedente invece di restare senza dati.
+- **La logica dei setup non cambia mai.** `mtf`, `m1_short`, `m1_range` e `quick_tick` restano
+  identici: cambiano solo i numeri in unita' di prezzo che ricevono.
+
+**Parametri per strumento.** Tutto cio' che e' espresso in $ (oro) o punti (indice) e' prefissabile:
+`XAUUSD_SL_MIN_USD`, `NAS100_SL_MIN_USD`, `NAS100_QUICK_TICK_TP_MAX_USD`… Ordine di risoluzione:
+env con prefisso → env storica senza prefisso (**solo** per XAUUSD, cosi' il deploy dell'oro non
+cambia di un centesimo) → default per strumento. I moltiplicatori ATR e i conteggi di candele
+restano **condivisi**: sono adimensionali e si adattano gia' da soli alla volatilita'. I default
+NAS100 non sono copiati dall'oro, sono scalati ~5× sulla volatilita' tipica (ATR M1 ~5-15 punti
+contro ~1-3$, escursione giornaliera ~1,3% contro ~1,5%) e vanno ritarati sui primi giorni reali.
+
+**Lotti e TP fisso sono per strumento**: `exec_lots_xauusd`/`exec_lots_nas100` e
+`fast_tp_usd_xauusd`/`fast_tp_usd_nas100`, con le chiavi storiche come ripiego per XAUUSD. La
+dashboard mostra sempre e solo quelli dello strumento attivo.
+
+**Margine e rischio** usano contract size e leva dello strumento (`XAUUSD_CONTRACT_SIZE` 100 a leva
+500, `NAS100_CONTRACT_SIZE` 1 a leva 200): sono dati del broker da verificare su MT5. Con la
+contract size dell'oro applicata a NAS100 il margine richiesto risulterebbe ~40 volte quello vero e
+il preflight bloccherebbe ogni ordine.
+
+**Cosa resta di conto e cosa diventa per strumento:**
+
+| Blocco | Ambito |
+| --- | --- |
+| Una sola posizione aperta | **Conto** (non per simbolo) |
+| `MAX_TRADES_PER_DAY`, `MAX_DAILY_LOSS` | **Conto** |
+| Pausa re-entry `SCALPER_MIN_REENTRY_SEC` | **Conto** |
+| `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES` | **Per strumento** |
+| `SCALPER_LOSS_COOLDOWN_MIN`, `SCALPER_THREE_LOSS_COOLDOWN_MIN` (prenotazione) | **Per strumento** |
+| Cooldown da margine insufficiente | **Per strumento + setup + direzione** |
+
+I segnali portano il proprio strumento in `scalper_signals.symbol`, e `trades.symbol` smette di
+essere la costante `XAUUSD`. Lo storico nato prima del selettore viene migrato sotto `XAUUSD`, cosi'
+i blocchi da perdita in corso al momento del deploy non si perdono.
+
 ### Cooldown da margine insufficiente (`MARGIN_FAIL_COOLDOWN_SEC`)
 
 Blocco **aggiuntivo e indipendente** dai precedenti: non tocca `LOSS_LOCK_MINUTES`, `CONSEC_LOSS_PAUSE_MINUTES`, la pausa re-entry né i criteri d'ingresso di alcun setup. Si arma **solo** sul fallimento specifico del margine, che nel codice ha due firme e due sole:

@@ -78,6 +78,8 @@ type ReserveSignalInput = {
   /** exit_mode/fast_tp_usd letti da scalper_settings all'apertura: fissati sulla riga per sempre. */
   exitMode?: ExitMode;
   fastTpUsd?: number | null;
+  /** Strumento del segnale: scritto sulla riga e usato per i blocchi da perdita per simbolo. */
+  symbol?: TradedSymbol;
 };
 
 type DealHistory = Awaited<ReturnType<typeof deals>>;
@@ -210,7 +212,7 @@ function shortClientId() {
   return `SC_XAU_${randomBytes(4).toString("hex")}`;
 }
 
-async function limits() {
+async function limits(symbol: TradedSymbol) {
   const start = sessionWindowStart();
   const [daily, last] = await Promise.all([
     dbQuery(
@@ -225,7 +227,12 @@ async function limits() {
               (SELECT COALESCE(SUM(mt5_profit),0) FROM scalper_signals WHERE closed_at >= $1::timestamptz) profit`,
       [start.toISOString(), tradeDedupSec()],
     ),
-    dbQuery(`SELECT outcome,close_reason,mt5_profit,closed_at FROM scalper_signals WHERE outcome IS NOT NULL ORDER BY closed_at DESC LIMIT 3`),
+    // I cooldown da perdita sono per strumento: una serie sull'oro non ferma NAS100 e viceversa.
+    dbQuery(
+      `SELECT outcome,close_reason,mt5_profit,closed_at FROM scalper_signals
+        WHERE outcome IS NOT NULL AND symbol=$1 ORDER BY closed_at DESC LIMIT 3`,
+      [symbol],
+    ),
   ]);
 
   const trades = Number(daily.rows[0]?.trades ?? 0);
@@ -288,11 +295,12 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      ),
      recent AS MATERIALIZED (
        -- Conta come perdita solo lo stop iniziale chiuso in perdita: le uscite gestite no.
+       -- Per strumento: le perdite dell'oro non devono bloccare NAS100, ne' il contrario.
        SELECT (outcome='LOSS' AND COALESCE(close_reason,'sl_initial')='sl_initial'
                AND COALESCE(mt5_profit,-1) < 0) AS is_loss,
               closed_at,row_number() OVER (ORDER BY closed_at DESC) AS rn
          FROM scalper_signals
-        WHERE outcome IS NOT NULL
+        WHERE outcome IS NOT NULL AND symbol=$20
         ORDER BY closed_at DESC
         LIMIT 3
      ),
@@ -340,8 +348,8 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
      ),
      inserted AS (
        INSERT INTO scalper_signals(direction,setup,entry,stop_loss,take_profit,risk_reward,reasoning,setup_key,
-                                   target1,context_json,final_sl,tp_broker,exit_mode,fast_tp_usd)
-       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4,$17,$18,$19 FROM decision WHERE reason IS NULL
+                                   target1,context_json,final_sl,tp_broker,exit_mode,fast_tp_usd,symbol)
+       SELECT $1,$2,$3,$4,$5,$6,$7,$15,$5,$16::jsonb,$4,$17,$18,$19,$20 FROM decision WHERE reason IS NULL
        ON CONFLICT DO NOTHING
        RETURNING id::text AS id
      )
@@ -368,6 +376,7 @@ export async function reserveStreamingSignal(input: ReserveSignalInput) {
       input.tpBroker ?? null,
       input.exitMode ?? "normal",
       input.fastTpUsd ?? null,
+      input.symbol ?? DEFAULT_TRADED_SYMBOL,
     ],
   );
 
@@ -547,7 +556,7 @@ export async function executeStreaming(
 
   if (!options.preflightDone) {
     const [lim, control] = await Promise.all([
-      limits(),
+      limits(options.symbol ?? DEFAULT_TRADED_SYMBOL),
       dbQuery(
         `SELECT COALESCE((SELECT value='true' FROM scalper_settings WHERE key='system_stop'), false) AS stopped`,
       ),
