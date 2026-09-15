@@ -3,6 +3,7 @@ import { atr, emaCloseSeries } from "./indicators";
 import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure";
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
 import { safetyTakeProfit } from "./positionManager";
+import type { ExitMode } from "../exitMode";
 
 /**
  * TP di sicurezza dei setup a uscita gestita: non e' l'obiettivo del trade (quello resta target1,
@@ -114,6 +115,14 @@ type EvaluateInput = {
    */
   disableShort?: boolean;
   disableRange?: boolean;
+  /**
+   * Mid dell'ultimo tick precedente, per quick_tick: stato tick-per-tick del worker (non una
+   * candela, non derivato da m1/m5). null quando non ancora disponibile (avvio, o subito dopo un
+   * gap ripristinato da seedCandles).
+   */
+  previousTick?: Quote | null;
+  /** exit_mode corrente da scalper_settings: quick_tick si valuta SOLO quando vale "fast". */
+  exitMode?: ExitMode;
 };
 
 /** Pure evaluation: a preview or failed preflight never consumes a setup. */
@@ -707,9 +716,85 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketCon
   };
 }
 
+export const QUICK_TICK_STRATEGY_VERSION = "quick-tick-v1";
+
+function quickTickBufferUsd() {
+  return env("QUICK_TICK_BUFFER_USD", 0.05, 0, 5);
+}
+
+function quickTickMaxSpread() {
+  return env("QUICK_TICK_MAX_SPREAD", 0.2, 0.01, 10);
+}
+
+/** Rete di emergenza mandata al broker: mai l'obiettivo del trade, quello resta il TP fisso di exit_mode=fast. */
+function quickTickEmergencySlUsd() {
+  return env("QUICK_TICK_EMERGENCY_SL_USD", 5, 0.5, 50);
+}
+
+function rejectQuickTick(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
+  const evaluation: SetupEvaluation = direction
+    ? { setup: "quick_tick", status: "rejected", direction, reason }
+    : { setup: "quick_tick", status: "rejected", reason };
+  return { direction: "NO_TRADE", setup: null, setupKey: null, entry: null, stopLoss: null,
+    takeProfit: null, riskReward: null, slPlan: null, reasoning: reason, evaluations: [evaluation] };
+}
+
 /**
- * Priorità: mtf-continuation-v1, poi m1_short e infine m1_range; il primo che produce un ordine vince.
- * Le valutazioni dei contesti attraversati viaggiano insieme in stream_last_decision.
+ * Quarto setup, valutato SOLO in exit_mode=fast (scalper_settings) e solo quando mtf/m1_short/
+ * m1_range non producono un ordine. Nessuna struttura M1/M5, nessun contesto M5/M15: solo la
+ * direzione del mid rispetto all'ultimo tick precedente, filtrata dallo spread. Il TP qui sotto e'
+ * un piano 1:1 sull'emergenza, sempre sovrascritto dal blocco exit_mode=fast del worker col target
+ * fisso di fast_tp_usd; lo SL e' solo la rete di emergenza mandata al broker (worker/streaming.ts),
+ * mai l'obiettivo reale del trade.
+ */
+function evaluateQuickTick(input: EvaluateInput): ScalperSignal {
+  const { quote, previousTick } = input;
+  if (!previousTick || previousTick.quotedAt === null || !Number.isFinite(previousTick.mid)) {
+    return rejectQuickTick("quick_tick: nessun tick precedente disponibile.");
+  }
+  const spread = quote.ask - quote.bid;
+  const maxSpread = quickTickMaxSpread();
+  if (spread > maxSpread) {
+    return rejectQuickTick("quick_tick: spread troppo alto " + spread.toFixed(2) + "$ (max " + maxSpread.toFixed(2) + "$).");
+  }
+  const buffer = quickTickBufferUsd();
+  const delta = quote.mid - previousTick.mid;
+  const direction: "BUY" | "SELL" | null = delta > buffer ? "BUY" : delta < -buffer ? "SELL" : null;
+  const deltaDetail = "mid " + quote.mid.toFixed(2) + " vs precedente " + previousTick.mid.toFixed(2)
+    + " (" + (delta >= 0 ? "+" : "") + delta.toFixed(2) + "$, soglia " + buffer.toFixed(2) + "$), spread " + spread.toFixed(2) + "$";
+  if (!direction) {
+    return rejectQuickTick("quick_tick: variazione tick sotto soglia, " + deltaDetail + ".");
+  }
+
+  const entry = direction === "BUY" ? quote.ask : quote.bid;
+  const emergency = quickTickEmergencySlUsd();
+  // Stesso arrotondamento conservativo di mtf/m1_short/m1_range: SL sempre arrotondato lontano
+  // dall'entry (mai piu' stretto), TP sempre arrotondato verso l'entry (mai piu' generoso). Qui il
+  // TP e' comunque solo un piano 1:1 placeholder: il blocco exit_mode=fast lo sovrascrive sempre.
+  const sl = direction === "BUY" ? Math.floor((entry - emergency) * 100) / 100 : Math.ceil((entry + emergency) * 100) / 100;
+  const tp = direction === "BUY" ? Math.floor((entry + emergency) * 100) / 100 : Math.ceil((entry - emergency) * 100) / 100;
+  const risk = Math.abs(entry - sl), reward = Math.abs(tp - entry);
+  if (!(risk > 0 && reward > 0)) return rejectQuickTick("quick_tick: SL di emergenza non calcolabile al prezzo corrente.", direction);
+
+  const reason = "quick_tick " + direction + ": " + deltaDetail + ".";
+  return {
+    direction, setup: "quick_tick",
+    // Chiave unica per tick, nessuna candela da riarmare: l'anti-duplicazione reale e' il cooldown
+    // generico DUP_COOLDOWN_S/DUP_SETUP_BARS del worker, non questa chiave.
+    setupKey: [QUICK_TICK_STRATEGY_VERSION, direction, String(previousTick.quotedAt)].join(":"),
+    entry, stopLoss: sl, takeProfit: tp,
+    riskReward: Number((reward / risk).toFixed(2)),
+    slPlan: null,
+    evaluations: [{ setup: "quick_tick", status: "triggered", direction, reason }],
+    reasoning: QUICK_TICK_STRATEGY_VERSION + ": " + reason + " SL emergenza " + emergency.toFixed(2)
+      + "$ (uscita reale: TP fisso exit_mode=fast, nessun breakeven/trailing).",
+  };
+}
+
+/**
+ * Priorità: mtf-continuation-v1, poi m1_short, poi m1_range e infine quick_tick; il primo che
+ * produce un ordine vince. quick_tick si valuta solo con exit_mode="fast" (scalper_settings), dopo
+ * tutti gli altri. Le valutazioni dei setup attraversati viaggiano insieme in stream_last_decision.
  */
 export function evaluateScalper(input: EvaluateInput): ScalperSignal {
   const nowMs = input.nowMs ?? Date.now();
@@ -733,6 +818,11 @@ export function evaluateScalper(input: EvaluateInput): ScalperSignal {
     const ranged = evaluateM1Range(input, nowMs, context);
     evaluations = [...evaluations, ...ranged.evaluations];
     if (ranged.direction !== "NO_TRADE") return { ...ranged, evaluations };
+  }
+  if (input.exitMode === "fast") {
+    const quickTick = evaluateQuickTick(input);
+    evaluations = [...evaluations, ...quickTick.evaluations];
+    if (quickTick.direction !== "NO_TRADE") return { ...quickTick, evaluations };
   }
   return { ...mtf, evaluations };
 }

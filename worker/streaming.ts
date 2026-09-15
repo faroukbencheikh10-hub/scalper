@@ -319,6 +319,9 @@ async function main() {
   let m1: Candle[] = [];
   let m5: Candle[] = [];
   let latestQuote: Quote | null = null;
+  // Tick precedente per quick_tick (exit_mode=fast): aggiornato ad ogni tick accettato, azzerato
+  // dopo un gap ripristinato da seedCandles (vedi sotto) perche' un salto di prezzo non e' momentum.
+  let previousTick: Quote | null = null;
   let lastQuoteReceivedAtMs = 0;
   let quoteWatchStartedAtMs = workerStartedAtMs;
   let latestDecision: Record<string, unknown> | null = null;
@@ -1203,9 +1206,11 @@ async function main() {
         return;
       } finally { ready = !stopped; }
       // Reevaluate only on the next fresh quote, after history has been restored.
+      previousTick = null;
       latestQuote = quote;
       return;
     }
+    previousTick = latestQuote;
     latestQuote = quote;
 
     upsertTick(m1, 1, quote.bid, quote.quotedAt ?? Date.now(), m1Max);
@@ -1281,7 +1286,10 @@ async function main() {
     if (entryBlockedByOpenPositions(openPositions.length, maxOpenPositions)) {
       // In posizione nessun setup viene valutato per l'ingresso: la valutazione resta diagnostica e
       // serve solo a registrare i segnali contrari, che non chiudono e non invertono mai.
-      const watching = withLiquidityEvaluation(evaluateScalper({ quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
+      const watching = withLiquidityEvaluation(evaluateScalper({
+        quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
+        previousTick, exitMode: activeExitMode,
+      }));
       const reason = `Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`;
       latestDecision = noTradeDecision(reason, quote, { setup: watching.setup, evaluations: watching.evaluations });
       const openDirections = openPositions.map(positionDirection).filter((value): value is "BUY" | "SELL" => value !== null);
@@ -1292,7 +1300,10 @@ async function main() {
       return;
     }
 
-    const signal = withLiquidityEvaluation(evaluateScalper({ quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
+    const signal = withLiquidityEvaluation(evaluateScalper({
+      quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
+      previousTick, exitMode: activeExitMode,
+    }));
     latestDecision = {
       at: new Date().toISOString(),
       mode: "event_driven_intrabar_fast_preflight",
@@ -1467,7 +1478,10 @@ async function main() {
         return;
       }
 
-      const finalSignal = withLiquidityEvaluation(evaluateScalper({ quote: finalQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
+      const finalSignal = withLiquidityEvaluation(evaluateScalper({
+        quote: finalQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
+        previousTick, exitMode: orderExitMode,
+      }));
       if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup || finalSignal.setupKey !== signal.setupKey) {
         const reason = finalSignal.direction === "NO_TRADE"
           ? `Final preflight: ${signal.direction}/${signal.setup ?? "—"} invalidato — ${finalSignal.reasoning}`
@@ -1628,7 +1642,10 @@ async function main() {
 
       const sendQuote = latestQuote ?? finalQuote;
       const sendAgeMs = quoteAgeMs(sendQuote);
-      const sendCheck = withLiquidityEvaluation(evaluateScalper({ quote: sendQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange }));
+      const sendCheck = withLiquidityEvaluation(evaluateScalper({
+        quote: sendQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
+        previousTick, exitMode: orderExitMode,
+      }));
       const entryDrift = sendCheck.direction === "NO_TRADE" || sendCheck.entry === null
         ? Number.POSITIVE_INFINITY
         : Math.abs(sendCheck.entry - finalSignal.entry!);

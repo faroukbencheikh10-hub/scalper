@@ -672,6 +672,18 @@ check("m1_range: la mtf ha la precedenza e RANGE_ENABLED=false lo spegne", () =>
     assert.ok(!s.evaluations.some(e => e.setup === "range_gate"));
   });
 });
+check("quick_tick: la mtf ha la precedenza anche con exit_mode=fast e un tick che farebbe scattare quick_tick da solo", () => {
+  const input = fixture();
+  const s = evaluateScalper({
+    ...input,
+    exitMode: "fast",
+    // Mid abbastanza distante dal precedente da superare da solo QUICK_TICK_BUFFER_USD: se la
+    // priorita' non fosse rispettata questo tick basterebbe a far vincere quick_tick.
+    previousTick: { ...input.quote, mid: input.quote.mid - 1, quotedAt: (input.quote.quotedAt ?? nowMs) - 500 },
+  });
+  assert.equal(s.setup, "micro_pullback", JSON.stringify(s));
+  assert.ok(!s.evaluations.some(e => e.setup === "quick_tick"), "quick_tick non deve essere valutato: la mtf ha gia' prodotto un ordine");
+});
 // --- Contesto M5/M15 obbligatorio per m1_short e m1_range ------------------------------------
 function contextReason(s: ReturnType<typeof evaluateScalper>) {
   return s.evaluations.find(e => e.setup === "context_gate")!.reason;
