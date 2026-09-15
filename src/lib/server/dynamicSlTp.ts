@@ -1,5 +1,7 @@
 import type { Candle } from "../types";
 import { improvesStop, lastSwing } from "./positionManager";
+import { DEFAULT_TRADED_SYMBOL, type TradedSymbol } from "../symbols";
+import { symbolPriceParam, type PriceParamName } from "./symbolConfig";
 
 export type TradeDirection = "BUY" | "SELL";
 
@@ -28,16 +30,28 @@ function envUsd(name: string, fallback: number, min: number, max: number) {
   return Number.isFinite(value) && value >= min && value <= max ? value : fallback;
 }
 
+/**
+ * Tutte le distanze qui sotto sono in unita' di prezzo, quindi dipendono dallo strumento: il
+ * simbolo arriva da chi chiama (il worker passa quello attivo) e senza di esso si resta su XAUUSD,
+ * cioe' esattamente sui valori storici.
+ */
+type WithSymbol = TradedSymbol | undefined;
+function priceParam(symbol: WithSymbol, name: PriceParamName, min: number, max: number) {
+  return symbolPriceParam(symbol ?? DEFAULT_TRADED_SYMBOL, name, min, max);
+}
+
 /** Cap rigido sulla distanza SL dal prezzo di apertura. Nome esatto richiesto: senza suffisso _USD. */
-export function slMaxUsd() { return envUsd("SL_MAX", 15, 0.1, 500); }
+export function slMaxUsd(symbol?: TradedSymbol) { return priceParam(symbol, "SL_MAX", 0.1, 500); }
 /** Cap rigido sul TP iniziale. Nome esatto richiesto: senza suffisso _USD. */
-export function tpMaxUsd() { return envUsd("TP_MAX", 10, 0.1, 500); }
+export function tpMaxUsd(symbol?: TradedSymbol) { return priceParam(symbol, "TP_MAX", 0.1, 500); }
 export function sltpUpdateMinIntervalMs() { return envUsd("SLTP_UPDATE_MIN_INTERVAL_SEC", 5, 0, 3600) * 1000; }
-export function tpExtendTriggerUsd() { return envUsd("TP_EXTEND_TRIGGER_USD", 1, 0, 500); }
-export function tpTrailPullbackUsd() { return envUsd("TP_TRAIL_PULLBACK_USD", 2, 0.01, 500); }
-export function tpTrailMinStepUsd() { return envUsd("TP_TRAIL_MIN_STEP_USD", 0.3, 0, 500); }
+export function tpExtendTriggerUsd(symbol?: TradedSymbol) { return priceParam(symbol, "TP_EXTEND_TRIGGER_USD", 0, 500); }
+export function tpTrailPullbackUsd(symbol?: TradedSymbol) { return priceParam(symbol, "TP_TRAIL_PULLBACK_USD", 0.01, 500); }
+export function tpTrailMinStepUsd(symbol?: TradedSymbol) { return priceParam(symbol, "TP_TRAIL_MIN_STEP_USD", 0, 500); }
 /** Deve restare sempre >= TP_MAX: se l'env la mette sotto, si alza al minimo valido. */
-export function tpMaxTotalUsd() { return Math.max(envUsd("TP_MAX_TOTAL_USD", 12, 0.1, 1000), tpMaxUsd()); }
+export function tpMaxTotalUsd(symbol?: TradedSymbol) {
+  return Math.max(priceParam(symbol, "TP_MAX_TOTAL_USD", 0.1, 1000), tpMaxUsd(symbol));
+}
 
 // Coefficienti interni (non env): la struttura M1 e l'ATR M1 bastano come input, questi sono solo
 // il margine oltre il livello grezzo. Non fanno parte della lista di env nuove della specifica.
@@ -145,6 +159,8 @@ export function initialLevels(input: {
   spreadUsd: number;
   brokerMinDistanceUsd?: number;
   tickSizeUsd?: number;
+  /** Strumento dei cap SL_MAX/TP_MAX: senza, restano quelli di XAUUSD. */
+  symbol?: TradedSymbol;
 }): InitialLevels {
   const empty = (rejectReason: InitialLevelsRejectReason): InitialLevels => ({
     valid: false, rejectReason, stopLoss: null, takeProfit: null,
@@ -160,12 +176,12 @@ export function initialLevels(input: {
   const structuralLevel = structuralStopLevel({ direction: input.direction, referencePrice: input.entry, m1: input.m1, atrM1: input.atrM1, spreadUsd: input.spreadUsd });
   const rawSlDistance = input.direction === "BUY" ? input.entry - structuralLevel : structuralLevel - input.entry;
   const requiredSlDistance = Math.max(rawSlDistance, brokerMinRaw, MIN_DISTANCE_USD);
-  const slCap = slMaxUsd();
+  const slCap = slMaxUsd(input.symbol);
   const slClamped = requiredSlDistance > slCap;
   const slDistanceTarget = Math.min(requiredSlDistance, slCap);
 
   const rawTpDistance = Math.max(input.atrM1 * TP_ATR_MULT, input.spreadUsd * TP_SPREAD_MULT, brokerMinRaw, MIN_DISTANCE_USD);
-  const tpCap = tpMaxUsd();
+  const tpCap = tpMaxUsd(input.symbol);
   const tpClamped = rawTpDistance > tpCap;
   const tpDistanceTarget = Math.min(rawTpDistance, tpCap);
 
@@ -255,19 +271,21 @@ export function updateTrailingTp(state: TrailingTpState, input: {
   currentPrice: number;
   initialTp: number;
   entry: number;
+  /** Strumento delle soglie di estensione/pullback del TP trailing. */
+  symbol?: TradedSymbol;
 }): TrailingTpState {
   if (!validPositive(input.currentPrice)) return state;
   const favorable = input.direction === "BUY" ? Math.max(state.peak, input.currentPrice) : Math.min(state.peak, input.currentPrice);
   const advancedPastInitial = input.direction === "BUY" ? favorable - input.initialTp : input.initialTp - favorable;
-  const trigger = tpExtendTriggerUsd();
+  const trigger = tpExtendTriggerUsd(input.symbol);
 
   if (advancedPastInitial < trigger) {
     return { peak: favorable, triggered: false, currentTp: input.initialTp };
   }
 
-  const pullback = tpTrailPullbackUsd();
+  const pullback = tpTrailPullbackUsd(input.symbol);
   const rawTrail = input.direction === "BUY" ? favorable - pullback : favorable + pullback;
-  const maxTotal = tpMaxTotalUsd();
+  const maxTotal = tpMaxTotalUsd(input.symbol);
   const cappedTrail = input.direction === "BUY"
     ? Math.min(rawTrail, input.entry + maxTotal)
     : Math.max(rawTrail, input.entry - maxTotal);
@@ -292,6 +310,8 @@ export function decideTpBrokerUpdate(input: {
   nowMs?: number;
   lastUpdateAtMs?: number | null;
   minUpdateIntervalMs?: number;
+  /** Strumento del passo minimo di aggiornamento del TP. */
+  symbol?: TradedSymbol;
 }): TpUpdateDecision {
   const tickSizeUsd = input.tickSizeUsd ?? 0.01;
   const intervalMs = input.minUpdateIntervalMs ?? sltpUpdateMinIntervalMs();
@@ -306,7 +326,7 @@ export function decideTpBrokerUpdate(input: {
   const normalized = normalizeLevelToTick({ direction: input.direction, kind: "takeProfit", value: input.candidateTp, tickSizeUsd });
   if (normalized === null) return { kind: "hold", reason: "invalid_market_data" };
   const improvement = input.direction === "BUY" ? normalized - input.currentBrokerTp : input.currentBrokerTp - normalized;
-  const minStep = input.minStepUsd ?? tpTrailMinStepUsd();
+  const minStep = input.minStepUsd ?? tpTrailMinStepUsd(input.symbol);
   if (improvement + 1e-9 < minStep) return { kind: "hold", reason: "not_improved" };
   return { kind: "update", takeProfit: normalized };
 }

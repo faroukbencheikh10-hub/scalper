@@ -14,7 +14,19 @@ function accountId() {
   if (!v) throw new Error("METAAPI_ACCOUNT_ID non impostato");
   return v;
 }
-export function symbol() { return process.env.METAAPI_SYMBOL_XAUUSD?.trim() || "XAUUSD"; }
+/**
+ * Simbolo del broker in uso. Il processo tratta uno strumento alla volta: il worker lo fissa
+ * all'avvio e ad ogni cambio di active_symbol con setActiveBrokerSymbol, cosi' quote, candele e
+ * storico deals seguono lo strumento attivo senza propagare il nome in ogni chiamata. Senza
+ * impostazione esplicita resta il simbolo storico di XAUUSD.
+ */
+let activeBrokerSymbol: string | null = null;
+export function setActiveBrokerSymbol(value: string) {
+  activeBrokerSymbol = value.trim() || null;
+}
+export function symbol() {
+  return activeBrokerSymbol ?? (process.env.METAAPI_SYMBOL_XAUUSD?.trim() || "XAUUSD");
+}
 function regions() {
   const r = process.env.METAAPI_REGION?.trim().toLowerCase();
   return r ? [r] : ["backup-new-york", "new-york", "london"];

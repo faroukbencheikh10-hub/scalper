@@ -6,6 +6,7 @@ import { ExitModeControl } from "@/components/exit-mode-control";
 import { ScheduledCloseControl } from "@/components/scheduled-close-control";
 import { setupLabel } from "@/lib/setups";
 import { usdDistanceToEurApprox } from "@/lib/lots";
+import { CONTRACT_SPEC_DEFAULTS } from "@/lib/symbols";
 import { currentOperationalState, type OperationalState } from "@/lib/operationalState";
 import { DEFAULT_FAST_TP_USD, type ExitMode } from "@/lib/exitMode";
 import type { ScheduledCloseStatus } from "@/lib/scheduledClose";
@@ -45,6 +46,11 @@ type DashboardState = {
   quote?: Quote | null;
   autoExec?: boolean | null;
   lots?: number;
+  activeSymbol?: string;
+  activeSymbolLabel?: string;
+  symbolChoices?: string[];
+  symbolSwitchBlockedBy?: string | null;
+  contract?: { contractSize: number; leverage: number } | null;
   lotsMin?: number;
   lotsMax?: number;
   lotChoices?: number[];
@@ -179,8 +185,9 @@ export default function Home() {
   const m15GateLive = data?.stream?.detail?.m15GateMode === "live";
   const currentLots = Number(data?.lots ?? data?.stream?.detail?.lots ?? Number.NaN);
   /** € equivalente approssimativo ai lotti correnti di una distanza in $ dall'apertura. */
+  const contract = data?.contract ?? CONTRACT_SPEC_DEFAULTS.XAUUSD;
   const eurFor = (distanceUsd: number) => {
-    const eur = usdDistanceToEurApprox(distanceUsd, currentLots);
+    const eur = usdDistanceToEurApprox(distanceUsd, currentLots, contract.contractSize);
     return eur === null ? "" : ` (≈${money(Math.abs(eur))}€)`;
   };
   const sltpExitText = openSltp
@@ -263,6 +270,7 @@ export default function Home() {
           entry={last?.entry === null || last?.entry === undefined ? null : Number(last.entry)}
           stopLoss={last?.stop_loss === null || last?.stop_loss === undefined ? null : Number(last.stop_loss)}
           account={data.account ?? data.stream?.detail?.account ?? null}
+          contract={contract}
           onChanged={(stopped) => setData((current) => current ? { ...current, systemStopped: stopped } : current)}
           onLotsChanged={(lots) => setData((current) => current ? { ...current, lots } : current)}
         />

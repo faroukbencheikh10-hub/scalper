@@ -7,6 +7,8 @@ import { deals, symbol } from "./metaApi";
 import { definitelyRejected, recoverOrder, type RecoveryDeal } from "./orderSafety";
 import { closeReasonFromPrice, countsAsLoss, fastExitCloseReasonFromPrice, isManagedSetup, sltpCloseReasonFromPrice } from "./positionManager";
 import type { ExitMode } from "@/lib/exitMode";
+import { DEFAULT_TRADED_SYMBOL, type TradedSymbol } from "@/lib/symbols";
+import { contractSpec } from "./symbolConfig";
 
 type StreamPosition = {
   id: string;
@@ -54,6 +56,8 @@ type ExecuteOptions = {
   lots?: number;
   /** Prezzo corrente usato per stimare il margine richiesto. */
   price?: number;
+  /** Strumento attivo: decide contract size e leva del preflight sul margine. */
+  symbol?: TradedSymbol;
 };
 
 type ReserveSignalInput = {
@@ -559,7 +563,7 @@ export async function executeStreaming(
   const marginPrice = Number(options.price);
   const freeMargin = Number(connection.terminalState.accountInformation?.freeMargin);
   if (Number.isFinite(marginPrice) && marginPrice > 0 && Number.isFinite(freeMargin)) {
-    const needed = requiredMargin(orderLots, marginPrice);
+    const needed = requiredMargin(orderLots, marginPrice, contractSpec(options.symbol ?? DEFAULT_TRADED_SYMBOL));
     if (needed > freeMargin) {
       console.warn("[scalper-worker] insufficient_margin", { lots: orderLots, needed, freeMargin });
       return {

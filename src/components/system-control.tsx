@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { LOT_CHOICES, lossAtStop, requiredMargin, stopDistanceFrom } from "@/lib/lots";
+import { CONTRACT_SPEC_DEFAULTS, type ContractSpec } from "@/lib/symbols";
 
 type Account = { balance?: number | null; equity?: number | null; freeMargin?: number | null; currency?: string | null } | null;
 
@@ -13,6 +14,8 @@ type Props = {
   entry?: number | null;
   stopLoss?: number | null;
   account?: Account;
+  /** Contract size e leva dello strumento attivo: margine e rischio non sono quelli dell'oro su NAS100. */
+  contract?: ContractSpec | null;
   onChanged?: (stopped: boolean) => void;
   onLotsChanged?: (lots: number) => void;
 };
@@ -21,7 +24,7 @@ function amount(value: number | null | undefined, digits = 2) {
   return Number.isFinite(value) ? Number(value).toFixed(digits) : "—";
 }
 
-export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLoss, account, onChanged, onLotsChanged }: Props) {
+export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLoss, account, contract, onChanged, onLotsChanged }: Props) {
   const [isStopped, setIsStopped] = useState(stopped);
   const [busy, setBusy] = useState(false);
   const [lotsBusy, setLotsBusy] = useState(false);
@@ -94,9 +97,10 @@ export function SystemControl({ stopped, lots, lotChoices, price, entry, stopLos
   const choices = lotChoices && lotChoices.length > 0 ? lotChoices : LOT_CHOICES;
   const selected = Number.isFinite(activeLots) ? Number(activeLots) : null;
   const options = selected !== null && !choices.includes(selected) ? [...choices, selected].sort((a, b) => a - b) : choices;
-  const margin = selected !== null && Number.isFinite(price) ? requiredMargin(selected, Number(price)) : null;
+  const spec = contract ?? CONTRACT_SPEC_DEFAULTS.XAUUSD;
+  const margin = selected !== null && Number.isFinite(price) ? requiredMargin(selected, Number(price), spec) : null;
   const distance = stopDistanceFrom(entry, stopLoss);
-  const risk = selected !== null ? lossAtStop(selected, distance) : null;
+  const risk = selected !== null ? lossAtStop(selected, distance, spec.contractSize) : null;
   const currency = account?.currency ?? "USD";
   const freeMargin = Number.isFinite(account?.freeMargin) ? Number(account?.freeMargin) : null;
   const marginShort = margin !== null && freeMargin !== null && margin > freeMargin;

@@ -9,7 +9,10 @@ import type { Candle, Quote } from "../types";
  * per decidere e gli scenari offline per verificarle.
  */
 
-/** Distanza fissa dallo swing M5 usata dal trailing. */
+/**
+ * Distanza dallo swing M5 usata dal trailing, in unita' di prezzo: il default e' quello storico di
+ * XAUUSD, il worker passa quello dello strumento attivo (vedi symbolConfig.TRAILING_BUFFER_USD).
+ */
 export const TRAILING_BUFFER_USD = 0.2;
 
 export type ManagedCloseReason =
@@ -164,12 +167,12 @@ export function lastSwing(m5: Candle[], kind: "high" | "low"): Candle | null {
   return null;
 }
 
-export function trailingStop(direction: "BUY" | "SELL", m5: Candle[]) {
+export function trailingStop(direction: "BUY" | "SELL", m5: Candle[], bufferUsd = TRAILING_BUFFER_USD) {
   const swing = lastSwing(m5, direction === "BUY" ? "low" : "high");
   if (!swing) return null;
   const level = direction === "BUY"
-    ? Math.floor((swing.low - TRAILING_BUFFER_USD) * 100) / 100
-    : Math.ceil((swing.high + TRAILING_BUFFER_USD) * 100) / 100;
+    ? Math.floor((swing.low - bufferUsd) * 100) / 100
+    : Math.ceil((swing.high + bufferUsd) * 100) / 100;
   return { level, bar: swing };
 }
 
@@ -185,9 +188,9 @@ export function tickAction(state: ManagedExitState, quote: Quote, nowMs: number,
 }
 
 /** Trailing sulla struttura M5: solo dopo il breakeven e solo alla chiusura di una M5. */
-export function m5CloseAction(state: ManagedExitState, m5: Candle[]): ManagedAction | null {
+export function m5CloseAction(state: ManagedExitState, m5: Candle[], bufferUsd = TRAILING_BUFFER_USD): ManagedAction | null {
   if (!state.target1Hit || state.breakevenPrice === null) return null;
-  const trail = trailingStop(state.direction, m5);
+  const trail = trailingStop(state.direction, m5, bufferUsd);
   if (!trail || !improvesStop(state.direction, state.stopLoss, trail.level)) return null;
   return { kind: "trailing", from: state.stopLoss, to: trail.level, swingAt: trail.bar.datetime };
 }

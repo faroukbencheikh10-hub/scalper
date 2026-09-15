@@ -1,5 +1,5 @@
 import MetaApi, { SynchronizationListener } from "metaapi.cloud-sdk";
-import { dbQuery, ensureSchema, getSettings, setSetting } from "../src/lib/server/db";
+import { dbQuery, ensureSchema, getSetting, getSettings, setSetting } from "../src/lib/server/db";
 import { autoExecEnabled, clampLots, lots, lotsMax, lotsMin, resolveLots } from "../src/lib/server/tradingConfig";
 import { EXEC_LOTS_SETTING_KEY, lossAtStop } from "../src/lib/lots";
 import {
@@ -11,7 +11,7 @@ import {
   SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
 } from "../src/lib/scheduledClose";
 import { money, sendTelegram } from "../src/lib/server/notify";
-import { deals, fetchCandles, symbol } from "../src/lib/server/metaApi";
+import { deals, fetchCandles, setActiveBrokerSymbol, symbol } from "../src/lib/server/metaApi";
 import { getSessionStatus, sessionConfigFromEnv, sessionWindowStart } from "../src/lib/session";
 import {
   contextM5M15, evaluateScalper, m15GateMode, plannedEntryValid, QUICK_TICK_SPREAD_WINDOW_M1, STRATEGY_VERSION,
@@ -34,6 +34,13 @@ import {
   armMarginCooldown, isInsufficientMarginFailure, marginCooldownActive, marginCooldownKey,
   marginCooldownReason, type MarginCooldownState,
 } from "../src/lib/server/marginCooldown";
+import {
+  ACTIVE_SYMBOL_SETTING_KEY, execLotsSettingKey, fastTpSettingKey, pickSymbolSetting,
+  resolveTradedSymbol, tradedSymbolLabel, type TradedSymbol,
+} from "../src/lib/symbols";
+import {
+  brokerSymbol, contractSpec, fastTpBounds, symbolPriceParam,
+} from "../src/lib/server/symbolConfig";
 import {
   computeLiquiditySnapshot, createLiquidityState, describeLiquiditySnapshot, lotMultiplierFor,
   setupsAllowedFor, updateLiquidityState,
@@ -318,12 +325,16 @@ async function main() {
 
   let subscribed = false;
   let ready = false;
+  // Strumento attivo, letto una volta all'avvio: fissa il simbolo del broker e tutti i parametri in
+  // unita' di prezzo. Il cambio a caldo da dashboard arriva piu' sotto (switchActiveSymbol).
+  let activeSymbol: TradedSymbol = resolveTradedSymbol(await getSetting(ACTIVE_SYMBOL_SETTING_KEY));
+  setActiveBrokerSymbol(brokerSymbol(activeSymbol));
   let activeLots = lots();
   // exit_mode/fast_tp_usd: letti dalla dashboard come i lotti, ma fissati sulla singola posizione
   // al momento dell'apertura (vedi orderExitMode/orderFastTpUsd piu' sotto) — un cambio qui non
   // tocca mai le posizioni gia' aperte.
   let activeExitMode: ExitMode = "normal";
-  let activeFastTpUsd = resolveFastTpUsd(undefined);
+  let activeFastTpUsd = resolveFastTpUsd(undefined, fastTpBounds(activeSymbol));
   // Chiusura programmata: blocco indipendente, riletto dal database come i lotti. Decide SOLO se
   // aprire nuovi ordini; le posizioni gia' aperte non passano mai di qui.
   let scheduledCloseConfig = resolveScheduledCloseConfig(() => undefined);
@@ -334,11 +345,15 @@ async function main() {
   const refreshControl = async () => {
     const settings = await getSettings([
       "system_stop", EXEC_LOTS_SETTING_KEY, EXIT_MODE_SETTING_KEY, FAST_TP_USD_SETTING_KEY,
+      ACTIVE_SYMBOL_SETTING_KEY, execLotsSettingKey(activeSymbol), fastTpSettingKey(activeSymbol),
       SCHEDULED_CLOSE_ENABLED_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
     ]);
-    activeLots = resolveLots(settings.get(EXEC_LOTS_SETTING_KEY));
+    activeLots = resolveLots(pickSymbolSetting(
+      activeSymbol, settings.get(execLotsSettingKey(activeSymbol)), settings.get(EXEC_LOTS_SETTING_KEY)));
     activeExitMode = resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY));
-    activeFastTpUsd = resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY));
+    activeFastTpUsd = resolveFastTpUsd(
+      pickSymbolSetting(activeSymbol, settings.get(fastTpSettingKey(activeSymbol)), settings.get(FAST_TP_USD_SETTING_KEY)),
+      fastTpBounds(activeSymbol));
     scheduledCloseConfig = resolveScheduledCloseConfig((key) => settings.get(key));
     return settings.get("system_stop") === "true";
   };
@@ -399,7 +414,9 @@ async function main() {
   const positionGoneConfirmTicks = envInt("POSITION_GONE_CONFIRM_TICKS", 3, 1, 100);
   let managedBusy = false;
   let lastM5CloseSeen = 0;
-  const breakevenBuffer = envNum("ENTRY_BUFFER_USD", 0.1);
+  // Buffer in unita' di prezzo: seguono lo strumento attivo, non una costante dell'oro.
+  const breakevenBuffer = () => symbolPriceParam(activeSymbol, "ENTRY_BUFFER_USD", 0, 5);
+  const trailingBuffer = () => symbolPriceParam(activeSymbol, "TRAILING_BUFFER_USD", 0, 50);
 
   const closedAtMs = (value: unknown) => {
     const parsed = value instanceof Date ? value.getTime() : Date.parse(String(value ?? ""));
@@ -495,6 +512,9 @@ async function main() {
 
   const workerDetail = () => ({
     symbol: symbol(),
+    activeSymbol,
+    activeSymbolLabel: tradedSymbolLabel(activeSymbol),
+    contract: contractSpec(activeSymbol),
     mode: `M15 trend / M5 pullback-retest / M1 chiusa + max ${maxOpenPositions} posizioni`,
     strategyVersion: STRATEGY_VERSION,
     autoExec: autoExecEnabled(),
@@ -801,7 +821,7 @@ async function main() {
       if (state.mode === "trailing") {
         const trail = updateTrailingTp(
           { peak: state.peak, triggered: state.tpTriggered, currentTp: state.currentTp },
-          { direction: state.direction, currentPrice: priceRef, initialTp: state.initialTp, entry: state.entry },
+          { direction: state.direction, currentPrice: priceRef, initialTp: state.initialTp, entry: state.entry, symbol: activeSymbol },
         );
         state.peak = trail.peak;
         state.tpTriggered = trail.triggered;
@@ -819,7 +839,7 @@ async function main() {
       // abbastanza da giustificare un aggiornamento e il rate-limit lo consente.
       const tpDecision = tpCandidate === null ? null : decideTpBrokerUpdate({
         direction: state.direction, candidateTp: tpCandidate, currentBrokerTp: state.currentTp,
-        tickSizeUsd, nowMs, lastUpdateAtMs: rateLimitReferenceMs,
+        tickSizeUsd, nowMs, lastUpdateAtMs: rateLimitReferenceMs, symbol: activeSymbol,
       });
       if (slDecision.kind === "update" || tpDecision?.kind === "update") {
         const nextSl = slDecision.kind === "update" ? slDecision.stopLoss : state.stopLoss;
@@ -908,7 +928,7 @@ async function main() {
         }
 
         // 1. Primo tick che tocca target1 (BID sui long, ASK sugli short): stop a breakeven.
-        const breakeven = tickAction(current, quote, Date.now(), breakevenBuffer);
+        const breakeven = tickAction(current, quote, Date.now(), breakevenBuffer());
         if (breakeven && breakeven.kind === "breakeven") {
           // SEMPRE sl e tp espliciti nella stessa modifyPosition: un tp omesso viene letto dal
           // broker come "cancellalo", non "lascialo com'era" (vedi trade MT5 #220522199).
@@ -951,7 +971,7 @@ async function main() {
 
         // 2. Trailing sulla struttura M5: solo dopo il breakeven e solo a M5 chiusa.
         if (!freshM5Close) continue;
-        const trailing = m5CloseAction(current, closedM5);
+        const trailing = m5CloseAction(current, closedM5, trailingBuffer());
         if (!trailing || trailing.kind !== "trailing") continue;
         const trailingCommand = buildModifyPositionCommand(trailing, current.brokerTp, position);
         if (trailingCommand.blocked) {
@@ -1332,7 +1352,7 @@ async function main() {
       // serve solo a registrare i segnali contrari, che non chiudono e non invertono mai.
       const watching = withLiquidityEvaluation(evaluateScalper({
         quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
-        exitMode: activeExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed),
+        exitMode: activeExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed), symbol: activeSymbol,
       }));
       const reason = `Limite ${maxOpenPositions} posizioni XAUUSD aperte raggiunto.`;
       latestDecision = noTradeDecision(reason, quote, { setup: watching.setup, evaluations: watching.evaluations });
@@ -1346,7 +1366,7 @@ async function main() {
 
     const signal = withLiquidityEvaluation(evaluateScalper({
       quote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
-      exitMode: activeExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed),
+      exitMode: activeExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed), symbol: activeSymbol,
     }));
     latestDecision = {
       at: new Date().toISOString(),
@@ -1537,7 +1557,7 @@ async function main() {
 
       const finalSignal = withLiquidityEvaluation(evaluateScalper({
         quote: finalQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
-        exitMode: orderExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed),
+        exitMode: orderExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed), symbol: activeSymbol,
       }));
       if (finalSignal.direction !== signal.direction || finalSignal.setup !== signal.setup || finalSignal.setupKey !== signal.setupKey) {
         const reason = finalSignal.direction === "NO_TRADE"
@@ -1589,6 +1609,7 @@ async function main() {
           spreadUsd: finalQuote.spread,
           brokerMinDistanceUsd: levelsStopsLevelMinUsd,
           tickSizeUsd: levelsTickSizeUsd,
+          symbol: activeSymbol,
         });
         if (!sltpInitial.valid) {
           const reason = "SLTP_MODE: SL/TP da struttura non calcolabili al prezzo corrente, nessun ordine senza livelli validi.";
@@ -1608,7 +1629,7 @@ async function main() {
       if (orderExitMode === "fast") {
         const fastTarget = finalSignal.setup === "quick_tick"
           ? finalSignal.takeProfit!
-          : fastTargetPrice(finalSignal.direction as "BUY" | "SELL", finalSignal.entry!, orderFastTpUsd);
+          : fastTargetPrice(finalSignal.direction as "BUY" | "SELL", finalSignal.entry!, orderFastTpUsd, fastTpBounds(activeSymbol));
         finalSignal.takeProfit = fastTarget;
         finalSignal.tpBroker = fastTarget;
         finalSignal.reasoning = finalSignal.setup === "quick_tick"
@@ -1639,7 +1660,9 @@ async function main() {
       const perLot = riskPerLot(slDistance,
         Number(connection.terminalState.specification(symbol())?.tickSize),
         Number(connection.terminalState.price(symbol())?.lossTickValue));
-      const orderRisk = (size: number) => perLot === null ? lossAtStop(size, slDistance) : size * perLot;
+      const orderRisk = (size: number) => perLot === null
+        ? lossAtStop(size, slDistance, contractSpec(activeSymbol).contractSize)
+        : size * perLot;
       // Liquidita' del momento: lotti ridotti in MEDIUM/LOW (1 in HIGH, nessuna modifica),
       // gia' arrotondati al passo lotti da lotMultiplierFor; clampLots resta comunque una rete di
       // sicurezza in piu' sui limiti SCALPER_LOTS_MIN/MAX del broker. Il cap di rischio sotto puo'
@@ -1706,7 +1729,7 @@ async function main() {
       const sendAgeMs = quoteAgeMs(sendQuote);
       const sendCheck = withLiquidityEvaluation(evaluateScalper({
         quote: sendQuote, m1, m5, disableShort: liquidity.disableShort, disableRange: liquidity.disableRange,
-        exitMode: orderExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed),
+        exitMode: orderExitMode, quickTickSpreadAvg: rollingSpreadAvg(quickTickSpreadState.closed), symbol: activeSymbol,
       }));
       const entryDrift = sendCheck.direction === "NO_TRADE" || sendCheck.entry === null
         ? Number.POSITIVE_INFINITY
@@ -1780,7 +1803,7 @@ async function main() {
         finalSignal.stopLoss!,
         Number(brokerTp),
         tradingConnection,
-        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: sendQuote.mid },
+        { schemaReady: true, skipSync: true, systemStopped: stopped, preflightDone: true, lots: orderLots, price: sendQuote.mid, symbol: activeSymbol },
       );
 
       // Margine insufficiente: due sole firme reali (preflight "insufficient_margin" e retcode 10019

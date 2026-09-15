@@ -10,6 +10,11 @@ import {
   SCHEDULED_CLOSE_END_KEY, SCHEDULED_CLOSE_START_KEY, SCHEDULED_CLOSE_TIMEZONE_KEY,
 } from "@/lib/scheduledClose";
 import { getSessionStatus, sessionConfigFromEnv, type SessionConfig } from "@/lib/session";
+import {
+  ACTIVE_SYMBOL_SETTING_KEY, execLotsSettingKey, fastTpSettingKey, pickSymbolSetting,
+  resolveTradedSymbol, TRADED_SYMBOLS, tradedSymbolLabel,
+} from "@/lib/symbols";
+import { contractSpec, fastTpBounds } from "@/lib/server/symbolConfig";
 import { parseWorkerHeartbeat } from "@/lib/server/workerHeartbeat";
 
 export const dynamic = "force-dynamic";
@@ -27,6 +32,11 @@ const SETTING_KEYS = [
   EXEC_LOTS_SETTING_KEY,
   EXIT_MODE_SETTING_KEY,
   FAST_TP_USD_SETTING_KEY,
+  ACTIVE_SYMBOL_SETTING_KEY,
+  execLotsSettingKey("XAUUSD"),
+  execLotsSettingKey("NAS100"),
+  fastTpSettingKey("XAUUSD"),
+  fastTpSettingKey("NAS100"),
   SCHEDULED_CLOSE_ENABLED_KEY,
   SCHEDULED_CLOSE_START_KEY,
   SCHEDULED_CLOSE_END_KEY,
@@ -37,7 +47,7 @@ type OperationalState = "LIVE" | "WAITING" | "STOP" | "OFFLINE";
 type ParsedError = { raw: string; message: string; at: string | null; atMs: number | null };
 type WorkerAccount = { balance?: number | null; equity?: number | null; margin?: number | null; freeMargin?: number | null; leverage?: number | null; currency?: string | null };
 type ManagedExit = { positionId?: string; setup?: string; direction?: string; openPrice?: number; initialStop?: number; target1?: number; tpBroker?: number | null; fillPending?: boolean; stopLoss?: number; target1Hit?: boolean; breakevenPrice?: number | null; breakevenAt?: string | null; trailingActive?: boolean; trailingUpdates?: number };
-type WorkerDetail = { symbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; exitMode?: "normal" | "fast"; fastTpUsd?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
+type WorkerDetail = { symbol?: string; activeSymbol?: string; mode?: string; autoExec?: boolean; lots?: number; lotsMin?: number; lotsMax?: number; exitMode?: "normal" | "fast"; fastTpUsd?: number; account?: WorkerAccount | null; maxOpenPositions?: number; openPositions?: number; maxTradesPerDay?: number; tradeDedupSeconds?: number; managed?: ManagedExit[]; riskMaxPct?: number; riskCapActive?: boolean; lossLockedDirections?: string[]; lossLockUntil?: Record<string, string>; lossPauseUntil?: string | null; lossLockMinutes?: number; consecLossPauseMinutes?: number; quoteAgeSec?: number | null; m1?: number; m5?: number; hoursUtc?: string; flattenBeforeEndMin?: number; fridayCloseUtc?: string };
 
 function parseJson<T = Record<string, unknown>>(value: string | undefined): T | null {
   if (!value) return null;
@@ -89,6 +99,12 @@ export async function GET() {
     const heartbeatAgeMs = workerHeartbeat.atMs !== null ? Math.max(0, now.getTime() - workerHeartbeat.atMs) : null;
     const heartbeatFresh = heartbeatAgeMs !== null && heartbeatAgeMs < 60_000;
     const config = workerSessionConfig(workerDetail);
+    const activeSymbol = resolveTradedSymbol(settings.get(ACTIVE_SYMBOL_SETTING_KEY));
+    // Il cambio strumento e' bloccato finche' resta aperta una posizione, su qualunque simbolo:
+    // il conteggio arriva dal worker, unico a vedere il terminal state.
+    const openPositionSymbol = Number(workerDetail?.openPositions ?? 0) > 0
+      ? resolveTradedSymbol(workerDetail?.activeSymbol ?? activeSymbol)
+      : null;
     const sessionStatus = getSessionStatus(now, config);
 
     let state: OperationalState;
@@ -126,13 +142,23 @@ export async function GET() {
       systemStopChangedAt: settings.get("system_stop_changed_at") ?? null,
       quote,
       autoExec: typeof workerDetail?.autoExec === "boolean" ? workerDetail.autoExec : null,
-      lots: resolveLots(settings.get(EXEC_LOTS_SETTING_KEY)),
+      // Strumento attivo: lotti, TP fisso e specifica di contratto sono quelli del simbolo scelto,
+      // non di entrambi insieme. Il cambio e' bloccato dal worker se c'e' una posizione aperta.
+      activeSymbol,
+      activeSymbolLabel: tradedSymbolLabel(activeSymbol),
+      symbolChoices: TRADED_SYMBOLS,
+      symbolSwitchBlockedBy: openPositionSymbol,
+      contract: contractSpec(activeSymbol),
+      lots: resolveLots(pickSymbolSetting(activeSymbol, settings.get(execLotsSettingKey(activeSymbol)), settings.get(EXEC_LOTS_SETTING_KEY))),
       lotsMin: lotsMin(),
       lotsMax: lotsMax(),
       lotChoices: LOT_CHOICES,
       exitMode: resolveExitMode(settings.get(EXIT_MODE_SETTING_KEY)),
-      fastTpUsd: resolveFastTpUsd(settings.get(FAST_TP_USD_SETTING_KEY)),
-      fastTpUsdMin: MIN_FAST_TP_USD,
+      fastTpUsd: resolveFastTpUsd(
+        pickSymbolSetting(activeSymbol, settings.get(fastTpSettingKey(activeSymbol)), settings.get(FAST_TP_USD_SETTING_KEY)),
+        fastTpBounds(activeSymbol),
+      ),
+      fastTpUsdMin: fastTpBounds(activeSymbol).minUsd,
       // Stato calcolato server-side con l'ora del server e il fuso salvato: la dashboard mostra
       // questo, e il worker usa la stessa funzione sulle stesse chiavi. Nessun offset congelato.
       scheduledClose: scheduledCloseStatus(now, resolveScheduledCloseConfig((key) => settings.get(key))),

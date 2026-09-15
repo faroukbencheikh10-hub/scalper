@@ -4,6 +4,8 @@ import { aggregateM15, closedBars, MINUTE, swingLevels } from "./marketStructure
 import { getSessionStatus, parseSessionHours, sessionConfigFromEnv } from "../session";
 import { safetyTakeProfit } from "./positionManager";
 import type { ExitMode } from "../exitMode";
+import { DEFAULT_TRADED_SYMBOL, type TradedSymbol } from "../symbols";
+import { contractSpec, symbolPriceParam, type PriceParamName } from "./symbolConfig";
 
 /**
  * TP di sicurezza dei setup a uscita gestita: non e' l'obiettivo del trade (quello resta target1,
@@ -16,6 +18,22 @@ function brokerSafetyTp(direction: "BUY" | "SELL", entry: number, target1: numbe
 }
 
 export const STRATEGY_VERSION = "mtf-continuation-v1";
+
+/**
+ * Strumento dei parametri in unita' di prezzo della valutazione in corso. evaluateScalper e' l'unico
+ * punto che lo scrive, in cima ad ogni chiamata: la funzione e' interamente sincrona, quindi due
+ * valutazioni non possono intrecciarsi e leggere il simbolo l'una dell'altra. I setup non lo vedono
+ * nemmeno: continuano a chiedere i loro numeri come prima, cambia solo da dove arrivano.
+ */
+let priceParamSymbol: TradedSymbol = DEFAULT_TRADED_SYMBOL;
+
+/**
+ * Parametro in unita' di prezzo dello strumento attivo ($ sull'oro, punti su NAS100). Il default
+ * per strumento sta in symbolConfig.ts; min e max restano quelli di sempre.
+ */
+function priceEnv(name: PriceParamName, min: number, max: number) {
+  return symbolPriceParam(priceParamSymbol, name, min, max);
+}
 
 function env(name: string, fallback: number, min: number, max: number) {
   const raw = process.env[name]?.trim(), value = raw ? Number(raw) : NaN;
@@ -118,6 +136,11 @@ type EvaluateInput = {
   /** exit_mode corrente da scalper_settings: quick_tick si valuta SOLO quando vale "fast". */
   exitMode?: ExitMode;
   /**
+   * Strumento attivo (scalper_settings.active_symbol): decide SOLO i parametri in unita' di prezzo
+   * (SL/TP, buffer, spread massimo, limiti ATR). I criteri d'ingresso dei setup non cambiano mai.
+   */
+  symbol?: TradedSymbol;
+  /**
    * Spread medio delle ultime QUICK_TICK_SPREAD_WINDOW_M1 candele M1 chiuse, per la condizione 3 di
    * quick_tick: stato tick-per-tick del worker (non derivato da m1/m5, le candele non portano lo
    * spread). null in warmup, prima che sia chiusa almeno una M1 dall'avvio o da un reseed.
@@ -135,7 +158,7 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     || ![quote.bid, quote.ask, quote.mid, quote.spread].every(Number.isFinite)
     || quote.bid <= 0 || quote.ask < quote.bid || quote.spread < 0) return reject("Quote assente, vecchia o non valida.");
   const spread = quote.ask - quote.bid;
-  if (spread > env("SCALPER_MAX_SPREAD", 1.2, 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
+  if (spread > priceEnv("SCALPER_MAX_SPREAD", 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
 
   const sessionConfig = sessionConfigFromEnv();
   if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
@@ -153,8 +176,8 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
 
   const atr1 = atr(m1, 14, true)!, atr5 = atr(m5, 14, true)!, atr15 = atr(m15, 14, true)!;
   if (!(atr1 > 0 && atr5 > 0 && atr15 > 0)) return reject("ATR non disponibile.");
-  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
-    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return reject("Volatilità M1 fuori limiti: ATR " + atr1.toFixed(2) + "$.");
+  if (atr1 < priceEnv("SCALPER_MIN_ATR_M1", 0.01, 20)
+    || atr1 > priceEnv("SCALPER_MAX_ATR_M1", 0.1, 100)) return reject("Volatilità M1 fuori limiti: ATR " + atr1.toFixed(2) + "$.");
 
   const fast15 = emaCloseSeries(m15, 9), slow15 = emaCloseSeries(m15, 21);
   const fast = fast15.at(-1)!, slow = slow15.at(-1)!;
@@ -268,7 +291,7 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
     const structureStop = d === "BUY" ? Math.min(minLow(pullback), minLow(m1.slice(-3))) - stopBuffer
       : Math.max(maxHigh(pullback), maxHigh(m1.slice(-3))) + stopBuffer;
     const structural = signed(d, entry - structureStop);
-    const minUsd = env("SL_MIN_USD", 3, 0.1, 50), maxUsd = env("SL_MAX_USD", 8, 0.1, 100);
+    const minUsd = priceEnv("SL_MIN_USD", 0.1, 50), maxUsd = priceEnv("SL_MAX_USD", 0.1, 100);
     const atrRisk = atr1 * env("SL_ATR_MULT", 1.3, 0.5, 5);
     const risk = Math.max(structural, atrRisk, minUsd);
     if (structural <= 0 || risk > maxUsd || spread / risk > env("MTF_MAX_SPREAD_RISK", 0.2, 0.01, 0.5)) {
@@ -276,7 +299,9 @@ function evaluateMtfContinuation(input: EvaluateInput): ScalperSignal {
       continue;
     }
     // Spread is in the bid/ask entry already. These are additional estimated costs, in price units.
-    const cost = env("MTF_ROUNDTRIP_COMMISSION_PER_LOT_USD", 7, 0, 100) / 100
+    // La commissione e' per lotto: in unita' di prezzo si divide per la contract size dello
+    // strumento (100 once sull'oro, 1 unita' di indice su NAS100), non per un 100 fisso.
+    const cost = priceEnv("MTF_ROUNDTRIP_COMMISSION_PER_LOT_USD", 0, 100) / contractSpec(priceParamSymbol).contractSize
       + atr1 * env("MTF_SLIPPAGE_ATR", 0.05, 0, 1);
     const minNetR = env("MTF_MIN_NET_RR", 1.5, 1, 5), targetR = env("MTF_TARGET_RR", 2, 1.5, 5);
     const levels = [extreme, ...swingLevels(m5.slice(-60), d), ...swingLevels(m15.slice(-60), d)];
@@ -449,7 +474,7 @@ export const SHORT_STRATEGY_VERSION = "m1-short-v1";
 
 /** Margine oltre il livello che il prezzo live deve superare perche' il trigger sia valido. */
 function entryBuffer() {
-  return env("ENTRY_BUFFER_USD", 0.1, 0, 5);
+  return priceEnv("ENTRY_BUFFER_USD", 0, 5);
 }
 
 function shortEnabled() {
@@ -466,7 +491,7 @@ function commonPreflight(input: EvaluateInput, nowMs: number): ScalperSignal | n
     || ![quote.bid, quote.ask, quote.mid, quote.spread].every(Number.isFinite)
     || quote.bid <= 0 || quote.ask < quote.bid || quote.spread < 0) return reject("Quote assente, vecchia o non valida.");
   const spread = quote.ask - quote.bid;
-  if (spread > env("SCALPER_MAX_SPREAD", 1.2, 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
+  if (spread > priceEnv("SCALPER_MAX_SPREAD", 0.01, 10)) return reject("Spread troppo alto: " + spread.toFixed(2) + "$.");
   const sessionConfig = sessionConfigFromEnv();
   if (!parseSessionHours(sessionConfig.hoursUtc)) return reject("Configurazione oraria non valida.");
   const session = getSessionStatus(new Date(nowMs), sessionConfig);
@@ -510,8 +535,8 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number, context: MarketCon
 
   const atr1 = atr(m1, 14, true);
   if (!atr1 || !(atr1 > 0)) return rejectShort("m1_short: ATR M1 non disponibile.");
-  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
-    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectShort("m1_short: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+  if (atr1 < priceEnv("SCALPER_MIN_ATR_M1", 0.01, 20)
+    || atr1 > priceEnv("SCALPER_MAX_ATR_M1", 0.1, 100)) return rejectShort("m1_short: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
 
   const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
   const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
@@ -525,9 +550,9 @@ function evaluateM1Short(input: EvaluateInput, nowMs: number, context: MarketCon
   const ema20 = emaCloseSeries(m1, 20).at(-1)!;
   const buffer = entryBuffer();
   const slAtr = atr1 * env("SHORT_SL_ATR", 2, 0.2, 10);
-  const slMin = env("SHORT_SL_MIN_USD", 3, 0.1, 50), slMax = env("SHORT_SL_MAX_USD", 8, 0.1, 100);
+  const slMin = priceEnv("SHORT_SL_MIN_USD", 0.1, 50), slMax = priceEnv("SHORT_SL_MAX_USD", 0.1, 100);
   const tpAtr = atr1 * env("SHORT_TP_ATR", 0.6, 0.05, 10);
-  const tpMin = env("SHORT_TP_MIN_USD", 1.5, 0.1, 50), tpMax = env("SHORT_TP_MAX_USD", 3, 0.1, 100);
+  const tpMin = priceEnv("SHORT_TP_MIN_USD", 0.1, 50), tpMax = priceEnv("SHORT_TP_MAX_USD", 0.1, 100);
   const plannedRisk = Math.max(slAtr, slMin), plannedReward = Math.min(Math.max(tpAtr, tpMin), tpMax);
   const detail = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
     + ", prezzo " + quote.bid.toFixed(2) + "/" + quote.ask.toFixed(2) + ", buffer " + buffer.toFixed(2) + "$"
@@ -625,8 +650,8 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketCon
 
   const atr1 = atr(m1, 14, true);
   if (!atr1 || !(atr1 > 0)) return rejectRange("m1_range: ATR M1 non disponibile.");
-  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
-    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectRange("m1_range: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+  if (atr1 < priceEnv("SCALPER_MIN_ATR_M1", 0.01, 20)
+    || atr1 > priceEnv("SCALPER_MAX_ATR_M1", 0.1, 100)) return rejectRange("m1_range: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
 
   const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
   const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
@@ -637,12 +662,12 @@ function evaluateM1Range(input: EvaluateInput, nowMs: number, context: MarketCon
   // Range e ATR solo da candele chiuse: del tick serve soltanto il prezzo.
   const window = m1.slice(-bars);
   const high = maxHigh(window), low = minLow(window), width = high - low;
-  const minAtr = env("RANGE_MIN_ATR", 1.5, 0.1, 10), minUsd = env("RANGE_MIN_USD", 3, 0.1, 100);
+  const minAtr = env("RANGE_MIN_ATR", 1.5, 0.1, 10), minUsd = priceEnv("RANGE_MIN_USD", 0.1, 100);
   const edgePct = env("RANGE_EDGE_PCT", 20, 1, 50) / 100;
-  const slBuffer = env("SL_BUFFER_USD", 0.3, 0, 5), tpBuffer = env("TP_BUFFER_USD", 0.3, 0, 5);
-  const slAtrMult = env("RANGE_SL_ATR", 2, 0.1, 10), slMinUsd = env("RANGE_SL_MIN_USD", 2, 0.1, 50);
-  const slMaxUsd = env("RANGE_SL_MAX_USD", 8, 0.1, 100), slMaxPct = env("RANGE_SL_MAX_PCT", 50, 5, 100) / 100;
-  const tpMinUsd = env("RANGE_TP_MIN_USD", 1.5, 0.1, 50);
+  const slBuffer = priceEnv("SL_BUFFER_USD", 0, 5), tpBuffer = priceEnv("TP_BUFFER_USD", 0, 5);
+  const slAtrMult = env("RANGE_SL_ATR", 2, 0.1, 10), slMinUsd = priceEnv("RANGE_SL_MIN_USD", 0.1, 50);
+  const slMaxUsd = priceEnv("RANGE_SL_MAX_USD", 0.1, 100), slMaxPct = env("RANGE_SL_MAX_PCT", 50, 5, 100) / 100;
+  const tpMinUsd = priceEnv("RANGE_TP_MIN_USD", 0.1, 50);
   const container = m5.slice(-RANGE_M5_CONTAINER_BARS);
   const containerHigh = maxHigh(container), containerLow = minLow(container);
   const base = "range " + bars + " M1 chiuse " + low.toFixed(2) + "-" + high.toFixed(2)
@@ -726,7 +751,7 @@ function quickTickM1Window() {
 }
 
 function quickTickBreakoutBufferUsd() {
-  return env("QUICK_TICK_BREAKOUT_BUFFER_USD", 0.15, 0, 5);
+  return priceEnv("QUICK_TICK_BREAKOUT_BUFFER_USD", 0, 5);
 }
 
 function quickTickMaxSpreadRatio() {
@@ -735,15 +760,15 @@ function quickTickMaxSpreadRatio() {
 
 /** Fallback assoluto finche' la media spread rolling non e' pronta (warmup): stesso ruolo di sempre. */
 function quickTickMaxSpreadFallback() {
-  return env("QUICK_TICK_MAX_SPREAD", 0.2, 0.01, 10);
+  return priceEnv("QUICK_TICK_MAX_SPREAD", 0.01, 10);
 }
 
 function quickTickTpAtrMult() { return env("QUICK_TICK_TP_ATR_MULT", 1.5, 0.1, 10); }
-function quickTickTpMinUsd() { return env("QUICK_TICK_TP_MIN_USD", 2, 0.1, 50); }
-function quickTickTpMaxUsd() { return env("QUICK_TICK_TP_MAX_USD", 4, 0.1, 100); }
+function quickTickTpMinUsd() { return priceEnv("QUICK_TICK_TP_MIN_USD", 0.1, 50); }
+function quickTickTpMaxUsd() { return priceEnv("QUICK_TICK_TP_MAX_USD", 0.1, 100); }
 function quickTickSlAtrMult() { return env("QUICK_TICK_SL_ATR_MULT", 1.2, 0.1, 10); }
-function quickTickSlMinUsd() { return env("QUICK_TICK_SL_MIN_USD", 2.5, 0.1, 50); }
-function quickTickSlMaxUsd() { return env("QUICK_TICK_SL_MAX_USD", 6, 0.1, 100); }
+function quickTickSlMinUsd() { return priceEnv("QUICK_TICK_SL_MIN_USD", 0.1, 50); }
+function quickTickSlMaxUsd() { return priceEnv("QUICK_TICK_SL_MAX_USD", 0.1, 100); }
 
 function rejectQuickTickGate(reason: string, direction?: "BUY" | "SELL"): ScalperSignal {
   const evaluation: SetupEvaluation = direction
@@ -787,8 +812,8 @@ function evaluateQuickTick(input: EvaluateInput, nowMs: number, context: MarketC
 
   const atr1 = atr(m1, 14, true);
   if (!atr1 || !(atr1 > 0)) return rejectGate("quick_tick: ATR M1 non disponibile.");
-  if (atr1 < env("SCALPER_MIN_ATR_M1", 0.8, 0.01, 20)
-    || atr1 > env("SCALPER_MAX_ATR_M1", 6, 0.1, 100)) return rejectGate("quick_tick: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
+  if (atr1 < priceEnv("SCALPER_MIN_ATR_M1", 0.01, 20)
+    || atr1 > priceEnv("SCALPER_MAX_ATR_M1", 0.1, 100)) return rejectGate("quick_tick: volatilità M1 fuori limiti, ATR " + atr1.toFixed(2) + "$.");
 
   const trigger = m1.at(-1)!, forming = input.m1.at(-1)!;
   const shock = env("SHOCK_ATR_MULT", 2.2, 1, 10) * atr1;
@@ -864,6 +889,8 @@ function evaluateQuickTick(input: EvaluateInput, nowMs: number, context: MarketC
  * tutti gli altri. Le valutazioni dei setup attraversati viaggiano insieme in stream_last_decision.
  */
 export function evaluateScalper(input: EvaluateInput): ScalperSignal {
+  // Unico punto che fissa lo strumento dei parametri in unita' di prezzo, prima di qualsiasi lettura.
+  priceParamSymbol = input.symbol ?? DEFAULT_TRADED_SYMBOL;
   const nowMs = input.nowMs ?? Date.now();
   const blocked = commonPreflight(input, nowMs);
   if (blocked) return blocked;
